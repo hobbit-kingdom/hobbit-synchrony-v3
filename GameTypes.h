@@ -25,7 +25,7 @@ struct Enemy
 	float x, y, z;        // Vector3 position
 	float rot;            // rotationY
 	uint32_t anim;        // animation
-
+	float health;
 };
 
 // ---------------------------------------------------------------------------

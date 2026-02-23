@@ -6,8 +6,7 @@
 	and broadcasts position updates between all connected clients.
 */
 
-#include "NetworkConfig.h"
-#include "GameTypes.h"
+#include "shared.h"
 #include "GuidManager.h"
 
 #undef SendMessage
@@ -110,6 +109,8 @@ static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMe
 			server.CreateMessage(i, ENEMIES_UPDATE));
 
 		broadcast->enemies = msg->enemies;
+
+		broadcast->nowLevel = msg->nowLevel;
 
 		server.SendMessage(i, 0, broadcast);
 	}

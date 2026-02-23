@@ -4,58 +4,12 @@
 */
 
 #include "GuidManager.h"
-#include <fstream>
-#include <iostream>
-#include <filesystem>
+#include "shared.h"
 
 bool GuidManager::loadFromFile(const std::string& filePath)
 {
-    std::ifstream file;
-    std::string   currentPath = filePath;
-    bool          foundOnFirstTry = true;
-
-    // Keep prompting until the file is opened or the user quits
-    while (!file.is_open())
-    {
-        file.open(currentPath);
-        if (file.is_open())
-            break;
-
-        foundOnFirstTry = false;
-        auto fullPath = std::filesystem::absolute(currentPath);
-        printf("File not found at: %s\n", fullPath.string().c_str());
-        printf("Enter the path to FAKE_BILBO_GUID.txt (or 'q' to quit): ");
-
-        std::string input;
-        std::getline(std::cin, input);
-        if (input == "q" || input == "Q")
-            return false;
-
-        currentPath = input;
-    }
-
-    // Parse each line: format is "XXXXXXXX_XXXXXXXX" (hex)
-    std::string line;
-    while (std::getline(file, line))
-    {
-        size_t underscorePos = line.find('_');
-        if (underscorePos == std::string::npos)
-            continue;
-
-        // "AABBCCDD_EEFFGGHH" → combined = "AABBCCDDEEFFGGHH"
-        std::string part1 = line.substr(0, underscorePos);
-        std::string part2 = line.substr(underscorePos + 1);
-        std::string combined = part1 + part2;
-
-        uint64_t guid = std::stoull(combined, nullptr, 16);
-        allGuids_.push_back(guid);
-    }
-
-    // All loaded GUIDs are initially available
+    allGuids_ = loadGuidsFromFile(filePath);
     availableGuids_ = allGuids_;
-
-    if (foundOnFirstTry)
-        printf("GUID file loaded successfully (%zu GUIDs).\n", allGuids_.size());
 
     return !allGuids_.empty();
 }

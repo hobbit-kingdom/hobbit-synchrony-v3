@@ -104,6 +104,8 @@ struct EnemiesStateMessage : public Message
 {
 	std::unordered_map<uint64_t, Enemy> enemies;
 
+	uint32_t nowLevel = 0;
+
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
@@ -129,7 +131,10 @@ struct EnemiesStateMessage : public Message
 				serialize_float(stream, e.z);
 				serialize_float(stream, e.rot);
 				serialize_bits(stream, e.anim, 32);
+				serialize_float(stream, e.health);
 			}
+
+			serialize_bits(stream, nowLevel, 32);
 		}
 		else  // reading
 		{
@@ -155,9 +160,12 @@ struct EnemiesStateMessage : public Message
 				serialize_float(stream, e.z);
 				serialize_float(stream, e.rot);
 				serialize_bits(stream, e.anim, 32);
+				serialize_float(stream, e.health);
 
 				enemies[guid] = e;
 			}
+
+			serialize_bits(stream, nowLevel, 32);
 		}
 
 		return true;

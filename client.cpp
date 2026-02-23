@@ -8,11 +8,9 @@
 */
 
 #define _CRT_SECURE_NO_WARNINGS
-#include "NetworkConfig.h"
-#include "GameTypes.h"
+#include "shared.h"
 #include "Player.h"
 #include "NPC.h"
-#include "MathUtils.h"
 #include "HobbitGameManager/HobbitGameManager.h"
 #include "HobbitGameManager/HobbitProcessAnalyzer.h"
 
@@ -34,7 +32,11 @@ using namespace yojimbo;
 
 static volatile int quit = 0;
 
+static int isHost = 0;
+static bool processedDataForThisLevel = false;
+
 static void interruptHandler(int) { quit = 1; }
+
 
 // --- Game process interface ---
 static HobbitGameManager       gameManager;
@@ -54,9 +56,12 @@ static float    localLastAnimFrame = 0.0f;
 
 static uint32_t bilboWeapon;
 static uint32_t nowLevel;
+static bool levelIsRunning;
 
 // --- Remote players ---
 static std::vector<Player> activePlayers;
+
+static std::vector<uint64_t> playerGuids;
 
 // --- Animation data caches ---
 std::unordered_map<uint32_t, uint32_t> animDataMap;
@@ -72,6 +77,10 @@ const uint32_t X_POSITION_PTR = 0x0075BA3C;
 
 static void readGamePointers()
 {
+	activePlayers.clear();
+	nowLevel = processAnalyzer->readData<uint32_t>(0x00762B5C);
+
+
 	bilboPosBasePtr = processAnalyzer->readData<uint32_t>(X_POSITION_PTR);
 	bilboAnimPtr = 0x8 + processAnalyzer->readData<uint32_t>(
 		0x560 + processAnalyzer->readData<uint32_t>(X_POSITION_PTR));
@@ -80,27 +89,39 @@ static void readGamePointers()
 	enemies.clear();
 	printf("List Enemies\n");
 
+	std::vector<uint32_t> allFriendAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000100000001, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allEnemieAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000200000002, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
+
+	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
 
 	for (uint32_t e : allEnemieAddrs)
 	{
-		if (0x04004232 != processAnalyzer->readData<uint32_t>(e + 0x10))
+		uint32_t value = processAnalyzer->readData<uint32_t>(e + 0x10);
+		if (0x04004232 != value && 0x004A14C0 != value)
 			continue;
-		if (0xABCABCABCABCABC0 == processAnalyzer->readData<uint32_t>(e + 0x8))
+
+		uint64_t eGuid = processAnalyzer->readData<uint64_t>(e + 0x8);
+
+		bool skip = false;
+		for (uint64_t pGuid : playerGuids) if (pGuid == eGuid) skip = true;
+
+
+		if (skip) continue;
+
+		if (0xABCABCABCABCABC0 == eGuid)
 		{
 			printf("YOU ARE SETTING BILBO AS ENEMY NPC!!!");
 			continue;
 		}
 
 		//hex
-		std::cout << "Address: " << e << " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
+		std::cout << eGuid << " Address: " << e << " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
 
 		NPC* enemy = new NPC(processAnalyzer);;
 		enemy->initializeByAddress(e);
 
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
-
 
 	printf("Enemies Found: %d", enemies.size());
 }
@@ -125,7 +146,7 @@ static void readLocalPlayerState()
 	localAnimFrame = processAnalyzer->readData<float>(baseAddr + 0x530);
 	localLastAnimFrame = processAnalyzer->readData<float>(baseAddr + 0x53C);
 
-	// Read weapon and level
+	// Read weapon 
 	bilboWeapon = processAnalyzer->readData<uint32_t>(0x0075C738);
 	nowLevel = processAnalyzer->readData<uint32_t>(0x00762B5C);
 
@@ -147,9 +168,9 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		Vector3 ePos = enemy.second->getPosition();
 		float eRot = enemy.second->getRotationY();
 		uint32_t eAnim = enemy.second->getAnimation();
-		//uint32_t eHealth = enemy.second->getHealth();
+		float eHealth = enemy.second->getHealth();
 
-		temp[enemy.first] = { ePos.x, ePos.y, ePos.z, eRot, eAnim };
+		temp[enemy.first] = { ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth };
 	}
 
 	return temp;
@@ -217,7 +238,6 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 		player.npc = nullptr;
 
 	// --- Rotation ---
-	player.prevRotationY = player.rotationY;
 	player.targetRotationY = msg->rotationY;
 
 	// --- Animation ---
@@ -316,27 +336,45 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 
 static void processPositionUpdate(PositionMessage* msg, double currentTime)
 {
+	if (msg->nowLevel != nowLevel)
+	{
+		return;
+	}
+
 	Player* existing = findPlayerByGuid(msg->playerGuid);
 	if (existing)
 		updateExistingPlayer(*existing, msg, currentTime);
 	else
 		addNewPlayer(msg, currentTime);
 
-	printf("Player %llu: pos(%.1f, %.1f, %.1f) rot(%.1f) anim(%u) frame(%.1f) weapon(%d) level(%d)\n",
-		msg->playerGuid, msg->x, msg->y, msg->z,
-		msg->rotationY, msg->animation, msg->animFrame, msg->bilboWeapon, msg->nowLevel);
+	std::cout << "Player " << msg->playerGuid
+		<< ": pos(" << msg->x << ", "
+		<< msg->y << ", "
+		<< msg->z << ") rot("
+		<< msg->rotationY << ") anim("
+		<< msg->animation << ") frame("
+		<< msg->animFrame << ") weapon("
+		<< msg->bilboWeapon << ") level("
+		<< msg->nowLevel << ")"
+		<< "\n";
 }
 
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double currentTime)
 {
+	if (msg->nowLevel != nowLevel) return;
+
 	std::unordered_map<uint64_t, Enemy> updates = msg->enemies;
 
 	for (auto enemyUpdate : updates)
 	{
+		if (enemies[enemyUpdate.first] == nullptr || !enemies[enemyUpdate.first]->isValid()) continue;
+
 		enemies[enemyUpdate.first]->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
 		enemies[enemyUpdate.first]->setRotationY(enemyUpdate.second.rot);
+		enemies[enemyUpdate.first]->setHealth(enemyUpdate.second.health);
 		if (enemies[enemyUpdate.first]->getAnimation() != enemyUpdate.second.anim)
 			enemies[enemyUpdate.first]->setNPCAnim(enemyUpdate.second.anim);
+
 	}
 }
 
@@ -345,10 +383,10 @@ static void processMessage(Client& client, Message* message, double time)
 	switch (message->GetType())
 	{
 	case POSITION_UPDATE:
-		processPositionUpdate(static_cast<PositionMessage*>(message), time);
+		if (gameManager.isOnLevel()) processPositionUpdate(static_cast<PositionMessage*>(message), time);
 		break;
 	case ENEMIES_UPDATE:
-		processEnemiesUpdate(static_cast<EnemiesStateMessage*>(message), time);
+		if (gameManager.isOnLevel()) processEnemiesUpdate(static_cast<EnemiesStateMessage*>(message), time);
 		break;
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
@@ -411,6 +449,19 @@ static int clientMain()
 		client.SendPackets();
 		client.ReceivePackets();
 
+
+		if (gameManager.isOnLevel() && !processedDataForThisLevel)
+		{
+			readGamePointers();
+			processedDataForThisLevel = true;
+		}
+		if (!gameManager.isOnLevel())
+		{
+			processedDataForThisLevel = false;
+			activePlayers.clear();
+			enemies.clear();
+		}
+
 		// Process incoming messages on all channels
 		for (int ch = 0; ch < config.numChannels; ch++)
 		{
@@ -418,6 +469,7 @@ static int clientMain()
 			while (msg)
 			{
 				processMessage(client, msg, time);
+
 				client.ReleaseMessage(msg);
 				msg = client.ReceiveMessage(ch);
 			}
@@ -438,7 +490,7 @@ static int clientMain()
 		// Send local player state at the configured tick rate
 		if (client.IsConnected() && myGuid != 0)
 		{
-			if (time - lastSend > NetDefaults::SEND_INTERVAL)
+			if (time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
 			{
 				readLocalPlayerState();
 
@@ -457,18 +509,21 @@ static int clientMain()
 
 				client.SendMessage(0, msg);
 
-				//ENEMIES
-				//////////////////////////////////
+				if (isHost == 1)
+				{
+					//ENEMIES
+					//////////////////////////////////
+					std::unordered_map<uint64_t, Enemy> enemiesPosSnap = readEnemiesState();
 
-				//std::unordered_map<uint64_t, Enemy> enemiesPosSnap = readEnemiesState();
+					auto* msgEnemy = static_cast<EnemiesStateMessage*>(client.CreateMessage(ENEMIES_UPDATE));
 
-				//auto* msgEnemy = static_cast<EnemiesStateMessage*>(client.CreateMessage(ENEMIES_UPDATE));
+					msgEnemy->enemies = enemiesPosSnap;
 
-				//msgEnemy->enemies = enemiesPosSnap;
+					msgEnemy->nowLevel = nowLevel;
 
-				//client.SendMessage(0, msgEnemy);
-
-				//////////////////////////////////
+					client.SendMessage(0, msgEnemy);
+					//////////////////////////////////
+				}
 
 				lastSend = time;
 			}
@@ -514,11 +569,19 @@ int mainThread()
 	AllocConsole();
 	freopen("CONOUT$", "w",
 		stdout);
+	freopen("CONIN$", "r",
+		stdin);
 
 	// Attach to the Hobbit game process
 	gameManager.start();
 	processAnalyzer = gameManager.getHobbitProcessAnalyzer();
-	readGamePointers();
+
+	playerGuids = loadGuidsFromFile("FAKE_BILBO_GUID.txt");
+
+	std::cout << "SIZE " << playerGuids.size() << "\n";
+
+	std::cout << "Are you the host? (yes - 1 / no - 0)\n";
+	std::cin >> isHost;
 
 	if (!InitializeYojimbo())
 	{

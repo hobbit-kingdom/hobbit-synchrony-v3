@@ -35,7 +35,6 @@ public:
 	float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
 
 	// --- Interpolation: rotation ---
-	float prevRotationY = 0.0f;
 	float targetRotationY = 0.0f;
 
 	// --- Interpolation: animation ---

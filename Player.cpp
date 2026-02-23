@@ -49,7 +49,6 @@ void Player::initializeLerp(double currentTime)
 	targetX = x;     targetY = y;     targetZ = z;
 
 	// Rotation
-	prevRotationY = rotationY;
 	targetRotationY = rotationY;
 
 	// Animation
@@ -73,13 +72,13 @@ void Player::tickLerp(float t)
 	z = MathUtils::lerp(prevZ, targetZ, t);
 	npc->setPosition(x, y, z);
 
-	// --- Rotation (angle-aware) ---
-	rotationY = MathUtils::lerpAngle(prevRotationY, targetRotationY, t);
+	// --- Rotation (direct) ---
+	rotationY = targetRotationY;
 	npc->setRotationY(rotationY);
 
 	// --- Animation frames ---
-	animFrame = MathUtils::lerp(prevAnimFrame, targetAnimFrame, t);
-	lastAnimFrame = targetLastAnimFrame;
+	//animFrame = MathUtils::lerp(prevAnimFrame, targetAnimFrame, t);
+	//lastAnimFrame = targetLastAnimFrame;
 
 	if (animation > 0 && animation <= 200)
 	{
