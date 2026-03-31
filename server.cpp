@@ -98,6 +98,32 @@ static void broadcastPosition(Server& server, int senderIndex, PositionMessage* 
 	}
 }
 
+
+
+static void broadcastHoistableUpdate(Server& server, int senderIndex, HoistableStateMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableStateMessage*>(
+			server.CreateMessage(i, HOISTABLE_UPDATE));
+
+		broadcast->x = msg->x;
+		broadcast->y = msg->y;
+		broadcast->z = msg->z;
+		broadcast->rotationY = msg->rotationY;
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, 0, broadcast);
+	}
+}
+
+
 static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMessage* msg)
 {
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
@@ -125,6 +151,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case ENEMIES_UPDATE:
 		broadcastEnemyUpdate(server, clientIndex, static_cast<EnemiesStateMessage*>(message));
+		break;
+	case HOISTABLE_UPDATE:
+		broadcastHoistableUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
 		break;
 	default:
 		break;

@@ -63,7 +63,7 @@ public:
 		return ProcessAnalyzerTypeWrapped::readData(hobbitProcess, (LPVOID)address, byesSize);
 	}
 
-	
+
 	template <typename T>
 	void writeData(uint32_t address, T data)
 	{
@@ -100,7 +100,7 @@ public:
 
 		std::lock_guard<std::mutex> lock(objectStackMutex);
 
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE){
+		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
 			uint32_t objStackAddress = objectStackAddress + offset;
 			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
 			if (objAddrs != 0)
@@ -193,7 +193,7 @@ public:
 
 		return 0;
 	}
-	
+
 	template <typename T>
 	std::vector<uint32_t> findAllGameObjByPattern(T pattern, uint32_t shift)
 	{
@@ -252,14 +252,14 @@ public:
 		if (gameObjs.size() == 0)
 		{
 			std::string warningMsg = "";
-			for (T e : pattern) warningMsg+= e + "_";
+			for (T e : pattern) warningMsg += e + "_";
 			printf("Warning: Couldn't find %s Pattern in the Game Object Stack\n", warningMsg.c_str());
 		}
 
 		return gameObjs;
 	}
-	
-	
+
+
 	template <typename T, typename P>
 	std::vector<T> findReadAllGameObjByPattern(P pattern, uint32_t patternShift, uint32_t readShift)
 	{

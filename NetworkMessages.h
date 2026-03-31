@@ -22,9 +22,67 @@ enum GameMessageType
 {
 	POSITION_UPDATE,
 	ENEMIES_UPDATE,
+	HOISTABLE_UPDATE,
 	GUID_ASSIGN,
 	NUM_GAME_MESSAGE_TYPES
 };
+
+struct HoistableStateMessage : public Message
+{
+	float    x = 0.0f;
+	float    y = 0.0f;
+	float    z = 0.0f;
+	float    rotationY = 0.0f;
+	uint64_t hoistableGuid = 0;
+
+
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		if (stream.IsWriting)
+		{
+
+
+			serialize_float(stream, x);
+			serialize_float(stream, y);
+			serialize_float(stream, z);
+			serialize_float(stream, rotationY);
+
+			// uint64_t must be serialized as two 32-bit halves
+			uint32_t guid_low = static_cast<uint32_t>(hoistableGuid);
+			uint32_t guid_high = static_cast<uint32_t>(hoistableGuid >> 32);
+			serialize_bits(stream, guid_low, 32);
+			serialize_bits(stream, guid_high, 32);
+			hoistableGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+
+			serialize_bits(stream, nowLevel, 32);
+		}
+
+		else  // reading
+		{
+			serialize_float(stream, x);
+			serialize_float(stream, y);
+			serialize_float(stream, z);
+
+			serialize_float(stream, rotationY);
+
+			uint32_t guid_low;
+			uint32_t guid_high;
+			serialize_bits(stream, guid_low, 32);
+			serialize_bits(stream, guid_high, 32);
+			hoistableGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+
+			serialize_bits(stream, nowLevel, 32);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
 
 // ---------------------------------------------------------------------------
 // PositionMessage — Player state update (position, rotation, animation)

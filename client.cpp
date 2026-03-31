@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <vector>
+
+#include "Hoistable.h"
 using namespace yojimbo;
 
 // ===========================================================================
@@ -63,13 +65,19 @@ static std::vector<Player> activePlayers;
 
 static std::vector<uint64_t> playerGuids;
 
+static std::vector<uint64_t> hoistableGuidTest;
+
 // --- Animation data caches ---
 std::unordered_map<uint32_t, uint32_t> animDataMap;
 static std::unordered_map<uint32_t, float> animFrameRanges;
 
 
 std::unordered_map<uint64_t, NPC*> enemies;
+std::unordered_map<uint64_t, Hoistable*> hoistables;
 const uint32_t X_POSITION_PTR = 0x0075BA3C;
+
+Hoistable* testHoistable;
+
 
 // ===========================================================================
 //  Game Memory Reading
@@ -89,8 +97,32 @@ static void readGamePointers()
 	enemies.clear();
 	printf("List Enemies\n");
 
+	//
+	hoistables.clear();
+
 	std::vector<uint32_t> allFriendAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000100000001, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allEnemieAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000200000002, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
+	std::vector<uint32_t> allRigidInstances = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x05, 0x7c); //put the values that indicate that thing
+	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
+
+	std::vector<uint32_t> allHoistables;
+	for (auto rigidIn : allRigidInstances)
+	{
+		if (processAnalyzer->readData<uint8_t>(rigidIn + 0x13) == 2)
+		{
+			allHoistables.push_back(rigidIn);
+		}
+	}
+
+	for (uint32_t hoisAddr : allHoistables)
+	{
+		Hoistable* ho = new Hoistable(processAnalyzer);;
+		ho->initializeByAddress(hoisAddr);
+
+		hoistables.emplace(ho->getGUID(), ho);
+	}
+
+	std::cout << "SIZE OF ALL HOISTABLES: " << allHoistables.size() << '\n';
 
 	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
 
@@ -123,7 +155,12 @@ static void readGamePointers()
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
 
+	// testHoistable = new Hoistable(processAnalyzer);
+	// hoistableGuidTest = loadGuidsFromFile("hoistable.txt");
+	// testHoistable->initializeByGuid(hoistableGuidTest[0]);
+
 	printf("Enemies Found: %d", enemies.size());
+
 }
 
 static void readLocalPlayerState()
@@ -346,8 +383,7 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 		updateExistingPlayer(*existing, msg, currentTime);
 	else
 		addNewPlayer(msg, currentTime);
-
-	std::cout << "Player " << msg->playerGuid
+	std::cout << "Player " << std::hex << msg->playerGuid << std::dec
 		<< ": pos(" << msg->x << ", "
 		<< msg->y << ", "
 		<< msg->z << ") rot("
@@ -357,6 +393,20 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 		<< msg->bilboWeapon << ") level("
 		<< msg->nowLevel << ")"
 		<< "\n";
+}
+
+static void processHoistableUpdate(HoistableStateMessage* msg, double currentTime)
+{
+	if (msg->nowLevel != nowLevel)
+	{
+		return;
+	}
+
+	if (hoistables[msg->hoistableGuid] == nullptr || !hoistables[msg->hoistableGuid]->isValid()) return;
+
+	hoistables[msg->hoistableGuid]->setPosition(msg->x, msg->y, msg->z);
+	// hoistables[msg->hoistableGuid]->setRotationY(msg->rotationY);
+
 }
 
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double currentTime)
@@ -369,11 +419,12 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double currentTime)
 	{
 		if (enemies[enemyUpdate.first] == nullptr || !enemies[enemyUpdate.first]->isValid()) continue;
 
-		enemies[enemyUpdate.first]->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
-		enemies[enemyUpdate.first]->setRotationY(enemyUpdate.second.rot);
-		enemies[enemyUpdate.first]->setHealth(enemyUpdate.second.health);
-		if (enemies[enemyUpdate.first]->getAnimation() != enemyUpdate.second.anim)
-			enemies[enemyUpdate.first]->setNPCAnim(enemyUpdate.second.anim);
+		NPC* badBoy = enemies[enemyUpdate.first];
+		badBoy->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
+		badBoy->setRotationY(enemyUpdate.second.rot);
+		badBoy->setHealth(enemyUpdate.second.health);
+		if (badBoy->getAnimation() != enemyUpdate.second.anim)
+			badBoy->setNPCAnim(enemyUpdate.second.anim);
 
 	}
 }
@@ -387,6 +438,9 @@ static void processMessage(Client& client, Message* message, double time)
 		break;
 	case ENEMIES_UPDATE:
 		if (gameManager.isOnLevel()) processEnemiesUpdate(static_cast<EnemiesStateMessage*>(message), time);
+		break;
+	case HOISTABLE_UPDATE:
+		if (gameManager.isOnLevel()) processHoistableUpdate(static_cast<HoistableStateMessage*>(message), time);
 		break;
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
@@ -523,7 +577,28 @@ static int clientMain()
 
 					client.SendMessage(0, msgEnemy);
 					//////////////////////////////////
+
+					for (auto hoists : hoistables)
+					{
+						auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
+
+						Vector3 v = hoists.second->getPosition();
+
+						msgHoistable->x = v.x;
+						msgHoistable->y = v.y;
+						msgHoistable->z = v.z;
+
+						msgHoistable->rotationY = hoists.second->getRotationY();
+
+						msgHoistable->hoistableGuid = hoists.first;
+						msgHoistable->nowLevel = nowLevel;
+
+						client.SendMessage(0, msgHoistable);
+					}
 				}
+
+
+
 
 				lastSend = time;
 			}
