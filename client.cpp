@@ -9,6 +9,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "shared.h"
+#include "SecureConnection.h"
 #include "Player.h"
 #include "NPC.h"
 #include "HobbitGameManager/HobbitGameManager.h"
@@ -291,7 +292,7 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		uint32_t eAnim = enemy.second->getAnimation();
 		float eHealth = enemy.second->getHealth();
 
-		temp[enemy.first] = { ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth };
+		temp[enemy.first] = NetworkClamp::sanitizeEnemy({ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth });
 	}
 
 	return temp;
@@ -301,7 +302,7 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 //  Server IP Config
 // ===========================================================================
 
-static std::string readServerIP()
+[[maybe_unused]] static std::string readServerIP()
 {
 	std::string ip = NetDefaults::DEFAULT_IP;
 	std::ifstream configFile(NetDefaults::CONFIG_FILE);
@@ -314,6 +315,13 @@ static std::string readServerIP()
 	{
 		printf("config.txt not found — using default: %s\n", ip.c_str());
 	}
+	return ip;
+}
+
+static std::string readSecureServerIP()
+{
+	const std::string ip = SecureConnect::getClientServerIp();
+	printf("Server IP for secure token request: %s\n", ip.c_str());
 	return ip;
 }
 
@@ -642,9 +650,11 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentT
 		return;
 	}
 
-	if (hoistables[msg->hoistableGuid] == nullptr || !hoistables[msg->hoistableGuid]->isValid()) return;
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	if (hoistableIt == hoistables.end() || hoistableIt->second == nullptr || !hoistableIt->second->isValid())
+		return;
 
-	hoistables[msg->hoistableGuid]->setPosition(msg->x, msg->y, msg->z);
+	hoistableIt->second->setPosition(msg->x, msg->y, msg->z);
 	// hoistables[msg->hoistableGuid]->setRotationY(msg->rotationY);
 
 }
@@ -657,9 +667,11 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 
 	for (auto enemyUpdate : updates)
 	{
-		if (enemies[enemyUpdate.first] == nullptr || !enemies[enemyUpdate.first]->isValid()) continue;
+		const auto enemyIt = enemies.find(enemyUpdate.first);
+		if (enemyIt == enemies.end() || enemyIt->second == nullptr || !enemyIt->second->isValid())
+			continue;
 
-		NPC* badBoy = enemies[enemyUpdate.first];
+		NPC* badBoy = enemyIt->second;
 		badBoy->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
 		badBoy->setRotationY(enemyUpdate.second.rot);
 		badBoy->setHealth(enemyUpdate.second.health);
@@ -708,39 +720,29 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 
 static int clientMain()
 {
-	printf("\nConnecting client (insecure)...\n");
+	printf("\nConnecting client with a server-issued token...\n");
 
 	double time = NetDefaults::INITIAL_TIME;
 	double lastSend = time;
 
-	// Generate a random client ID
-	uint64_t clientId = 0;
-	yojimbo_random_bytes(reinterpret_cast<uint8_t*>(&clientId), 8);
-	printf("Client ID: %.16" PRIx64 "\n", clientId);
-
 	// Read server address
-	std::string serverIP = readServerIP();
-	Address serverAddress(serverIP.c_str(), ServerPort);
-
-	// Allow command-line override
-	// if (argc == 2)
-	// {
-	// 	Address cliAddr(argv[1]);
-	// 	if (cliAddr.IsValid())
-	// 	{
-	// 		if (cliAddr.GetPort() == 0)
-	// 			cliAddr.SetPort(ServerPort);
-	// 		serverAddress = cliAddr;
-	// 	}
-	// }
+	std::string serverIP = readSecureServerIP();
 
 	// Connect
 	ClientServerConfig config;
 	ConfigureGameNetworking(config);
 	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, time);
 
-	uint8_t privateKey[KeyBytes] = {};
-	client.InsecureConnect(privateKey, clientId, serverAddress);
+	uint64_t clientId = 0;
+	uint8_t connectToken[ConnectTokenBytes] = {};
+	if (!SecureConnect::requestConnectTokenFromServer(serverIP, clientId, connectToken))
+	{
+		printf("Failed to request connect token from %s:%d\n", serverIP.c_str(), SecureConnect::ConnectTokenPort);
+		return 1;
+	}
+
+	printf("Client ID from server token: %.16" PRIx64 "\n", clientId);
+	client.Connect(clientId, connectToken);
 
 	char addrStr[256];
 	client.GetAddress().ToString(addrStr, sizeof(addrStr));
@@ -802,17 +804,17 @@ static int clientMain()
 				readLocalPlayerState();
 
 				auto* msg = static_cast<PositionMessage*>(client.CreateMessage(POSITION_UPDATE));
-				msg->x = localPos.x;
-				msg->y = localPos.y;
-				msg->z = localPos.z;
-				msg->rotationY = localRot.y;
-				msg->animation = localAnimation;
-				msg->animFrame = localAnimFrame;
-				msg->lastAnimFrame = localLastAnimFrame;
+				msg->x = NetworkClamp::sanitizePosition(localPos.x);
+				msg->y = NetworkClamp::sanitizePosition(localPos.y);
+				msg->z = NetworkClamp::sanitizePosition(localPos.z);
+				msg->rotationY = NetworkClamp::sanitizeRotationRadians(localRot.y);
+				msg->animation = NetworkClamp::sanitizeAnimation(localAnimation);
+				msg->animFrame = NetworkClamp::sanitizeAnimationFrame(localAnimFrame);
+				msg->lastAnimFrame = NetworkClamp::sanitizeAnimationFrame(localLastAnimFrame);
 				msg->playerGuid = myGuid;
 
-				msg->bilboWeapon = bilboWeapon;
-				msg->nowLevel = nowLevel;
+				msg->bilboWeapon = NetworkClamp::sanitizeWeapon(bilboWeapon);
+				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 				client.SendMessage(channels::Gameplay, msg);
 
@@ -826,7 +828,7 @@ static int clientMain()
 
 					msgEnemy->enemies = enemiesPosSnap;
 
-					msgEnemy->nowLevel = nowLevel;
+					msgEnemy->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 					client.SendMessage(channels::Gameplay, msgEnemy);
 					//////////////////////////////////
@@ -837,14 +839,14 @@ static int clientMain()
 
 						Vector3 v = hoists.second->getPosition();
 
-						msgHoistable->x = v.x;
-						msgHoistable->y = v.y;
-						msgHoistable->z = v.z;
+						msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
+						msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
+						msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
 
-						msgHoistable->rotationY = hoists.second->getRotationY();
+						msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(hoists.second->getRotationY());
 
 						msgHoistable->hoistableGuid = hoists.first;
-						msgHoistable->nowLevel = nowLevel;
+						msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 						client.SendMessage(channels::Gameplay, msgHoistable);
 					}

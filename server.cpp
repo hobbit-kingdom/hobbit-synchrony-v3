@@ -7,15 +7,18 @@
 */
 
 #include "shared.h"
+#include "SecureConnection.h"
 #include "GuidManager.h"
 
 #undef SendMessage
 
 #include <cstdio>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +42,183 @@ struct CachedSkinData
 };
 
 static std::unordered_map<uint64_t, CachedSkinData> cachedSkins;
+
+class ConnectTokenServer
+{
+public:
+	ConnectTokenServer(const uint8_t privateKey[KeyBytes],
+		const std::string& bindIp,
+		const std::string& publicIp,
+		const ClientServerConfig& config)
+		: m_bindIp(bindIp)
+		, m_publicIp(publicIp)
+		, m_config(config)
+	{
+		memcpy(m_privateKey, privateKey, sizeof(m_privateKey));
+	}
+
+	~ConnectTokenServer()
+	{
+		Stop();
+	}
+
+	bool Start()
+	{
+		if (m_publicIp.empty() || m_publicIp == "0.0.0.0")
+		{
+			printf("Secure token server requires a reachable public_ip/server_ip in %s\n", NetDefaults::CONFIG_FILE);
+			return false;
+		}
+
+		if (SecureConnect::buildServerAddressString(m_publicIp, ServerPort).empty())
+		{
+			printf("Invalid public server address for token generation: %s\n", m_publicIp.c_str());
+			return false;
+		}
+
+		addrinfo hints = {};
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+		hints.ai_flags = AI_PASSIVE;
+
+		addrinfo* result = nullptr;
+		const std::string portString = std::to_string(SecureConnect::ConnectTokenPort);
+		const char* bindHost = m_bindIp.empty() ? nullptr : m_bindIp.c_str();
+		if (getaddrinfo(bindHost, portString.c_str(), &hints, &result) != 0)
+		{
+			printf("Failed to resolve token server bind address %s:%d\n",
+				m_bindIp.empty() ? "*" : m_bindIp.c_str(),
+				SecureConnect::ConnectTokenPort);
+			return false;
+		}
+
+		for (addrinfo* it = result; it != nullptr; it = it->ai_next)
+		{
+			m_listenSocket = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+			if (m_listenSocket == INVALID_SOCKET)
+				continue;
+
+			const BOOL reuseAddress = TRUE;
+			setsockopt(m_listenSocket, SOL_SOCKET, SO_REUSEADDR,
+				reinterpret_cast<const char*>(&reuseAddress), sizeof(reuseAddress));
+
+			if (bind(m_listenSocket, it->ai_addr, static_cast<int>(it->ai_addrlen)) == SOCKET_ERROR)
+			{
+				closesocket(m_listenSocket);
+				m_listenSocket = INVALID_SOCKET;
+				continue;
+			}
+
+			if (listen(m_listenSocket, SOMAXCONN) == SOCKET_ERROR)
+			{
+				closesocket(m_listenSocket);
+				m_listenSocket = INVALID_SOCKET;
+				continue;
+			}
+
+			break;
+		}
+
+		freeaddrinfo(result);
+
+		if (m_listenSocket == INVALID_SOCKET)
+		{
+			printf("Failed to start secure token server on %s:%d\n",
+				m_bindIp.empty() ? "*" : m_bindIp.c_str(),
+				SecureConnect::ConnectTokenPort);
+			return false;
+		}
+
+		m_stopRequested = false;
+		m_thread = std::thread(&ConnectTokenServer::Run, this);
+
+		printf("Secure token server listening on %s:%d and issuing tokens for %s:%d\n",
+			m_bindIp.empty() ? "*" : m_bindIp.c_str(),
+			SecureConnect::ConnectTokenPort,
+			m_publicIp.c_str(),
+			ServerPort);
+
+		return true;
+	}
+
+	void Stop()
+	{
+		m_stopRequested = true;
+
+		if (m_listenSocket != INVALID_SOCKET)
+		{
+			shutdown(m_listenSocket, SD_BOTH);
+			closesocket(m_listenSocket);
+			m_listenSocket = INVALID_SOCKET;
+		}
+
+		if (m_thread.joinable())
+			m_thread.join();
+	}
+
+private:
+	void Run()
+	{
+		while (!m_stopRequested)
+		{
+			SOCKET clientSocket = accept(m_listenSocket, nullptr, nullptr);
+			if (clientSocket == INVALID_SOCKET)
+			{
+				if (m_stopRequested)
+					break;
+
+				const int error = WSAGetLastError();
+				if (error == WSAEINTR || error == WSAENOTSOCK || error == WSAEINVAL)
+					break;
+
+				continue;
+			}
+
+			SecureConnect::applySocketTimeouts(clientSocket, SecureConnect::SocketTimeoutMs);
+			HandleClient(clientSocket);
+			shutdown(clientSocket, SD_BOTH);
+			closesocket(clientSocket);
+		}
+	}
+
+	void HandleClient(SOCKET clientSocket)
+	{
+		SecureConnect::ConnectTokenRequestPacket request;
+		SecureConnect::ConnectTokenResponsePacket response;
+		response.status = SecureConnect::ConnectTokenStatus_ServerError;
+
+		if (!SecureConnect::recvAll(clientSocket, &request, sizeof(request)))
+			return;
+
+		if (!SecureConnect::isValidRequest(request))
+		{
+			response.status = SecureConnect::ConnectTokenStatus_BadRequest;
+			SecureConnect::sendAll(clientSocket, &response, sizeof(response));
+			return;
+		}
+
+		if (!SecureConnect::generateConnectToken(m_privateKey, m_publicIp, m_config,
+			response.clientId, response.connectToken))
+		{
+			SecureConnect::sendAll(clientSocket, &response, sizeof(response));
+			return;
+		}
+
+		response.status = SecureConnect::ConnectTokenStatus_Ok;
+		SecureConnect::sendAll(clientSocket, &response, sizeof(response));
+
+		printf("Issued secure connect token for client %.16" PRIx64 "\n", response.clientId);
+	}
+
+	std::string m_bindIp;
+	std::string m_publicIp;
+	ClientServerConfig m_config;
+	uint8_t m_privateKey[KeyBytes] = {};
+	SOCKET m_listenSocket = INVALID_SOCKET;
+	std::atomic<bool> m_stopRequested = false;
+	std::thread m_thread;
+};
 
 static void sendSkinAnnouncementToClient(Server& server, int clientIndex, uint64_t playerGuid, const std::string& textureName)
 {
@@ -337,7 +517,7 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 
 static int serverMain()
 {
-	printf("Starting server on port %d (insecure)\n", ServerPort);
+	printf("Starting server on port %d with secure connect tokens\n", ServerPort);
 
 	// Load NPC GUIDs from file
 	if (!guidManager.loadFromFile())
@@ -353,31 +533,41 @@ static int serverMain()
 	ConfigureGameNetworking(config);
 
 	uint8_t privateKey[KeyBytes] = {};
+	bool createdPrivateKey = false;
+	if (!SecureConnect::loadOrCreatePrivateKey(SecureConnect::PrivateKeyFile, privateKey, createdPrivateKey))
+	{
+		printf("Failed to load or create %s\n", SecureConnect::PrivateKeyFile);
+		return 1;
+	}
 
-	// Read server bind IP from config.txt
-	std::string bindIP = NetDefaults::DEFAULT_IP;
-	std::ifstream configFile(NetDefaults::CONFIG_FILE);
-	if (configFile.is_open())
-	{
-		std::string line;
-		if (std::getline(configFile, line) && !line.empty())
-		{
-			bindIP = line;
-			printf("Loaded bind IP from config.txt: %s\n", bindIP.c_str());
-		}
-		configFile.close();
-	}
-	else
-	{
-		printf("%s not found, using default IP: %s\n", NetDefaults::CONFIG_FILE, bindIP.c_str());
-	}
+	printf(createdPrivateKey
+		? "Generated server private key at %s\n"
+		: "Loaded server private key from %s\n",
+		SecureConnect::PrivateKeyFile);
+
+	const SecureConnect::NetworkSettings networkSettings = SecureConnect::loadNetworkSettings();
+	printf("Server bind IP: %s\n", networkSettings.bindIp.c_str());
+	printf("Server public IP for tokens: %s\n", networkSettings.publicIp.c_str());
 
 	Server server(GetDefaultAllocator(), privateKey,
-		Address(bindIP.c_str(), ServerPort),
+		Address(networkSettings.bindIp.c_str(), ServerPort),
 		config, serverAdapter, time);
 
 	server.Start(NetDefaults::MAX_CLIENTS);
+	if (!server.IsRunning())
+	{
+		printf("Failed to start the UDP game server\n");
+		return 1;
+	}
+
 	serverAdapter.server = &server;
+
+	ConnectTokenServer tokenServer(privateKey, networkSettings.bindIp, networkSettings.publicIp, config);
+	if (!tokenServer.Start())
+	{
+		server.Stop();
+		return 1;
+	}
 
 	char addrStr[256];
 	server.GetAddress().ToString(addrStr, sizeof(addrStr));
@@ -418,6 +608,7 @@ static int serverMain()
 		yojimbo_sleep(NetDefaults::DELTA_TIME);
 	}
 
+	tokenServer.Stop();
 	server.Stop();
 	return 0;
 }

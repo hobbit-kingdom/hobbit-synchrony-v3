@@ -19,6 +19,29 @@ Network library used for this project
 
 https://github.com/mas-bandwidth/yojimbo
 
+## Secure Connect Tokens
+
+The multiplayer transport now uses Yojimbo's secure `Client::Connect` flow instead of `InsecureConnect`.
+
+- The server owns the private key in `server_private_key.txt`. If the file does not exist, the server generates it on first launch.
+- Clients request a short-lived connect token from the server over `TCP 40001`, then join the game over `UDP 40000`.
+- Do not ship `server_private_key.txt` with the client build.
+
+`config.txt` still supports the old single-line format for local testing:
+
+```txt
+127.0.0.1
+```
+
+For a dedicated host, you can now use key/value settings:
+
+```txt
+bind_ip=0.0.0.0
+public_ip=203.0.113.25
+```
+
+`bind_ip` is what the server listens on locally. `public_ip` is the address written into issued connect tokens and should be the address clients actually use.
+
 ## License
 
 [BSD 3-Clause license](https://opensource.org/licenses/BSD-3-Clause).

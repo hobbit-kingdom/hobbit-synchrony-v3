@@ -81,6 +81,15 @@ struct HoistableStateMessage : public Message
 			serialize_bits(stream, nowLevel, 32);
 		}
 
+		if (!stream.IsWriting)
+		{
+			x = NetworkClamp::sanitizePosition(x);
+			y = NetworkClamp::sanitizePosition(y);
+			z = NetworkClamp::sanitizePosition(z);
+			rotationY = NetworkClamp::sanitizeRotationRadians(rotationY);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
 		return true;
 	}
 
@@ -126,6 +135,19 @@ struct PositionMessage : public Message
 
 		serialize_bits(stream, bilboWeapon, 32);
 		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			x = NetworkClamp::sanitizePosition(x);
+			y = NetworkClamp::sanitizePosition(y);
+			z = NetworkClamp::sanitizePosition(z);
+			rotationY = NetworkClamp::sanitizeRotationRadians(rotationY);
+			animation = NetworkClamp::sanitizeAnimation(animation);
+			animFrame = NetworkClamp::sanitizeAnimationFrame(animFrame);
+			lastAnimFrame = NetworkClamp::sanitizeAnimationFrame(lastAnimFrame);
+			bilboWeapon = NetworkClamp::sanitizeWeapon(bilboWeapon);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
 
 		return true;
 	}
@@ -239,12 +261,16 @@ struct EnemiesStateMessage : public Message
 		if (stream.IsWriting)
 		{
 			// Serialize the number of enemies
-			uint32_t numEnemies = static_cast<uint32_t>(enemies.size());
+			uint32_t numEnemies = static_cast<uint32_t>(std::min(enemies.size(), NetworkClamp::MaxEnemyUpdatesPerMessage));
 			serialize_bits(stream, numEnemies, 16);  // assuming max 65535 enemies
 
 			// Serialize each enemy key-value pair
+			size_t count = 0;
 			for (const auto& pair : enemies)
 			{
+				if (count >= NetworkClamp::MaxEnemyUpdatesPerMessage)
+					break;
+
 				uint64_t guid = pair.first;
 				// uint64_t must be serialized as two 32-bit halves
 				uint32_t guid_low = static_cast<uint32_t>(guid);
@@ -252,13 +278,15 @@ struct EnemiesStateMessage : public Message
 				serialize_bits(stream, guid_low, 32);
 				serialize_bits(stream, guid_high, 32);
 
-				Enemy e = pair.second;  // copy to non-const
+				Enemy e = NetworkClamp::sanitizeEnemy(pair.second);
 				serialize_float(stream, e.x);
 				serialize_float(stream, e.y);
 				serialize_float(stream, e.z);
 				serialize_float(stream, e.rot);
 				serialize_bits(stream, e.anim, 32);
 				serialize_float(stream, e.health);
+
+				++count;
 			}
 
 			serialize_bits(stream, nowLevel, 32);
@@ -268,6 +296,8 @@ struct EnemiesStateMessage : public Message
 			// Deserialize the number of enemies
 			uint32_t numEnemies;
 			serialize_bits(stream, numEnemies, 16);
+			if (numEnemies > NetworkClamp::MaxEnemyUpdatesPerMessage)
+				return false;
 
 			enemies.clear();
 
@@ -289,10 +319,12 @@ struct EnemiesStateMessage : public Message
 				serialize_bits(stream, e.anim, 32);
 				serialize_float(stream, e.health);
 
-				enemies[guid] = e;
+				if (guid != 0)
+					enemies[guid] = NetworkClamp::sanitizeEnemy(e);
 			}
 
 			serialize_bits(stream, nowLevel, 32);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 		}
 
 		return true;
