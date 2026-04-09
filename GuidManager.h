@@ -28,6 +28,12 @@ public:
     /// Get the GUID assigned to a client. Returns 0 if not assigned.
     uint64_t getGuid(int clientIndex) const;
 
+    /// Get the fixed Bilbo slot index associated with a GUID. Returns 0 if not found.
+    int getGuidSlot(uint64_t guid) const;
+
+    /// Get the canonical diffuse texture filename for a GUID, eg. bilb3[d].xbmp.
+    std::string getSkinFileName(uint64_t guid) const;
+
     /// Check if any GUIDs are available for assignment.
     bool hasAvailableGuids() const { return !availableGuids_.empty(); }
 

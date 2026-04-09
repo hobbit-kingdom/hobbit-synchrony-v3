@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <vector>
 #include "GameTypes.h"
+#include "SkinSystem.h"
 #include <unordered_map>
 
 using namespace yojimbo;
@@ -24,6 +25,9 @@ enum GameMessageType
 	ENEMIES_UPDATE,
 	HOISTABLE_UPDATE,
 	GUID_ASSIGN,
+	SKIN_ANNOUNCE,
+	SKIN_FILE_TRANSFER,
+	SKIN_CLEAR,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -145,6 +149,71 @@ struct GuidAssignMessage : public Message
 		serialize_bits(stream, guid_low, 32);
 		serialize_bits(stream, guid_high, 32);
 		guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct SkinAnnouncementMessage : public Message
+{
+	uint64_t playerGuid = 0;
+	char     textureName[SkinSync::MaxTextureNameLength] = {};
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
+		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+
+		serialize_string(stream, textureName, sizeof(textureName));
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct SkinFileTransferMessage : public BlockMessage
+{
+	uint64_t playerGuid = 0;
+	char     textureName[SkinSync::MaxTextureNameLength] = {};
+	char     fileName[SkinSync::MaxFileNameLength] = {};
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
+		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+
+		serialize_string(stream, textureName, sizeof(textureName));
+		serialize_string(stream, fileName, sizeof(fileName));
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct SkinClearMessage : public Message
+{
+	uint64_t playerGuid = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
+		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
 
 		return true;
 	}

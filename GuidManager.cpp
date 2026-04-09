@@ -3,6 +3,8 @@
     Implementation of GUID loading and client assignment.
 */
 
+#include <algorithm>
+
 #include "GuidManager.h"
 #include "shared.h"
 
@@ -10,6 +12,7 @@ bool GuidManager::loadFromFile(const std::string& filePath)
 {
     allGuids_ = loadGuidsFromFile(filePath);
     availableGuids_ = allGuids_;
+    std::reverse(availableGuids_.begin(), availableGuids_.end());
 
     return !allGuids_.empty();
 }
@@ -47,4 +50,14 @@ uint64_t GuidManager::getGuid(int clientIndex) const
 {
     auto it = clientGuidMap_.find(clientIndex);
     return (it != clientGuidMap_.end()) ? it->second : 0;
+}
+
+int GuidManager::getGuidSlot(uint64_t guid) const
+{
+    return SkinSync::getGuidSlotIndex(allGuids_, guid);
+}
+
+std::string GuidManager::getSkinFileName(uint64_t guid) const
+{
+    return SkinSync::getGuidBoundSkinFileName(allGuids_, guid);
 }

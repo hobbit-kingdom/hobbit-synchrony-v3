@@ -13,8 +13,11 @@
 
 #include <cstdio>
 #include <csignal>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 using namespace yojimbo;
 
@@ -27,6 +30,112 @@ static volatile int quit = 0;
 static void interruptHandler(int) { quit = 1; }
 
 static GuidManager guidManager;
+
+struct CachedSkinData
+{
+	std::string textureName;
+	std::string fileName;
+	std::vector<uint8_t> fileBytes;
+};
+
+static std::unordered_map<uint64_t, CachedSkinData> cachedSkins;
+
+static void sendSkinAnnouncementToClient(Server& server, int clientIndex, uint64_t playerGuid, const std::string& textureName)
+{
+	if (textureName.empty())
+		return;
+
+	auto* msg = static_cast<SkinAnnouncementMessage*>(
+		server.CreateMessage(clientIndex, SKIN_ANNOUNCE));
+	if (!msg)
+		return;
+
+	msg->playerGuid = playerGuid;
+	SkinSync::copyStringToBuffer(textureName, msg->textureName, sizeof(msg->textureName));
+	server.SendMessage(clientIndex, channels::Skin, msg);
+}
+
+static void sendSkinClearToClient(Server& server, int clientIndex, uint64_t playerGuid)
+{
+	auto* msg = static_cast<SkinClearMessage*>(
+		server.CreateMessage(clientIndex, SKIN_CLEAR));
+	if (!msg)
+		return;
+
+	msg->playerGuid = playerGuid;
+	server.SendMessage(clientIndex, channels::Skin, msg);
+}
+
+static void sendSkinFileToClient(Server& server, int clientIndex, uint64_t playerGuid, const CachedSkinData& skinData)
+{
+	if (skinData.fileBytes.empty())
+		return;
+
+	auto* msg = static_cast<SkinFileTransferMessage*>(
+		server.CreateMessage(clientIndex, SKIN_FILE_TRANSFER));
+	if (!msg)
+		return;
+
+	msg->playerGuid = playerGuid;
+	SkinSync::copyStringToBuffer(skinData.textureName, msg->textureName, sizeof(msg->textureName));
+	SkinSync::copyStringToBuffer(skinData.fileName, msg->fileName, sizeof(msg->fileName));
+
+	uint8_t* block = server.AllocateBlock(clientIndex, static_cast<int>(skinData.fileBytes.size()));
+	if (!block)
+	{
+		server.ReleaseMessage(clientIndex, msg);
+		return;
+	}
+
+	std::memcpy(block, skinData.fileBytes.data(), skinData.fileBytes.size());
+	server.AttachBlockToMessage(clientIndex, msg, block, static_cast<int>(skinData.fileBytes.size()));
+	server.SendMessage(clientIndex, channels::Skin, msg);
+}
+
+static void replayCachedSkinsToClient(Server& server, int clientIndex)
+{
+	for (const auto& pair : cachedSkins)
+	{
+		if (!pair.second.textureName.empty())
+			sendSkinAnnouncementToClient(server, clientIndex, pair.first, pair.second.textureName);
+
+		if (!pair.second.fileBytes.empty())
+			sendSkinFileToClient(server, clientIndex, pair.first, pair.second);
+	}
+}
+
+static void broadcastSkinAnnouncement(Server& server, int senderIndex, uint64_t playerGuid, const std::string& textureName)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; ++i)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		sendSkinAnnouncementToClient(server, i, playerGuid, textureName);
+	}
+}
+
+static void broadcastSkinClear(Server& server, int senderIndex, uint64_t playerGuid)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; ++i)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		sendSkinClearToClient(server, i, playerGuid);
+	}
+}
+
+static void broadcastSkinFile(Server& server, int senderIndex, uint64_t playerGuid, const CachedSkinData& skinData)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; ++i)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		sendSkinFileToClient(server, i, playerGuid, skinData);
+	}
+}
 
 // ===========================================================================
 //  Server Adapter — handles connect/disconnect events
@@ -57,13 +166,23 @@ public:
 			auto* msg = static_cast<GuidAssignMessage*>(
 				server->CreateMessage(clientIndex, GUID_ASSIGN));
 			msg->guid = guid;
-			server->SendMessage(clientIndex, 0, msg);
+			server->SendMessage(clientIndex, channels::Gameplay, msg);
+
+			replayCachedSkinsToClient(*server, clientIndex);
 		}
 	}
 
 	void OnServerClientDisconnected(int clientIndex) override
 	{
+		const uint64_t guid = guidManager.getGuid(clientIndex);
 		guidManager.releaseGuid(clientIndex);
+
+		if (guid != 0)
+		{
+			cachedSkins.erase(guid);
+			if (server)
+				broadcastSkinClear(*server, clientIndex, guid);
+		}
 	}
 };
 
@@ -94,7 +213,7 @@ static void broadcastPosition(Server& server, int senderIndex, PositionMessage* 
 		broadcast->nowLevel = msg->nowLevel;
 		broadcast->playerGuid = senderGuid;
 
-		server.SendMessage(i, 0, broadcast);
+		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
 }
 
@@ -119,7 +238,7 @@ static void broadcastHoistableUpdate(Server& server, int senderIndex, HoistableS
 
 		broadcast->nowLevel = msg->nowLevel;
 
-		server.SendMessage(i, 0, broadcast);
+		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
 }
 
@@ -138,8 +257,54 @@ static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMe
 
 		broadcast->nowLevel = msg->nowLevel;
 
-		server.SendMessage(i, 0, broadcast);
+		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
+}
+
+static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
+{
+	(void) msg;
+
+	const uint64_t playerGuid = guidManager.getGuid(clientIndex);
+	if (playerGuid == 0)
+		return;
+
+	const std::string canonicalFileName = guidManager.getSkinFileName(playerGuid);
+	if (canonicalFileName.empty())
+		return;
+
+	CachedSkinData& skinData = cachedSkins[playerGuid];
+	skinData.textureName = canonicalFileName;
+	skinData.fileName = canonicalFileName;
+	broadcastSkinAnnouncement(server, clientIndex, playerGuid, canonicalFileName);
+}
+
+static void processSkinFileTransfer(Server& server, int clientIndex, SkinFileTransferMessage* msg)
+{
+	const uint64_t playerGuid = guidManager.getGuid(clientIndex);
+	if (playerGuid == 0)
+		return;
+
+	const int blockSize = msg->GetBlockSize();
+	if (blockSize <= 0 || blockSize > SkinSync::MaxSkinFileBytes)
+		return;
+
+	const uint8_t* blockData = msg->GetBlockData();
+	if (!blockData)
+		return;
+
+	CachedSkinData& skinData = cachedSkins[playerGuid];
+	const std::string canonicalFileName = guidManager.getSkinFileName(playerGuid);
+	if (canonicalFileName.empty())
+		return;
+
+	skinData.textureName = canonicalFileName;
+	skinData.fileName = canonicalFileName;
+	skinData.fileBytes.assign(blockData, blockData + blockSize);
+
+	broadcastSkinAnnouncement(server, clientIndex, playerGuid, canonicalFileName);
+
+	broadcastSkinFile(server, clientIndex, playerGuid, skinData);
 }
 
 static void processMessage(Server& server, int clientIndex, Message* message)
@@ -154,6 +319,12 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case HOISTABLE_UPDATE:
 		broadcastHoistableUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
+		break;
+	case SKIN_ANNOUNCE:
+		processSkinAnnouncement(server, clientIndex, static_cast<SkinAnnouncementMessage*>(message));
+		break;
+	case SKIN_FILE_TRANSFER:
+		processSkinFileTransfer(server, clientIndex, static_cast<SkinFileTransferMessage*>(message));
 		break;
 	default:
 		break;
@@ -179,6 +350,7 @@ static int serverMain()
 
 	double time = NetDefaults::INITIAL_TIME;
 	ClientServerConfig config;
+	ConfigureGameNetworking(config);
 
 	uint8_t privateKey[KeyBytes] = {};
 

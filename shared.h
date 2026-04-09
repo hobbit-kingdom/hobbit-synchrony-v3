@@ -39,7 +39,7 @@ inline std::vector<uint64_t> loadGuidsFromFile(const std::string& filePath)
             break;
 
         foundOnFirstTry = false;
-        auto fullPath = std::filesystem::absolute(currentPath);
+        auto fullPath = SkinSync::fs::absolute(currentPath);
         printf("File not found at: %s\n", fullPath.string().c_str());
         printf("Enter the path to FAKE_BILBO_GUID.txt (or 'q' to quit): ");
 

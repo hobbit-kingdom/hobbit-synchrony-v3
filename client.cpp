@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <csignal>
+#include <cstring>
 #include <fstream>
 #include <unordered_map>
 
@@ -33,6 +34,7 @@ using namespace yojimbo;
 // ===========================================================================
 
 static volatile int quit = 0;
+static HINSTANCE moduleInstance = nullptr;
 
 static int isHost = 0;
 static bool processedDataForThisLevel = false;
@@ -64,6 +66,14 @@ static bool levelIsRunning;
 static std::vector<Player> activePlayers;
 
 static std::vector<uint64_t> playerGuids;
+static std::unordered_map<uint64_t, std::string> playerTextureNames;
+static std::unordered_map<uint64_t, std::string> playerSkinFilePaths;
+
+static SkinSync::LocalSkinDefinition localSkinDefinition;
+static bool localSkinLoaded = false;
+static bool localSkinUploadAttempted = false;
+static std::string localSkinConfigPath;
+static std::string localSkinConfigError;
 
 static std::vector<uint64_t> hoistableGuidTest;
 
@@ -77,6 +87,80 @@ std::unordered_map<uint64_t, Hoistable*> hoistables;
 const uint32_t X_POSITION_PTR = 0x0075BA3C;
 
 Hoistable* testHoistable;
+
+static std::string getModuleDirectory(HMODULE module)
+{
+	if (!module && module != nullptr)
+		return {};
+
+	char pathBuffer[MAX_PATH] = {};
+	DWORD pathLength = GetModuleFileNameA(module, pathBuffer, MAX_PATH);
+	if (pathLength == 0 || pathLength >= MAX_PATH)
+		return {};
+
+	return SkinSync::fs::path(pathBuffer).parent_path().string();
+}
+
+static void appendUniqueConfigCandidate(std::vector<std::string>& candidates, const SkinSync::fs::path& path)
+{
+	if (path.empty())
+		return;
+
+	std::error_code error;
+	const std::string normalized = SkinSync::fs::absolute(path, error).string();
+	const std::string value = normalized.empty() ? path.string() : normalized;
+
+	for (const auto& existing : candidates)
+	{
+		if (existing == value)
+			return;
+	}
+
+	candidates.push_back(value);
+}
+
+static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition& outSkin, std::string& loadedPath, std::string& errorMessage)
+{
+	std::vector<std::string> candidates;
+	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SkinSync::LocalSkinConfigFile));
+
+	const std::string exeDirectory = getModuleDirectory(nullptr);
+	if (!exeDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / SkinSync::LocalSkinConfigFile);
+
+	const std::string dllDirectory = getModuleDirectory(moduleInstance);
+	if (!dllDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / SkinSync::LocalSkinConfigFile);
+
+	std::string firstDetailedError;
+
+	for (const auto& candidate : candidates)
+	{
+		std::string candidateError;
+		if (SkinSync::loadLocalSkinDefinition(outSkin, candidate, &candidateError))
+		{
+			loadedPath = candidate;
+			errorMessage.clear();
+			return true;
+		}
+
+		std::error_code error;
+		if (SkinSync::fs::exists(SkinSync::fs::path(candidate), error) && firstDetailedError.empty())
+			firstDetailedError = candidateError;
+	}
+
+	loadedPath.clear();
+	if (!firstDetailedError.empty())
+	{
+		errorMessage = firstDetailedError;
+	}
+	else
+	{
+		errorMessage = "skin_config.txt was not found in the current folder, game exe folder, or DLL folder";
+	}
+
+	return false;
+}
 
 
 // ===========================================================================
@@ -256,6 +340,43 @@ static Player* findPlayerByGuid(uint64_t guid)
 	return nullptr;
 }
 
+static std::string getCanonicalSkinFileNameForGuid(uint64_t guid)
+{
+	return SkinSync::getGuidBoundSkinFileName(playerGuids, guid);
+}
+
+static std::string getTextureNameForGuid(uint64_t guid)
+{
+	const auto it = playerTextureNames.find(guid);
+	if (it != playerTextureNames.end() && !it->second.empty())
+		return it->second;
+
+	return getCanonicalSkinFileNameForGuid(guid);
+}
+
+static std::string getSkinFilePathForGuid(uint64_t guid)
+{
+	const auto it = playerSkinFilePaths.find(guid);
+	return (it != playerSkinFilePaths.end()) ? it->second : std::string();
+}
+
+static bool installSkinBytesForGuid(uint64_t guid, const std::string& announcedFileName, const uint8_t* data, size_t bytes, std::string& savedPath)
+{
+	std::string canonicalFileName = SkinSync::sanitizeFileName(announcedFileName);
+	if (canonicalFileName.empty())
+		canonicalFileName = getCanonicalSkinFileNameForGuid(guid);
+	if (canonicalFileName.empty())
+		return false;
+
+	return SkinSync::saveInstalledSkinFile(canonicalFileName, data, bytes, savedPath);
+}
+
+static void applySkinMetadataToPlayer(Player& player)
+{
+	player.textureName = getTextureNameForGuid(player.npcGuid);
+	player.textureFilePath = getSkinFilePathForGuid(player.npcGuid);
+}
+
 static void updateExistingPlayer(Player& player, PositionMessage* msg, double currentTime)
 {
 	// --- Snapshot previous position ---
@@ -324,6 +445,7 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 
 	player.targetAnimation = msg->animation;
 	player.lerpStartTime = currentTime;
+	applySkinMetadataToPlayer(player);
 }
 
 static void addNewPlayer(PositionMessage* msg, double currentTime)
@@ -335,6 +457,7 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 	newPlayer.setAnimation(msg->animation, msg->animFrame, msg->lastAnimFrame);
 	newPlayer.bilboWeapon = msg->bilboWeapon;
 	newPlayer.nowLevel = msg->nowLevel;
+	applySkinMetadataToPlayer(newPlayer);
 	// Override lastAnimFrame with known range if available
 	if (animFrameRanges.count(msg->animation))
 		newPlayer.lastAnimFrame = animFrameRanges[msg->animation];
@@ -367,6 +490,123 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 	activePlayers.push_back(newPlayer);
 }
 
+static void processSkinAnnouncement(SkinAnnouncementMessage* msg)
+{
+	std::string textureName = SkinSync::sanitizeFileName(msg->textureName);
+	if (textureName.empty())
+		textureName = getCanonicalSkinFileNameForGuid(msg->playerGuid);
+	if (textureName.empty())
+		return;
+
+	playerTextureNames[msg->playerGuid] = textureName;
+
+	if (Player* player = findPlayerByGuid(msg->playerGuid))
+		applySkinMetadataToPlayer(*player);
+
+	printf("Skin mapped: GUID %llu -> texture '%s'\n", msg->playerGuid, textureName.c_str());
+}
+
+static void processSkinFileTransfer(SkinFileTransferMessage* msg)
+{
+	const int blockSize = msg->GetBlockSize();
+	if (blockSize <= 0 || blockSize > SkinSync::MaxSkinFileBytes || !msg->GetBlockData())
+		return;
+
+	std::string textureName = SkinSync::sanitizeFileName(msg->textureName);
+	std::string fileName = SkinSync::sanitizeFileName(msg->fileName);
+	if (fileName.empty())
+		fileName = getCanonicalSkinFileNameForGuid(msg->playerGuid);
+	if (textureName.empty())
+		textureName = fileName;
+	if (!textureName.empty())
+		playerTextureNames[msg->playerGuid] = textureName;
+
+	std::string savedPath;
+	if (installSkinBytesForGuid(msg->playerGuid, fileName,
+		msg->GetBlockData(), static_cast<size_t>(blockSize), savedPath))
+	{
+		playerSkinFilePaths[msg->playerGuid] = savedPath;
+
+		if (Player* player = findPlayerByGuid(msg->playerGuid))
+			applySkinMetadataToPlayer(*player);
+
+		printf("Saved skin file for GUID %llu to %s\n", msg->playerGuid, savedPath.c_str());
+	}
+}
+
+static void processSkinClear(SkinClearMessage* msg)
+{
+	const auto pathIt = playerSkinFilePaths.find(msg->playerGuid);
+	if (pathIt != playerSkinFilePaths.end())
+		SkinSync::removeInstalledSkinFileByPath(pathIt->second);
+
+	playerTextureNames.erase(msg->playerGuid);
+	playerSkinFilePaths.erase(msg->playerGuid);
+
+	if (Player* player = findPlayerByGuid(msg->playerGuid))
+	{
+		player->textureName.clear();
+		player->textureFilePath.clear();
+	}
+
+	printf("Cleared skin mapping for GUID %llu\n", msg->playerGuid);
+}
+
+static void sendLocalSkinData(Client& client)
+{
+	if (localSkinUploadAttempted || !client.IsConnected() || myGuid == 0)
+		return;
+
+	localSkinUploadAttempted = true;
+
+	if (!localSkinLoaded || !localSkinDefinition.enabled)
+		return;
+
+	const std::string canonicalFileName = getCanonicalSkinFileNameForGuid(myGuid);
+	if (canonicalFileName.empty())
+		return;
+
+	std::string savedPath;
+	if (installSkinBytesForGuid(myGuid, canonicalFileName,
+		localSkinDefinition.fileBytes.data(), localSkinDefinition.fileBytes.size(), savedPath))
+	{
+		playerTextureNames[myGuid] = canonicalFileName;
+		playerSkinFilePaths[myGuid] = savedPath;
+	}
+
+	auto* announceMsg = static_cast<SkinAnnouncementMessage*>(client.CreateMessage(SKIN_ANNOUNCE));
+	if (announceMsg)
+	{
+		announceMsg->playerGuid = myGuid;
+		SkinSync::copyStringToBuffer(canonicalFileName, announceMsg->textureName, sizeof(announceMsg->textureName));
+		client.SendMessage(channels::Skin, announceMsg);
+	}
+
+	auto* fileMsg = static_cast<SkinFileTransferMessage*>(client.CreateMessage(SKIN_FILE_TRANSFER));
+	if (!fileMsg)
+		return;
+
+	fileMsg->playerGuid = myGuid;
+	SkinSync::copyStringToBuffer(canonicalFileName, fileMsg->textureName, sizeof(fileMsg->textureName));
+	SkinSync::copyStringToBuffer(canonicalFileName, fileMsg->fileName, sizeof(fileMsg->fileName));
+
+	uint8_t* block = client.AllocateBlock(static_cast<int>(localSkinDefinition.fileBytes.size()));
+	if (!block)
+	{
+		client.ReleaseMessage(fileMsg);
+		return;
+	}
+
+	std::memcpy(block, localSkinDefinition.fileBytes.data(), localSkinDefinition.fileBytes.size());
+	client.AttachBlockToMessage(fileMsg, block, static_cast<int>(localSkinDefinition.fileBytes.size()));
+	client.SendMessage(channels::Skin, fileMsg);
+
+	printf("Uploaded local skin '%s' (%zu bytes) for GUID %llu\n",
+		canonicalFileName.c_str(),
+		localSkinDefinition.fileBytes.size(),
+		myGuid);
+}
+
 // ===========================================================================
 //  Message Dispatch
 // ===========================================================================
@@ -395,7 +635,7 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 		<< "\n";
 }
 
-static void processHoistableUpdate(HoistableStateMessage* msg, double currentTime)
+static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentTime*/)
 {
 	if (msg->nowLevel != nowLevel)
 	{
@@ -409,7 +649,7 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double currentTim
 
 }
 
-static void processEnemiesUpdate(EnemiesStateMessage* msg, double currentTime)
+static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
 {
 	if (msg->nowLevel != nowLevel) return;
 
@@ -429,7 +669,7 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double currentTime)
 	}
 }
 
-static void processMessage(Client& client, Message* message, double time)
+static void processMessage(Client& /*client*/, Message* message, double time)
 {
 	switch (message->GetType())
 	{
@@ -444,7 +684,17 @@ static void processMessage(Client& client, Message* message, double time)
 		break;
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
+		localSkinUploadAttempted = false;
 		printf("Assigned my GUID: %llu\n", myGuid);
+		break;
+	case SKIN_ANNOUNCE:
+		processSkinAnnouncement(static_cast<SkinAnnouncementMessage*>(message));
+		break;
+	case SKIN_FILE_TRANSFER:
+		processSkinFileTransfer(static_cast<SkinFileTransferMessage*>(message));
+		break;
+	case SKIN_CLEAR:
+		processSkinClear(static_cast<SkinClearMessage*>(message));
 		break;
 
 	default:
@@ -486,6 +736,7 @@ static int clientMain()
 
 	// Connect
 	ClientServerConfig config;
+	ConfigureGameNetworking(config);
 	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, time);
 
 	uint8_t privateKey[KeyBytes] = {};
@@ -529,6 +780,8 @@ static int clientMain()
 			}
 		}
 
+		sendLocalSkinData(client);
+
 		// Interpolate all remote players
 		for (auto& player : activePlayers)
 		{
@@ -561,7 +814,7 @@ static int clientMain()
 				msg->bilboWeapon = bilboWeapon;
 				msg->nowLevel = nowLevel;
 
-				client.SendMessage(0, msg);
+				client.SendMessage(channels::Gameplay, msg);
 
 				if (isHost == 1)
 				{
@@ -575,7 +828,7 @@ static int clientMain()
 
 					msgEnemy->nowLevel = nowLevel;
 
-					client.SendMessage(0, msgEnemy);
+					client.SendMessage(channels::Gameplay, msgEnemy);
 					//////////////////////////////////
 
 					for (auto hoists : hoistables)
@@ -593,7 +846,7 @@ static int clientMain()
 						msgHoistable->hoistableGuid = hoists.first;
 						msgHoistable->nowLevel = nowLevel;
 
-						client.SendMessage(0, msgHoistable);
+						client.SendMessage(channels::Gameplay, msgHoistable);
 					}
 				}
 
@@ -652,8 +905,20 @@ int mainThread()
 	processAnalyzer = gameManager.getHobbitProcessAnalyzer();
 
 	playerGuids = loadGuidsFromFile("FAKE_BILBO_GUID.txt");
+	localSkinLoaded = loadLocalSkinDefinitionFromKnownPaths(localSkinDefinition, localSkinConfigPath, localSkinConfigError);
 
 	std::cout << "SIZE " << playerGuids.size() << "\n";
+
+	if (localSkinLoaded)
+	{
+		std::cout << "Loaded local skin config from " << localSkinConfigPath
+			<< ": source '" << localSkinDefinition.filePath << "'\n";
+	}
+	else
+	{
+		std::cout << "Skin sync will stay disabled for this client: "
+			<< localSkinConfigError << "\n";
+	}
 
 	std::cout << "Are you the host? (yes - 1 / no - 0)\n";
 	std::cin >> isHost;
@@ -678,6 +943,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID)
 	DisableThreadLibraryCalls(hInstance);
 
 	if (fdwReason == DLL_PROCESS_ATTACH) {
+		moduleInstance = hInstance;
 		CloseHandle(CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)mainThread, NULL, 0, NULL));
 	}
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include "NPC.h"
 #include "MathUtils.h"
 
@@ -26,6 +27,8 @@ public:
 
 	uint32_t bilboWeapon = 0;
 	uint32_t nowLevel = 0;
+	std::string textureName;
+	std::string textureFilePath;
 
 	// --- In-game representation ---
 	NPC* npc = nullptr;

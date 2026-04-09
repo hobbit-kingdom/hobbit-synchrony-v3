@@ -33,6 +33,9 @@ YOJIMBO_DECLARE_MESSAGE_TYPE(POSITION_UPDATE, PositionMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(ENEMIES_UPDATE, EnemiesStateMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(HOISTABLE_UPDATE, HoistableStateMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(GUID_ASSIGN, GuidAssignMessage);
+YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_ANNOUNCE, SkinAnnouncementMessage);
+YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_FILE_TRANSFER, SkinFileTransferMessage);
+YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_CLEAR, SkinClearMessage);
 YOJIMBO_MESSAGE_FACTORY_FINISH();
 
 // ---------------------------------------------------------------------------
@@ -49,3 +52,11 @@ public:
 };
 
 static GameAdapter gameAdapter;
+
+inline void ConfigureGameNetworking(ClientServerConfig& config)
+{
+	config.numChannels = 2;
+	config.channel[channels::Gameplay].type = CHANNEL_TYPE_RELIABLE_ORDERED;
+	config.channel[channels::Skin].type = CHANNEL_TYPE_RELIABLE_ORDERED;
+	config.channel[channels::Skin].maxBlockSize = SkinSync::MaxSkinFileBytes;
+}
