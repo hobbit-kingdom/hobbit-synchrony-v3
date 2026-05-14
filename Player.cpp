@@ -80,6 +80,10 @@ void Player::tickLerp(float t)
 	//animFrame = MathUtils::lerp(prevAnimFrame, targetAnimFrame, t);
 	//lastAnimFrame = targetLastAnimFrame;
 
+	// --- Marker ---
+	if(nickname_marker)
+		nickname_marker->setPosition(x, y + 100.f, z);
+
 	if (animation > 0 && animation <= 200)
 	{
 		float wrappedFrame = animFrame;

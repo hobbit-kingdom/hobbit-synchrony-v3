@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include "NPC.h"
+#include "Marker.h"
 #include "MathUtils.h"
 
 class Player
@@ -32,6 +33,7 @@ public:
 
 	// --- In-game representation ---
 	NPC* npc = nullptr;
+	Marker* nickname_marker = nullptr;
 
 	// --- Interpolation: position ---
 	float prevX = 0.0f, prevY = 0.0f, prevZ = 0.0f;

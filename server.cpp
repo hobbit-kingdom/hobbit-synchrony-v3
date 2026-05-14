@@ -441,6 +441,26 @@ static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMe
 	}
 }
 
+static void broadcastNicknameUpdate(Server& server, int senderIndex, NicknameUpdateMessage* msg)
+{
+	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<NicknameUpdateMessage*>(
+			server.CreateMessage(i, NICKNAME_UPDATE));
+
+		broadcast->player_guid = msg->player_guid;
+		strncpy(broadcast->new_name, msg->new_name, 32);
+		broadcast->new_name[31] = '\0';
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
 	(void) msg;
@@ -506,6 +526,8 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 	case SKIN_FILE_TRANSFER:
 		processSkinFileTransfer(server, clientIndex, static_cast<SkinFileTransferMessage*>(message));
 		break;
+	case NICKNAME_UPDATE:
+		broadcastNicknameUpdate(server, clientIndex, static_cast<NicknameUpdateMessage*>(message));
 	default:
 		break;
 	}

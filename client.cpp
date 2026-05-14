@@ -12,12 +12,14 @@
 #include "SecureConnection.h"
 #include "Player.h"
 #include "NPC.h"
+#include "Marker.h"
 #include "HobbitGameManager/HobbitGameManager.h"
 #include "HobbitGameManager/HobbitProcessAnalyzer.h"
 
 #undef SetPort
 #undef SendMessage
 
+#include <conio.h>
 #include <cstdio>
 #include <csignal>
 #include <cstring>
@@ -62,6 +64,8 @@ static float    localLastAnimFrame = 0.0f;
 static uint32_t bilboWeapon;
 static uint32_t nowLevel;
 static bool levelIsRunning;
+
+static uint64_t myNicknameGuid = 0;
 
 // --- Remote players ---
 static std::vector<Player> activePlayers;
@@ -248,11 +252,18 @@ static void readGamePointers()
 
 }
 
+static Vector3 getBilboPos(void)
+{
+	Vector3 pos;
+	pos.x = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7C4);
+	pos.y = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7C8);
+	pos.z = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7CC);
+	return pos;
+}
+
 static void readLocalPlayerState()
 {
-	localPos.x = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7C4);
-	localPos.y = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7C8);
-	localPos.z = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7CC);
+	localPos = getBilboPos();
 	localRot.y = processAnalyzer->readData<float>(bilboPosBasePtr + 0x7AC);
 
 	localAnimation = processAnalyzer->readData<uint32_t>(bilboAnimPtr);
@@ -451,6 +462,8 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 		}
 	}
 
+	player.nickname_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
+
 	player.targetAnimation = msg->animation;
 	player.lerpStartTime = currentTime;
 	applySkinMetadataToPlayer(player);
@@ -493,6 +506,12 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 			}
 			newPlayer.npc->setWeapon(msg->bilboWeapon);
 		}
+
+		uint64_t nicknameGuid = (newPlayer.npcGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
+
+		newPlayer.nickname_marker = new Marker(processAnalyzer);
+		newPlayer.nickname_marker->initializeByGuid(nicknameGuid);
+		newPlayer.nickname_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
 	}
 
 	activePlayers.push_back(newPlayer);
@@ -631,6 +650,7 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 		updateExistingPlayer(*existing, msg, currentTime);
 	else
 		addNewPlayer(msg, currentTime);
+	/*
 	std::cout << "Player " << std::hex << msg->playerGuid << std::dec
 		<< ": pos(" << msg->x << ", "
 		<< msg->y << ", "
@@ -641,6 +661,7 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 		<< msg->bilboWeapon << ") level("
 		<< msg->nowLevel << ")"
 		<< "\n";
+	*/
 }
 
 static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentTime*/)
@@ -681,6 +702,22 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 	}
 }
 
+static void processNicknameUpdate(NicknameUpdateMessage* msg)
+{
+	std::cout << "processNicknameUpdate\r\n";
+	std::cout << "player GUID = " << msg->player_guid << "\r\n";
+	std::cout << "new name = " << msg->new_name << "\r\n";
+
+	Player* pl = findPlayerByGuid(msg->player_guid);
+	if(pl) {
+		std::cout << "playerFound\r\n";
+		if(pl->nickname_marker) {
+			std::cout << "markerFound\r\n";
+			pl->nickname_marker->setText(msg->new_name);
+		}
+	}
+}
+
 static void processMessage(Client& /*client*/, Message* message, double time)
 {
 	switch (message->GetType())
@@ -698,6 +735,9 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
 		localSkinUploadAttempted = false;
 		printf("Assigned my GUID: %llu\n", myGuid);
+
+		myNicknameGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
+
 		break;
 	case SKIN_ANNOUNCE:
 		processSkinAnnouncement(static_cast<SkinAnnouncementMessage*>(message));
@@ -707,6 +747,10 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 		break;
 	case SKIN_CLEAR:
 		processSkinClear(static_cast<SkinClearMessage*>(message));
+		break;
+
+	case NICKNAME_UPDATE:
+		processNicknameUpdate(static_cast<NicknameUpdateMessage*>(message));
 		break;
 
 	default:
@@ -755,7 +799,6 @@ static int clientMain()
 	{
 		client.SendPackets();
 		client.ReceivePackets();
-
 
 		if (gameManager.isOnLevel() && !processedDataForThisLevel)
 		{
@@ -856,6 +899,36 @@ static int clientMain()
 
 
 				lastSend = time;
+			}
+		}
+		
+		// update marker
+		{
+			Marker marker(processAnalyzer);
+			marker.initializeByGuid(myNicknameGuid);
+
+			Vector3 p = getBilboPos();
+			p.y += 100.f;
+			marker.setPosition(p.x, p.y, p.z);
+
+			if(kbhit()) {
+				char buf[128];
+				fgets(buf, 128, stdin);
+				marker.setText(buf);
+
+				{
+					auto* xmsg = static_cast<NicknameUpdateMessage*>(client.CreateMessage(NICKNAME_UPDATE));
+
+					xmsg->player_guid = myGuid;
+					strncpy(xmsg->new_name, buf, sizeof(xmsg->new_name));
+					xmsg->new_name[31] = '\0';
+
+					client.SendMessage(channels::Gameplay, xmsg);
+
+					std::cout << "sent nickname update\r\n";
+					std::cout << "player GUID = " << myGuid << "\r\n";
+					std::cout << "new name = " << xmsg->new_name << "\r\n";
+				}
 			}
 		}
 

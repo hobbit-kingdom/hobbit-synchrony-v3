@@ -36,6 +36,7 @@ YOJIMBO_DECLARE_MESSAGE_TYPE(GUID_ASSIGN, GuidAssignMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_ANNOUNCE, SkinAnnouncementMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_FILE_TRANSFER, SkinFileTransferMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(SKIN_CLEAR, SkinClearMessage);
+YOJIMBO_DECLARE_MESSAGE_TYPE(NICKNAME_UPDATE, NicknameUpdateMessage);
 YOJIMBO_MESSAGE_FACTORY_FINISH();
 
 // ---------------------------------------------------------------------------

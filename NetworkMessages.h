@@ -28,6 +28,7 @@ enum GameMessageType
 	SKIN_ANNOUNCE,
 	SKIN_FILE_TRANSFER,
 	SKIN_CLEAR,
+	NICKNAME_UPDATE,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -326,6 +327,27 @@ struct EnemiesStateMessage : public Message
 			serialize_bits(stream, nowLevel, 32);
 			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct NicknameUpdateMessage : public Message
+{
+	uint64_t player_guid = 0;
+	char new_name[32];
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(player_guid);
+		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_string(stream, new_name, sizeof(new_name));
 
 		return true;
 	}
