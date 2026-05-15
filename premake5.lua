@@ -4,6 +4,7 @@ yojimbo_version = "1.0"
 solution "Yojimbo"
     kind "ConsoleApp"
     language "C++"
+    cppdialect "C++17"
     configurations { "Debug", "Release" }
     includedirs { ".", "include", "sodium", "tlsf", "netcode", "reliable", "serialize" }
     if not os.istarget "windows" then
@@ -58,14 +59,15 @@ project "yojimbo"
     files { "include/*.h", "source/*.cpp" }
 
 project "client"
-    files { "client.cpp", "shared.h" }
+	kind "SharedLib"
+    files { "client.cpp", "Hoistable.cpp", "Hoistable.h", "Marker.cpp", "Marker.h", "NPC.cpp", "NPC.h", "Player.cpp", "Player.h", "shared.h" }
     filter "system:windows"
         links { "yojimbo", "sodium-builtin", "tlsf", "netcode", "reliable" }
     filter "system:not windows"
         links { "yojimbo", "sodium", "tlsf", "netcode", "reliable" }
 
 project "server"
-    files { "server.cpp", "shared.h" }
+    files { "GuidManager.cpp", "server.cpp", "shared.h" }
     filter "system:windows"
         links { "yojimbo", "sodium-builtin", "tlsf", "netcode", "reliable" }
     filter "system:not windows"
