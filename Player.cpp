@@ -80,9 +80,11 @@ void Player::tickLerp(float t)
 	//animFrame = MathUtils::lerp(prevAnimFrame, targetAnimFrame, t);
 	//lastAnimFrame = targetLastAnimFrame;
 
-	// --- Marker ---
+	// --- Marker(s) ---
 	if(nickname_marker)
-		nickname_marker->setPosition(x, y + 100.f, z);
+		nickname_marker->setPosition(x, y + 110.f, z);
+	if(status_marker)
+		status_marker->setPosition(x, y + 103.f, z);
 
 	if (animation > 0 && animation <= 200)
 	{

@@ -454,8 +454,48 @@ static void broadcastNicknameUpdate(Server& server, int senderIndex, NicknameUpd
 			server.CreateMessage(i, NICKNAME_UPDATE));
 
 		broadcast->player_guid = msg->player_guid;
-		strncpy(broadcast->new_name, msg->new_name, 32);
-		broadcast->new_name[31] = '\0';
+		strncpy(broadcast->new_name, msg->new_name, sizeof(msg->new_name));
+		broadcast->new_name[sizeof(msg->new_name)-1] = '\0';
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastStatusUpdate(Server& server, int senderIndex, StatusUpdateMessage* msg)
+{
+	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<StatusUpdateMessage*>(
+			server.CreateMessage(i, STATUS_UPDATE));
+
+		broadcast->player_guid = msg->player_guid;
+		strncpy(broadcast->new_status, msg->new_status, sizeof(msg->new_status));
+		broadcast->new_status[sizeof(msg->new_status)-1] = '\0';
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastChatMessage(Server& server, int senderIndex, ChatMsgMessage* msg)
+{
+	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (/*i == senderIndex ||*/ !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<ChatMsgMessage*>(
+			server.CreateMessage(i, CHAT_MESSAGE));
+
+		broadcast->player_guid = msg->player_guid;
+		strncpy(broadcast->msg, msg->msg, sizeof(msg->msg));
+		broadcast->msg[sizeof(msg->msg)-1] = '\0';
 
 		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
@@ -528,6 +568,13 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case NICKNAME_UPDATE:
 		broadcastNicknameUpdate(server, clientIndex, static_cast<NicknameUpdateMessage*>(message));
+		break;
+	case STATUS_UPDATE:
+		broadcastStatusUpdate(server, clientIndex, static_cast<StatusUpdateMessage*>(message));
+		break;
+	case CHAT_MESSAGE:
+		broadcastChatMessage(server, clientIndex, static_cast<ChatMsgMessage*>(message));
+		break;
 	default:
 		break;
 	}

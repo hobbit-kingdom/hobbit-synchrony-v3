@@ -29,6 +29,8 @@ enum GameMessageType
 	SKIN_FILE_TRANSFER,
 	SKIN_CLEAR,
 	NICKNAME_UPDATE,
+	STATUS_UPDATE,
+	CHAT_MESSAGE,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -348,6 +350,48 @@ struct NicknameUpdateMessage : public Message
 		serialize_bits(stream, guid_high, 32);
 		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
 		serialize_string(stream, new_name, sizeof(new_name));
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct StatusUpdateMessage : public Message
+{
+	uint64_t player_guid = 0;
+	char new_status[64];
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(player_guid);
+		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_string(stream, new_status, sizeof(new_status));
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct ChatMsgMessage : public Message
+{
+	uint64_t player_guid = 0; // sender GUID
+	char msg[128];
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		uint32_t guid_low = static_cast<uint32_t>(player_guid);
+		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
+		serialize_bits(stream, guid_low, 32);
+		serialize_bits(stream, guid_high, 32);
+		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_string(stream, msg, sizeof(msg));
 
 		return true;
 	}

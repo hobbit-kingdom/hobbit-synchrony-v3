@@ -49,7 +49,6 @@ static void interruptHandler(int) { quit = 1; }
 // --- Game process interface ---
 static HobbitGameManager       gameManager;
 static HobbitProcessAnalyzer* processAnalyzer = nullptr;
-static yojimbo::Client*        g_Client = nullptr;
 
 // --- Cached pointers into game memory ---
 static uint32_t bilboPosBasePtr = 0;
@@ -68,6 +67,9 @@ static uint32_t nowLevel;
 static bool levelIsRunning;
 
 static uint64_t myNicknameGuid = 0;
+static uint64_t myStatusGuid = 0;
+
+static std::string myNickname = "Username";
 
 // --- Remote players ---
 static std::vector<Player> activePlayers;
@@ -464,7 +466,11 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 		}
 	}
 
-	player.nickname_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
+	/* is it worth it ? these two updated in Player::tickLerp anyway */
+	if(player.nickname_marker)
+		player.nickname_marker->setPosition(msg->x, msg->y + 120.f, msg->z);
+	if(player.status_marker)
+		player.status_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
 
 	player.targetAnimation = msg->animation;
 	player.lerpStartTime = currentTime;
@@ -513,7 +519,13 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 
 		newPlayer.nickname_marker = new Marker(processAnalyzer);
 		newPlayer.nickname_marker->initializeByGuid(nicknameGuid);
-		newPlayer.nickname_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
+		newPlayer.nickname_marker->setPosition(msg->x, msg->y + 120.f, msg->z);
+
+		uint64_t statusGuid = (newPlayer.npcGuid & 0xFFFFFFFF) | 0x0D8AD91200000000ull;
+
+		newPlayer.status_marker = new Marker(processAnalyzer);
+		newPlayer.status_marker->initializeByGuid(statusGuid);
+		newPlayer.status_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
 	}
 
 	activePlayers.push_back(newPlayer);
@@ -713,11 +725,50 @@ static void processNicknameUpdate(NicknameUpdateMessage* msg)
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
 		std::cout << "playerFound\r\n";
+		pl->nickname = msg->new_name;
 		if (pl->nickname_marker) {
 			std::cout << "markerFound\r\n";
 			pl->nickname_marker->setText(msg->new_name);
 		}
 	}
+}
+
+static void processStatusUpdate(StatusUpdateMessage* msg)
+{
+	std::cout << "processStatusUpdate\r\n";
+	std::cout << "player GUID = " << msg->player_guid << "\r\n";
+	std::cout << "new status = " << msg->new_status << "\r\n";
+
+	Player* pl = findPlayerByGuid(msg->player_guid);
+	if (pl) {
+		std::cout << "playerFound\r\n";
+		if (pl->status_marker) {
+			std::cout << "markerFound\r\n";
+			pl->status_marker->setText(msg->new_status);
+		}
+	}
+}
+
+static void processChatMessage(ChatMsgMessage* msg)
+{
+	std::cout << "processChatMessage\r\n";
+	std::cout << "player GUID = " << msg->player_guid << "\r\n";
+	std::cout << "msg = " << msg->msg << "\r\n";
+
+	std::string sender_name;
+
+	if(msg->player_guid == myGuid) {
+		sender_name = myNickname;
+	} else {
+		Player* pl = findPlayerByGuid(msg->player_guid);
+		if (pl) {
+			sender_name = pl->nickname;
+		} else {
+			sender_name = "Unknown";
+		}
+	}
+
+	g_ChatOverlay.AddSystemMessage("[" + sender_name + "] " + msg->msg);
 }
 
 static void processMessage(Client& /*client*/, Message* message, double time)
@@ -739,6 +790,7 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 		printf("Assigned my GUID: %llu\n", myGuid);
 
 		myNicknameGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
+		myStatusGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91200000000ull;
 
 		break;
 	case SKIN_ANNOUNCE:
@@ -754,30 +806,77 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 	case NICKNAME_UPDATE:
 		processNicknameUpdate(static_cast<NicknameUpdateMessage*>(message));
 		break;
+	case STATUS_UPDATE:
+		processStatusUpdate(static_cast<StatusUpdateMessage*>(message));
+		break;
+	case CHAT_MESSAGE:
+		processChatMessage(static_cast<ChatMsgMessage*>(message));
+		break;
 
 	default:
 		break;
 	}
 }
 
-static void OnChatNickname(const std::string& name)
+// chat commands
+static yojimbo::Client* g_Client = nullptr;
+
+static void ChatMessage(const std::string& message)
 {
 	if (!g_Client || myGuid == 0)
 		return;
 
+	// Send network message
+	auto* xmsg = static_cast<ChatMsgMessage*>(g_Client->CreateMessage(CHAT_MESSAGE));
+	xmsg->player_guid = myGuid;
+	strncpy(xmsg->msg, message.c_str(), sizeof(xmsg->msg));
+	xmsg->msg[sizeof(xmsg->msg)-1] = '\0';
+	g_Client->SendMessage(channels::Gameplay, xmsg);
+
+//	std::cout << "sent chat message\r\n";
+//	std::cout << "player GUID = " << myGuid << "\r\n";
+//	std::cout << "message = " << xmsg->msg << "\r\n";
+}
+
+static void ChatCommandNickname(const std::string& name)
+{
+	if (!g_Client || myGuid == 0)
+		return;
+
+	myNickname = name;
+
 	// Update local marker
 	Marker marker(processAnalyzer);
 	marker.initializeByGuid(myNicknameGuid);
-	Vector3 p = getBilboPos();
-	p.y += 100.f;
-	marker.setPosition(p.x, p.y, p.z);
 	marker.setText(name.c_str());
 
 	// Send network message
 	auto* xmsg = static_cast<NicknameUpdateMessage*>(g_Client->CreateMessage(NICKNAME_UPDATE));
 	xmsg->player_guid = myGuid;
 	strncpy(xmsg->new_name, name.c_str(), sizeof(xmsg->new_name));
-	xmsg->new_name[31] = '\0';
+	xmsg->new_name[sizeof(xmsg->new_name)-1] = '\0';
+	g_Client->SendMessage(channels::Gameplay, xmsg);
+
+//	std::cout << "sent nickname update\r\n";
+//	std::cout << "player GUID = " << myGuid << "\r\n";
+//	std::cout << "new name = " << xmsg->new_name << "\r\n";
+}
+
+static void ChatCommandStatus(const std::string& status)
+{
+	if (!g_Client || myGuid == 0)
+		return;
+
+	// Update local marker
+	Marker marker(processAnalyzer);
+	marker.initializeByGuid(myStatusGuid);
+	marker.setText(status.c_str());
+
+	// Send network message
+	auto* xmsg = static_cast<StatusUpdateMessage*>(g_Client->CreateMessage(STATUS_UPDATE));
+	xmsg->player_guid = myGuid;
+	strncpy(xmsg->new_status, status.c_str(), sizeof(xmsg->new_status));
+	xmsg->new_status[sizeof(xmsg->new_status)-1] = '\0';
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 }
 
@@ -800,8 +899,11 @@ static int clientMain()
 	ConfigureGameNetworking(config);
 	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, time);
 
+	// add chat commands
 	g_Client = &client;
-	ChatOverlay_SetNicknameCallback(OnChatNickname);
+	g_ChatOverlay.SetMsgCallback(ChatMessage);
+	g_ChatOverlay.AddCommand("/name", "<nickname> - Change your nickname", ChatCommandNickname);
+	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
 
 	uint64_t clientId = 0;
 	uint8_t connectToken[ConnectTokenBytes] = {};
@@ -921,41 +1023,25 @@ static int clientMain()
 					}
 				}
 
-
-
-
 				lastSend = time;
 			}
 		}
 
-		// update marker
+		// update marker(s)
 		{
 			Marker marker(processAnalyzer);
 			marker.initializeByGuid(myNicknameGuid);
 
 			Vector3 p = getBilboPos();
-			p.y += 100.f;
+			p.y += 110.f;
 			marker.setPosition(p.x, p.y, p.z);
 
-			if (kbhit()) {
-				char buf[128];
-				fgets(buf, 128, stdin);
-				marker.setText(buf);
+			Marker marker2(processAnalyzer);
+			marker2.initializeByGuid(myStatusGuid);
 
-				{
-					auto* xmsg = static_cast<NicknameUpdateMessage*>(client.CreateMessage(NICKNAME_UPDATE));
-
-					xmsg->player_guid = myGuid;
-					strncpy(xmsg->new_name, buf, sizeof(xmsg->new_name));
-					xmsg->new_name[31] = '\0';
-
-					client.SendMessage(channels::Gameplay, xmsg);
-
-					std::cout << "sent nickname update\r\n";
-					std::cout << "player GUID = " << myGuid << "\r\n";
-					std::cout << "new name = " << xmsg->new_name << "\r\n";
-				}
-			}
+			Vector3 p2 = getBilboPos();
+			p2.y += 103.f;
+			marker2.setPosition(p2.x, p2.y, p2.z);
 		}
 
 		time += NetDefaults::DELTA_TIME;
@@ -1002,7 +1088,7 @@ DWORD WINAPI mainThread(LPVOID)
 	// FIND GAME WINDOW
 	//-----------------------------------------------------
 
-	ChatOverlay_Init(moduleInstance);
+	g_ChatOverlay.Init();
 
 	//-----------------------------------------------------
 	// LOAD GUIDS
@@ -1086,7 +1172,7 @@ DWORD WINAPI mainThread(LPVOID)
 	// SHUTDOWN CHAT OVERLAY
 	//-----------------------------------------------------
 
-	ChatOverlay_Shutdown();
+	g_ChatOverlay.Shutdown();
 
 	//-----------------------------------------------------
 	// CLEANUP

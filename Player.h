@@ -34,6 +34,10 @@ public:
 	// --- In-game representation ---
 	NPC* npc = nullptr;
 	Marker* nickname_marker = nullptr;
+	Marker* status_marker = nullptr;
+
+	// set nickname
+	std::string nickname = "Username";
 
 	// --- Interpolation: position ---
 	float prevX = 0.0f, prevY = 0.0f, prevZ = 0.0f;
