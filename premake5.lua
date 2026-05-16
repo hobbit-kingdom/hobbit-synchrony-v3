@@ -60,7 +60,7 @@ project "yojimbo"
 
 project "client"
 	kind "SharedLib"
-    files { "client.cpp", "Hoistable.cpp", "Hoistable.h", "Marker.cpp", "Marker.h", "NPC.cpp", "NPC.h", "Player.cpp", "Player.h", "shared.h" }
+    files { "client.cpp", "ChatOverlay.cpp", "ChatOverlay.h", "Hoistable.cpp", "Hoistable.h", "Marker.cpp", "Marker.h", "NPC.cpp", "NPC.h", "Player.cpp", "Player.h", "shared.h", "kiero.cpp", "kiero.h", "minhook/buffer.c", "minhook/hook.c", "minhook/hde32.c", "minhook/hde64.c", "minhook/trampoline.c" }
     filter "system:windows"
         links { "yojimbo", "sodium-builtin", "tlsf", "netcode", "reliable" }
     filter "system:not windows"

@@ -1,12 +1,3 @@
-/*
-	client.cpp
-	Hobbit Multiplayer Client
-
-	Connects to the game server, reads local player (Bilbo) state from the
-	Hobbit game process, sends position updates, and interpolates remote
-	player positions onto NPC entities.
-*/
-
 #define _CRT_SECURE_NO_WARNINGS
 #include "shared.h"
 #include "SecureConnection.h"
@@ -30,14 +21,24 @@
 #include <vector>
 
 #include "Hoistable.h"
+
+
+#include <Windows.h>
+#include <string>
+
+#include "ChatOverlay.h"
+
 using namespace yojimbo;
+
 
 // ===========================================================================
 //  Globals
 // ===========================================================================
 
+HMODULE moduleInstance = nullptr;
+
 static volatile int quit = 0;
-static HINSTANCE moduleInstance = nullptr;
+
 
 static int isHost = 0;
 static bool processedDataForThisLevel = false;
@@ -48,6 +49,7 @@ static void interruptHandler(int) { quit = 1; }
 // --- Game process interface ---
 static HobbitGameManager       gameManager;
 static HobbitProcessAnalyzer* processAnalyzer = nullptr;
+static yojimbo::Client*        g_Client = nullptr;
 
 // --- Cached pointers into game memory ---
 static uint32_t bilboPosBasePtr = 0;
@@ -709,9 +711,9 @@ static void processNicknameUpdate(NicknameUpdateMessage* msg)
 	std::cout << "new name = " << msg->new_name << "\r\n";
 
 	Player* pl = findPlayerByGuid(msg->player_guid);
-	if(pl) {
+	if (pl) {
 		std::cout << "playerFound\r\n";
-		if(pl->nickname_marker) {
+		if (pl->nickname_marker) {
 			std::cout << "markerFound\r\n";
 			pl->nickname_marker->setText(msg->new_name);
 		}
@@ -758,6 +760,27 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 	}
 }
 
+static void OnChatNickname(const std::string& name)
+{
+	if (!g_Client || myGuid == 0)
+		return;
+
+	// Update local marker
+	Marker marker(processAnalyzer);
+	marker.initializeByGuid(myNicknameGuid);
+	Vector3 p = getBilboPos();
+	p.y += 100.f;
+	marker.setPosition(p.x, p.y, p.z);
+	marker.setText(name.c_str());
+
+	// Send network message
+	auto* xmsg = static_cast<NicknameUpdateMessage*>(g_Client->CreateMessage(NICKNAME_UPDATE));
+	xmsg->player_guid = myGuid;
+	strncpy(xmsg->new_name, name.c_str(), sizeof(xmsg->new_name));
+	xmsg->new_name[31] = '\0';
+	g_Client->SendMessage(channels::Gameplay, xmsg);
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -776,6 +799,9 @@ static int clientMain()
 	ClientServerConfig config;
 	ConfigureGameNetworking(config);
 	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, time);
+
+	g_Client = &client;
+	ChatOverlay_SetNicknameCallback(OnChatNickname);
 
 	uint64_t clientId = 0;
 	uint8_t connectToken[ConnectTokenBytes] = {};
@@ -901,7 +927,7 @@ static int clientMain()
 				lastSend = time;
 			}
 		}
-		
+
 		// update marker
 		{
 			Marker marker(processAnalyzer);
@@ -911,7 +937,7 @@ static int clientMain()
 			p.y += 100.f;
 			marker.setPosition(p.x, p.y, p.z);
 
-			if(kbhit()) {
+			if (kbhit()) {
 				char buf[128];
 				fgets(buf, 128, stdin);
 				marker.setText(buf);
@@ -942,76 +968,139 @@ static int clientMain()
 	}
 
 	client.Disconnect();
+	g_Client = nullptr;
 	return 0;
 }
 
-
-void SendKeyPress(HWND hwnd, WPARAM key) {
-	// Send a WM_KEYDOWN message
-	PostMessage(hwnd, WM_KEYDOWN, key, 0);
-
-	// Send a WM_KEYUP message
-	PostMessage(hwnd, WM_KEYUP, key, 0);
-}
-
-std::string GetKeyName(int vkCode)
-{
-	char keyName[32] = { 0 };
-	if (GetKeyNameTextA(MapVirtualKeyA(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName)))
-	{
-		return std::string(keyName);
-	}
-	return "Unknown";
-}
 // ===========================================================================
 //  Entry Point
 // ===========================================================================
 
-int mainThread()
+DWORD WINAPI mainThread(LPVOID)
 {
+	//-----------------------------------------------------
+	// DEBUG CONSOLE
+	//-----------------------------------------------------
+
 	AllocConsole();
-	freopen("CONOUT$", "w",
-		stdout);
-	freopen("CONIN$", "r",
-		stdin);
 
-	// Attach to the Hobbit game process
+	freopen("CONOUT$", "w", stdout);
+	freopen("CONIN$", "r", stdin);
+
+	std::cout << "Injected.\n";
+
+	//-----------------------------------------------------
+	// START GAME MANAGER
+	//-----------------------------------------------------
+
 	gameManager.start();
-	processAnalyzer = gameManager.getHobbitProcessAnalyzer();
 
-	playerGuids = loadGuidsFromFile("FAKE_BILBO_GUID.txt");
-	localSkinLoaded = loadLocalSkinDefinitionFromKnownPaths(localSkinDefinition, localSkinConfigPath, localSkinConfigError);
+	processAnalyzer =
+		gameManager.getHobbitProcessAnalyzer();
 
-	std::cout << "SIZE " << playerGuids.size() << "\n";
+	//-----------------------------------------------------
+	// FIND GAME WINDOW
+	//-----------------------------------------------------
+
+	ChatOverlay_Init(moduleInstance);
+
+	//-----------------------------------------------------
+	// LOAD GUIDS
+	//-----------------------------------------------------
+
+	playerGuids =
+		loadGuidsFromFile(
+			"FAKE_BILBO_GUID.txt");
+
+	std::cout << "GUID count: "
+		<< playerGuids.size()
+		<< "\n";
+
+	//-----------------------------------------------------
+	// LOAD SKIN CONFIG
+	//-----------------------------------------------------
+
+	localSkinLoaded =
+		loadLocalSkinDefinitionFromKnownPaths(
+			localSkinDefinition,
+			localSkinConfigPath,
+			localSkinConfigError);
 
 	if (localSkinLoaded)
 	{
-		std::cout << "Loaded local skin config from " << localSkinConfigPath
-			<< ": source '" << localSkinDefinition.filePath << "'\n";
+		std::cout
+			<< "Loaded skin config from: "
+			<< localSkinConfigPath
+			<< "\n";
 	}
 	else
 	{
-		std::cout << "Skin sync will stay disabled for this client: "
-			<< localSkinConfigError << "\n";
+		std::cout
+			<< "Skin sync disabled: "
+			<< localSkinConfigError
+			<< "\n";
 	}
 
-	std::cout << "Are you the host? (yes - 1 / no - 0)\n";
+	//-----------------------------------------------------
+	// HOST INPUT
+	//-----------------------------------------------------
+
+	std::cout
+		<< "Are you the host? "
+		<< "(yes = 1 / no = 0)\n";
+
 	std::cin >> isHost;
+
+	//-----------------------------------------------------
+	// INIT YOJIMBO
+	//-----------------------------------------------------
 
 	if (!InitializeYojimbo())
 	{
-		printf("Error: failed to initialize Yojimbo!\n");
+		std::cout
+			<< "Failed to initialize Yojimbo.\n";
+
 		return 1;
 	}
 
-	yojimbo_log_level(YOJIMBO_LOG_LEVEL_INFO);
-	srand(static_cast<unsigned int>(::time(NULL)));
+	yojimbo_log_level(
+		YOJIMBO_LOG_LEVEL_INFO);
+
+	srand(
+		static_cast<unsigned int>(
+			::time(NULL)));
+
+	//-----------------------------------------------------
+	// START NETWORKING
+	//-----------------------------------------------------
 
 	int result = clientMain();
 
+	//-----------------------------------------------------
+	// SHUTDOWN
+	//-----------------------------------------------------
+
 	ShutdownYojimbo();
+
+	//-----------------------------------------------------
+	// SHUTDOWN CHAT OVERLAY
+	//-----------------------------------------------------
+
+	ChatOverlay_Shutdown();
+
+	//-----------------------------------------------------
+	// CLEANUP
+	//-----------------------------------------------------
+
+	FreeConsole();
+
+	FreeLibraryAndExitThread(
+		moduleInstance,
+		0);
+
 	return result;
 }
+
 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID)
 {
@@ -1024,3 +1113,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID)
 
 	return TRUE;
 }
+
+
+
+
