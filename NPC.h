@@ -80,6 +80,7 @@ public:
 	void setPosition(uint32_t x, uint32_t y, uint32_t z);
 	void setRotationY(uint32_t value);
 	void setGUID(uint32_t newGUID);
+	void setAIMode(int mode);
 
 private:
 	HobbitProcessAnalyzer* analyzer_ = nullptr;
@@ -91,6 +92,8 @@ private:
 	uint32_t animationAddr_ = 0;
 	float    lastAnimFrame_ = 0.0f;
 	uint64_t guid_ = 0;
+
+	uint8_t initialAIState = 0;
 
 	std::vector<uint32_t> positionXAddresses_;
 

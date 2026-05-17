@@ -63,6 +63,9 @@ void NPC::initializeByAddress(uint32_t address)
 	// Read initial health as a sanity check
 	float hp = getHealth();
 	printf("NPC initialized — health: %.1f\n", hp);
+
+	initialAIState = analyzer_->readData<uint8_t>(objectAddress_ + 0x268);
+
 }
 
 // ---------------------------------------------------------------------------
@@ -362,4 +365,59 @@ void NPC::resolveAnimationPtr()
 {
 	animationAddr_ = followAnimationPtrChain();
 	printf("Animation address: 0x%08X\n", animationAddr_);
+}
+
+// ---------------------------------------------------------------------------
+// Dostate + Senses: AI
+// ---------------------------------------------------------------------------
+
+void NPC::setAIMode(int mode)
+{
+	if (!isAnalyzerReady() || !isValid())
+		return;
+
+	uint32_t ObjectPtr = getObjectPtr();
+
+
+	char* pointerAI = (char*)ObjectPtr + 0x268;
+
+
+	if (*pointerAI <= 127) // && *pointerAI >= 87
+	{
+		if (mode == 0) // dostate and senses off
+		{
+			*pointerAI = 87;
+		}
+		else if (mode == 1) // everything on
+		{
+			*pointerAI = 127;
+		}
+		else if (mode == 2) // only senses off
+		{
+			*pointerAI = 95;
+		}
+		else if (mode == 3) // only state off
+		{
+			*pointerAI = 119;
+		}
+	}
+	else if (*pointerAI <= 255) // *pointerAI >= 215 && 
+	{
+		if (mode == 0) // dostate and senses off
+		{
+			*pointerAI = 215;
+		}
+		else if (mode == 1) // everything on
+		{
+			*pointerAI = 255;
+		}
+		else if (mode == 2) // only senses off
+		{
+			*pointerAI = 223;
+		}
+		else if (mode == 3) // only state off
+		{
+			*pointerAI = 247;
+		}
+	}
 }

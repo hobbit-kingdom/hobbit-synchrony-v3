@@ -278,7 +278,8 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 			if (slashPressed && !slashWasPressed)
 			{
 				g_ChatOverlay.m_ChatOpen = true;
-				g_ChatOverlay.m_ChatBuffer.clear();
+				g_ChatOverlay.m_ChatBuffer = "/";
+				
 			}
 			g_ChatOverlay.m_KeyState[VK_OEM_2] = slashPressed;
 		}
@@ -372,7 +373,8 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 		if (msg == WM_KEYDOWN && wParam == VK_OEM_2)
 		{
 			g_ChatOverlay.m_ChatOpen = true;
-			g_ChatOverlay.m_ChatBuffer.clear();
+			g_ChatOverlay.m_ChatBuffer = "/";
+			
 			return 0;
 		}
 	}
@@ -385,6 +387,8 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 		case WM_CHAR:
 		{
 			char c = (char)wParam;
+			if (g_ChatOverlay.m_ChatBuffer == "/" && c == '/')
+				return 0;
 			if (c >= 32 && c <= 126 && g_ChatOverlay.m_ChatBuffer.size() < 128)
 				g_ChatOverlay.m_ChatBuffer += c;
 			return 0;
