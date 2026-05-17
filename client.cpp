@@ -242,8 +242,9 @@ static void readGamePointers()
 		//hex
 		std::cout << eGuid << " Address: " << e << " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
 
-		NPC* enemy = new NPC(processAnalyzer);;
+		NPC* enemy = new NPC(processAnalyzer);
 		enemy->initializeByAddress(e);
+		if (isHost == 0) enemy->setAIMode(0);
 
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
@@ -311,6 +312,14 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 	}
 
 	return temp;
+}
+
+static void changeEnemiesAIMode(int mode)
+{
+	for (auto enemy : enemies)
+	{
+		enemy.second->setAIMode(mode);
+	}
 }
 
 // ===========================================================================
@@ -467,9 +476,9 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 	}
 
 	/* is it worth it ? these two updated in Player::tickLerp anyway */
-	if(player.nickname_marker)
+	if (player.nickname_marker)
 		player.nickname_marker->setPosition(msg->x, msg->y + 120.f, msg->z);
-	if(player.status_marker)
+	if (player.status_marker)
 		player.status_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
 
 	player.targetAnimation = msg->animation;
@@ -757,13 +766,15 @@ static void processChatMessage(ChatMsgMessage* msg)
 
 	std::string sender_name;
 
-	if(msg->player_guid == myGuid) {
+	if (msg->player_guid == myGuid) {
 		sender_name = myNickname;
-	} else {
+	}
+	else {
 		Player* pl = findPlayerByGuid(msg->player_guid);
 		if (pl) {
 			sender_name = pl->nickname;
-		} else {
+		}
+		else {
 			sender_name = "Unknown";
 		}
 	}
@@ -830,12 +841,12 @@ static void ChatMessage(const std::string& message)
 	auto* xmsg = static_cast<ChatMsgMessage*>(g_Client->CreateMessage(CHAT_MESSAGE));
 	xmsg->player_guid = myGuid;
 	strncpy(xmsg->msg, message.c_str(), sizeof(xmsg->msg));
-	xmsg->msg[sizeof(xmsg->msg)-1] = '\0';
+	xmsg->msg[sizeof(xmsg->msg) - 1] = '\0';
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
-//	std::cout << "sent chat message\r\n";
-//	std::cout << "player GUID = " << myGuid << "\r\n";
-//	std::cout << "message = " << xmsg->msg << "\r\n";
+	//	std::cout << "sent chat message\r\n";
+	//	std::cout << "player GUID = " << myGuid << "\r\n";
+	//	std::cout << "message = " << xmsg->msg << "\r\n";
 }
 
 static void ChatCommandNickname(const std::string& name)
@@ -854,12 +865,12 @@ static void ChatCommandNickname(const std::string& name)
 	auto* xmsg = static_cast<NicknameUpdateMessage*>(g_Client->CreateMessage(NICKNAME_UPDATE));
 	xmsg->player_guid = myGuid;
 	strncpy(xmsg->new_name, name.c_str(), sizeof(xmsg->new_name));
-	xmsg->new_name[sizeof(xmsg->new_name)-1] = '\0';
+	xmsg->new_name[sizeof(xmsg->new_name) - 1] = '\0';
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
-//	std::cout << "sent nickname update\r\n";
-//	std::cout << "player GUID = " << myGuid << "\r\n";
-//	std::cout << "new name = " << xmsg->new_name << "\r\n";
+	//	std::cout << "sent nickname update\r\n";
+	//	std::cout << "player GUID = " << myGuid << "\r\n";
+	//	std::cout << "new name = " << xmsg->new_name << "\r\n";
 }
 
 static void ChatCommandStatus(const std::string& status)
@@ -876,8 +887,18 @@ static void ChatCommandStatus(const std::string& status)
 	auto* xmsg = static_cast<StatusUpdateMessage*>(g_Client->CreateMessage(STATUS_UPDATE));
 	xmsg->player_guid = myGuid;
 	strncpy(xmsg->new_status, status.c_str(), sizeof(xmsg->new_status));
-	xmsg->new_status[sizeof(xmsg->new_status)-1] = '\0';
+	xmsg->new_status[sizeof(xmsg->new_status) - 1] = '\0';
 	g_Client->SendMessage(channels::Gameplay, xmsg);
+}
+
+static void ChatCommandChangeAIMode(const std::string& aiMode)
+{
+	if (!g_Client || myGuid == 0)
+		return;
+
+
+
+	changeEnemiesAIMode(stoi(aiMode));
 }
 
 // ===========================================================================
@@ -904,6 +925,7 @@ static int clientMain()
 	g_ChatOverlay.SetMsgCallback(ChatMessage);
 	g_ChatOverlay.AddCommand("/name", "<nickname> - Change your nickname", ChatCommandNickname);
 	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
+	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
 
 	uint64_t clientId = 0;
 	uint8_t connectToken[ConnectTokenBytes] = {};
@@ -1028,6 +1050,7 @@ static int clientMain()
 		}
 
 		// update marker(s)
+		/*
 		{
 			Marker marker(processAnalyzer);
 			marker.initializeByGuid(myNicknameGuid);
@@ -1043,7 +1066,7 @@ static int clientMain()
 			p2.y += 103.f;
 			marker2.setPosition(p2.x, p2.y, p2.z);
 		}
-
+		*/
 		time += NetDefaults::DELTA_TIME;
 		client.AdvanceTime(time);
 

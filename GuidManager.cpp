@@ -1,6 +1,6 @@
 /*
-    GuidManager.cpp
-    Implementation of GUID loading and client assignment.
+	GuidManager.cpp
+	Implementation of GUID loading and client assignment.
 */
 
 #include <algorithm>
@@ -10,54 +10,54 @@
 
 bool GuidManager::loadFromFile(const std::string& filePath)
 {
-    allGuids_ = loadGuidsFromFile(filePath);
-    availableGuids_ = allGuids_;
-    std::reverse(availableGuids_.begin(), availableGuids_.end());
+	allGuids_ = loadGuidsFromFile(filePath);
+	availableGuids_ = allGuids_;
+	std::reverse(availableGuids_.begin(), availableGuids_.end());
 
-    return !allGuids_.empty();
+	return !allGuids_.empty();
 }
 
 uint64_t GuidManager::assignGuid(int clientIndex)
 {
-    // Already assigned?
-    auto it = clientGuidMap_.find(clientIndex);
-    if (it != clientGuidMap_.end())
-        return it->second;
+	// Already assigned?
+	auto it = clientGuidMap_.find(clientIndex);
+	if (it != clientGuidMap_.end())
+		return it->second;
 
-    if (availableGuids_.empty())
-        return 0;
+	if (availableGuids_.empty())
+		return 0;
 
-    uint64_t guid = availableGuids_.back();
-    availableGuids_.pop_back();
-    clientGuidMap_[clientIndex] = guid;
+	uint64_t guid = availableGuids_.back();
+	availableGuids_.pop_back();
+	clientGuidMap_[clientIndex] = guid;
 
-    printf("Assigned GUID %llu to client %d\n", guid, clientIndex);
-    return guid;
+	printf("Assigned GUID %llu to client %d\n", guid, clientIndex);
+	return guid;
 }
 
 void GuidManager::releaseGuid(int clientIndex)
 {
-    auto it = clientGuidMap_.find(clientIndex);
-    if (it == clientGuidMap_.end())
-        return;
+	auto it = clientGuidMap_.find(clientIndex);
+	if (it == clientGuidMap_.end())
+		return;
 
-    availableGuids_.push_back(it->second);
-    clientGuidMap_.erase(it);
-    printf("Released GUID for client %d\n", clientIndex);
+	availableGuids_.push_back(it->second);
+	clientGuidMap_.erase(it);
+	printf("Released GUID for client %d\n", clientIndex);
 }
 
 uint64_t GuidManager::getGuid(int clientIndex) const
 {
-    auto it = clientGuidMap_.find(clientIndex);
-    return (it != clientGuidMap_.end()) ? it->second : 0;
+	auto it = clientGuidMap_.find(clientIndex);
+	return (it != clientGuidMap_.end()) ? it->second : 0;
 }
 
 int GuidManager::getGuidSlot(uint64_t guid) const
 {
-    return SkinSync::getGuidSlotIndex(allGuids_, guid);
+	return SkinSync::getGuidSlotIndex(allGuids_, guid);
 }
 
 std::string GuidManager::getSkinFileName(uint64_t guid) const
 {
-    return SkinSync::getGuidBoundSkinFileName(allGuids_, guid);
+	return SkinSync::getGuidBoundSkinFileName(allGuids_, guid);
 }
