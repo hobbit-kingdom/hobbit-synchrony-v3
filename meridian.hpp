@@ -71,7 +71,7 @@ public:
 	virtual void __something13() = 0;
 	virtual void __something14() = 0;
 	virtual void __something15() = 0;
-	virtual void __something16() = 0;
+	virtual void OnExport() = 0;
 	virtual void OnImport(bin_in& BinIn) = 0;
 	virtual void __something17() = 0;
 	virtual void __something18() = 0;
@@ -80,7 +80,7 @@ public:
 	virtual void __something21() = 0;
 	virtual void __something22() = 0;
 	virtual void __something23() = 0;
-	virtual void __something24() = 0;
+	virtual void OnApplyPain() = 0;
 	virtual void __something25() = 0;
 	virtual void __something26() = 0;
 	virtual void __something27() = 0;
@@ -105,6 +105,61 @@ class marker : public object
 {
 public:
 	void SetText(const char* pNewText);
+};
+
+enum BILBO_STATE
+{
+	_BS_NULL,
+	BS_IDLE,
+	BS_FLY,
+	BS_RUN,
+	BS_SNEAK,
+	BS_JUMP,
+	BS_FALL,
+	BS_LAND,
+	BS_CROUCH_SLIDE,
+	BS_CLIMB_WALL,
+	BS_WALL_PULLUP,
+	BS_EDGE_MOUNT,
+	BS_EDGE_GRAB,
+	BS_EDGE_PULLUP,
+	BS_EDGE_DROP_OFF,
+	BS_POLEJUMP,
+	BS_CHAIN_ATTACK,
+	BS_TARG_IDLE,
+	BS_TARG_RUN,
+	BS_TARG_JUMP,
+	BS_STONE_ATTACK,
+	BS_FIRST_PERSON_LOOK,
+	BS_TARG_STRAFE_ATTACK,
+	BS_FORWARD_INAIR_ATTACK,
+	BS_BACKWARD_BLOCK,
+	BS_KNOCKBACK,
+	BS_DEATH,
+	BS_DEATH_FALL,
+	BS_CLIMB_LADDER,
+	BS_LADDER_PULLUP,
+	BS_MINE_CART_RIDE,
+	BS_MINE_CART_SWING,
+	BS_CONVERSATION_LISTEN,
+	BS_CONVERSATION_TALK,
+	BS_CINEMATIC,
+	BS_ROPE_CLIMB,
+	BS_BLOCKED,
+	BS_PUSH_BLOCK,
+	BS_SLIDING,
+	BS_LAUCNHING,
+	BS_HOISTING,
+	BS_USE,
+	BS_FIDGET,
+	BS_DEATH_WATER
+};
+
+class bilbo : public object
+{
+public:
+	BILBO_STATE _get_state(void);
+	guid _get_nearest_hoistable();
 };
 
 class bin_in

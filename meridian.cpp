@@ -44,6 +44,19 @@ void object::SetObjSaveFlag(xbool flag)
 		*pExtraFlags &= ~1;
 }
 
+// bilbo
+BILBO_STATE bilbo::_get_state(void)
+{
+	u8 *pState = ((u8*)this) + 0x8D4;
+	return (BILBO_STATE)*pState;
+}
+
+guid bilbo::_get_nearest_hoistable(void)
+{
+	guid *pGuid = (guid*) (((u8*)this) + 0x5948);
+	return *pGuid;
+}
+
 // marker
 void marker::SetText(const char* pNewText)
 {

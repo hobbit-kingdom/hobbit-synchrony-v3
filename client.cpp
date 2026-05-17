@@ -27,6 +27,7 @@
 #include <string>
 
 #include "ChatOverlay.h"
+#include "meridian.hpp"
 
 using namespace yojimbo;
 
@@ -84,18 +85,72 @@ static bool localSkinUploadAttempted = false;
 static std::string localSkinConfigPath;
 static std::string localSkinConfigError;
 
-static std::vector<uint64_t> hoistableGuidTest;
-
 // --- Animation data caches ---
 std::unordered_map<uint32_t, uint32_t> animDataMap;
 static std::unordered_map<uint32_t, float> animFrameRanges;
 
 
 std::unordered_map<uint64_t, NPC*> enemies;
-std::unordered_map<uint64_t, Hoistable*> hoistables;
-const uint32_t X_POSITION_PTR = 0x0075BA3C;
+const uint32_t X_POSITION_PTR = 0x0075BA3C; // address of bilbo *g_pBilbo variable
 
-Hoistable* testHoistable;
+struct HoistableUpdateStruct
+{
+	Hoistable *pObject;
+	float x, y, z;
+	float yaw;
+	bool updated = false;
+};
+
+std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
+static Hoistable *g_currentHoistable = nullptr;
+
+CRITICAL_SECTION hoistablesCriticalSection;
+
+typedef void (bilbo:: *pOnAdvanceLogic_t)(float fDeltaTime);
+pOnAdvanceLogic_t pOnAdvanceLogic_orig;
+
+class hook_bilbo
+{
+	public:
+	void OnAdvanceLogic(float fDeltaTime);
+};
+
+void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
+{
+	bilbo *pBilbo = (bilbo*)this;
+	(pBilbo->*pOnAdvanceLogic_orig)(fDeltaTime);
+
+	// update hoistables position
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	for(auto it = hoistables.begin(); it != hoistables.end(); it++) {
+		HoistableUpdateStruct &upd = it->second;
+		if(upd.updated) {
+			upd.pObject->setPosition(upd.x, upd.y, upd.z);
+			//upd.pObject->setRotationY(upd.yaw);
+			upd.updated = false;
+		}
+	}
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+void SetupBilboHook(void)
+{
+	LPDWORD pAddressInVMT = LPDWORD(0x006e9828);
+
+	LPVOID pOriginal = LPVOID(0x0041e360);
+	void (hook_bilbo::*pDetour_)(float fDeltaTime) = &hook_bilbo::OnAdvanceLogic;
+	DWORD pDetour;
+
+	memcpy(&pDetour, &pDetour_, 4);
+	memcpy(&pOnAdvanceLogic_orig, &pOriginal, 4);
+
+	DWORD oldProtect;
+	VirtualProtect(pAddressInVMT, 4, PAGE_EXECUTE_READWRITE, &oldProtect);
+	*pAddressInVMT = pDetour;
+	VirtualProtect(pAddressInVMT, 4, oldProtect, &oldProtect);
+}
 
 static std::string getModuleDirectory(HMODULE module)
 {
@@ -198,25 +253,6 @@ static void readGamePointers()
 	std::vector<uint32_t> allRigidInstances = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x05, 0x7c); //put the values that indicate that thing
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
 
-	std::vector<uint32_t> allHoistables;
-	for (auto rigidIn : allRigidInstances)
-	{
-		if (processAnalyzer->readData<uint8_t>(rigidIn + 0x13) == 2)
-		{
-			allHoistables.push_back(rigidIn);
-		}
-	}
-
-	for (uint32_t hoisAddr : allHoistables)
-	{
-		Hoistable* ho = new Hoistable(processAnalyzer);;
-		ho->initializeByAddress(hoisAddr);
-
-		hoistables.emplace(ho->getGUID(), ho);
-	}
-
-	std::cout << "SIZE OF ALL HOISTABLES: " << allHoistables.size() << '\n';
-
 	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
 
 	for (uint32_t e : allEnemieAddrs)
@@ -247,10 +283,6 @@ static void readGamePointers()
 
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
-
-	// testHoistable = new Hoistable(processAnalyzer);
-	// hoistableGuidTest = loadGuidsFromFile("hoistable.txt");
-	// testHoistable->initializeByGuid(hoistableGuidTest[0]);
 
 	printf("Enemies Found: %d", enemies.size());
 
@@ -685,13 +717,32 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentT
 		return;
 	}
 
+	EnterCriticalSection(&hoistablesCriticalSection);
+
 	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
-	if (hoistableIt == hoistables.end() || hoistableIt->second == nullptr || !hoistableIt->second->isValid())
-		return;
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
 
-	hoistableIt->second->setPosition(msg->x, msg->y, msg->z);
-	// hoistables[msg->hoistableGuid]->setRotationY(msg->rotationY);
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
 
+		hoistables.emplace(msg->hoistableGuid, upd);
+	} else {
+		HoistableUpdateStruct &upd = hoistableIt->second;
+
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
+	}
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
 }
 
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
@@ -905,6 +956,10 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/name", "<nickname> - Change your nickname", ChatCommandNickname);
 	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
 
+	// try to hook bilbo's OnAdvanceLogic
+	InitializeCriticalSection(&hoistablesCriticalSection);
+	SetupBilboHook();
+
 	uint64_t clientId = 0;
 	uint8_t connectToken[ConnectTokenBytes] = {};
 	if (!SecureConnect::requestConnectTokenFromServer(serverIP, clientId, connectToken))
@@ -1003,7 +1058,7 @@ static int clientMain()
 
 					client.SendMessage(channels::Gameplay, msgEnemy);
 					//////////////////////////////////
-
+/*
 					for (auto hoists : hoistables)
 					{
 						auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
@@ -1021,14 +1076,55 @@ static int clientMain()
 
 						client.SendMessage(channels::Gameplay, msgHoistable);
 					}
+*/
 				}
 
 				lastSend = time;
 			}
 		}
 
-		// update marker(s)
+		// update hoistable
 		{
+			bilbo *pBilbo = *((bilbo**)X_POSITION_PTR);
+			guid hoist_guid = pBilbo->_get_nearest_hoistable();
+
+			if(!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
+				// acquire
+				g_currentHoistable = new Hoistable(processAnalyzer);
+				g_currentHoistable->initializeByGuid(hoist_guid.Guid);
+
+				std::cout << "hoistable acquire\r\n";
+			}
+
+			if(g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
+				// release
+				delete g_currentHoistable;
+				g_currentHoistable = nullptr;
+
+				std::cout << "hoistable release\r\n";
+			}
+
+			if(g_currentHoistable) {
+				// update
+				auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
+
+				Vector3 v = g_currentHoistable->getPosition();
+
+				msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
+				msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
+				msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
+
+				msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentHoistable->getRotationY());
+
+				msgHoistable->hoistableGuid = g_currentHoistable->getGUID();
+				msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+				client.SendMessage(channels::Gameplay, msgHoistable);
+			}
+		}
+
+		// update marker(s)
+		{/*
 			Marker marker(processAnalyzer);
 			marker.initializeByGuid(myNicknameGuid);
 
@@ -1041,7 +1137,7 @@ static int clientMain()
 
 			Vector3 p2 = getBilboPos();
 			p2.y += 103.f;
-			marker2.setPosition(p2.x, p2.y, p2.z);
+			marker2.setPosition(p2.x, p2.y, p2.z);*/
 		}
 
 		time += NetDefaults::DELTA_TIME;
