@@ -127,7 +127,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 		HoistableUpdateStruct &upd = it->second;
 		if(upd.updated) {
 			upd.pObject->setPosition(upd.x, upd.y, upd.z);
-			//upd.pObject->setRotationY(upd.yaw);
+			upd.pObject->setRotationY(upd.yaw);
 			upd.updated = false;
 		}
 	}
@@ -1170,56 +1170,58 @@ static int clientMain()
 		// update hoistable
 		{
 			bilbo *pBilbo = *((bilbo**)X_POSITION_PTR);
-			guid hoist_guid = pBilbo->_get_nearest_hoistable();
+			if(pBilbo) { // bilbo doesn't exist if we're still in menu
+				guid hoist_guid = pBilbo->_get_nearest_hoistable();
 
-			if(!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
-				// acquire
-				g_currentHoistable = new Hoistable(processAnalyzer);
-				g_currentHoistable->initializeByGuid(hoist_guid.Guid);
+				if(!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
+					// acquire
+					g_currentHoistable = new Hoistable(processAnalyzer);
+					g_currentHoistable->initializeByGuid(hoist_guid.Guid);
 
-				auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_ACQUIRE));
+					auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_ACQUIRE));
 
-				msg->hoistableGuid = g_currentHoistable->getGUID();
-				msg->playerGuid = myGuid;
-				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+					msg->hoistableGuid = g_currentHoistable->getGUID();
+					msg->playerGuid = myGuid;
+					msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-				client.SendMessage(channels::Gameplay, msg);
+					client.SendMessage(channels::Gameplay, msg);
 
-				std::cout << "hoistable acquire\r\n";
-			}
+					std::cout << "hoistable acquire\r\n";
+				}
 
-			if(g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
-				// release
-				auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
+				if(g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
+					// release
+					auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
 
-				msg->hoistableGuid = g_currentHoistable->getGUID();
-				msg->playerGuid = myGuid;
-				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+					msg->hoistableGuid = g_currentHoistable->getGUID();
+					msg->playerGuid = myGuid;
+					msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-				client.SendMessage(channels::Gameplay, msg);
+					client.SendMessage(channels::Gameplay, msg);
 
-				delete g_currentHoistable;
-				g_currentHoistable = nullptr;
+					delete g_currentHoistable;
+					g_currentHoistable = nullptr;
 
-				std::cout << "hoistable release\r\n";
-			}
+					std::cout << "hoistable release\r\n";
+				}
 
-			if(g_currentHoistable) {
-				// update
-				auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
+				if(g_currentHoistable) {
+					// update
+					auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
 
-				Vector3 v = g_currentHoistable->getPosition();
+					Vector3 v = g_currentHoistable->getPosition();
 
-				msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
-				msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
-				msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
+					msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
+					msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
+					msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
 
-				msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentHoistable->getRotationY());
+					msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentHoistable->getRotationY());
 
-				msgHoistable->hoistableGuid = g_currentHoistable->getGUID();
-				msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+					msgHoistable->hoistableGuid = g_currentHoistable->getGUID();
+					msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-				client.SendMessage(channels::Gameplay, msgHoistable);
+					client.SendMessage(channels::Gameplay, msgHoistable);
+				}
 			}
 		}
 
