@@ -16,7 +16,7 @@ typedef unsigned long long u64;
 
 class bin_in;
 class prop_array;
-class ed_property;
+struct ed_property;
 
 struct xcolor
 {

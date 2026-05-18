@@ -719,12 +719,66 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 	*/
 }
 
+static void processHoistableAcquire(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable *pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	} else {
+		HoistableUpdateStruct &upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->MakeHoistable(false);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processHoistableRelease(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable *pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	} else {
+		HoistableUpdateStruct &upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->MakeHoistable(true);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
 static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentTime*/)
 {
 	if (msg->nowLevel != nowLevel)
-	{
 		return;
-	}
 
 	EnterCriticalSection(&hoistablesCriticalSection);
 
@@ -843,9 +897,17 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 	case ENEMIES_UPDATE:
 		if (gameManager.isOnLevel()) processEnemiesUpdate(static_cast<EnemiesStateMessage*>(message), time);
 		break;
+
+	case HOISTABLE_ACQUIRE:
+		if (gameManager.isOnLevel()) processHoistableAcquire(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
+	case HOISTABLE_RELEASE:
+		if (gameManager.isOnLevel()) processHoistableRelease(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
 	case HOISTABLE_UPDATE:
 		if (gameManager.isOnLevel()) processHoistableUpdate(static_cast<HoistableStateMessage*>(message), time);
 		break;
+
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
 		localSkinUploadAttempted = false;
@@ -1115,11 +1177,27 @@ static int clientMain()
 				g_currentHoistable = new Hoistable(processAnalyzer);
 				g_currentHoistable->initializeByGuid(hoist_guid.Guid);
 
+				auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_ACQUIRE));
+
+				msg->hoistableGuid = g_currentHoistable->getGUID();
+				msg->playerGuid = myGuid;
+				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+				client.SendMessage(channels::Gameplay, msg);
+
 				std::cout << "hoistable acquire\r\n";
 			}
 
 			if(g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
 				// release
+				auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
+
+				msg->hoistableGuid = g_currentHoistable->getGUID();
+				msg->playerGuid = myGuid;
+				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+				client.SendMessage(channels::Gameplay, msg);
+
 				delete g_currentHoistable;
 				g_currentHoistable = nullptr;
 

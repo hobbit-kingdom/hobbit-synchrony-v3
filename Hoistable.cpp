@@ -98,8 +98,6 @@ void Hoistable::setPosition(float x, float y, float z)
 	vector3 ve = { x,y,z };
 
 	theObject->Move(ve, false);
-
-
 }
 
 Vector3 Hoistable::getPosition() const
@@ -116,6 +114,17 @@ void Hoistable::setRotationY(float value)
 float Hoistable::getRotationY() const
 {
 	return  analyzer_->readData<float>(rotationYAddr_);
+}
+
+void Hoistable::MakeHoistable(bool bHoistable)
+{
+	object* theObject = (object*)objectAddress_;
+	if(theObject) {
+		ed_property prop = {};
+		theObject->GetProperty(prop, "Is Hoistable");
+		prop.m_Value.m_xboolValue = (xbool)!!bHoistable;
+		theObject->SetProperty("Is Hoistable", prop);
+	}
 }
 
 

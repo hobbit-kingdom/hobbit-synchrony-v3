@@ -29,6 +29,7 @@ public:
 
 	void setRotationY(float value);
 
+	void MakeHoistable(bool bHoistable);
 
 private:
 	HobbitProcessAnalyzer* analyzer_ = nullptr;

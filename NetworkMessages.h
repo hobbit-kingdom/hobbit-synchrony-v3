@@ -23,7 +23,11 @@ enum GameMessageType
 {
 	POSITION_UPDATE,
 	ENEMIES_UPDATE,
+	
+	HOISTABLE_ACQUIRE,
+	HOISTABLE_RELEASE,
 	HOISTABLE_UPDATE,
+
 	GUID_ASSIGN,
 	SKIN_ANNOUNCE,
 	SKIN_FILE_TRANSFER,
@@ -34,6 +38,41 @@ enum GameMessageType
 	NUM_GAME_MESSAGE_TYPES
 };
 
+// uint64_t must be serialized as two 32-bit halves
+#define serialize_GUID(stream, guid64) \
+	do { \
+		uint32_t guid_low = static_cast<uint32_t>(guid64); \
+		uint32_t guid_high = static_cast<uint32_t>(guid64 >> 32); \
+		serialize_bits(stream, guid_low, 32); \
+		serialize_bits(stream, guid_high, 32); \
+		guid64 = (static_cast<uint64_t>(guid_high) << 32) | guid_low; \
+	} while(0);
+
+// both HOISTABLE_ACQUIRE & HOISTABLE_RELEASE
+struct HoistableAcquireReleaseMessage : public Message
+{
+	uint64_t hoistableGuid = 0;
+	uint64_t playerGuid = 0;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, hoistableGuid);
+		serialize_GUID(stream, playerGuid);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
 struct HoistableStateMessage : public Message
 {
 	float    x = 0.0f;
@@ -41,48 +80,17 @@ struct HoistableStateMessage : public Message
 	float    z = 0.0f;
 	float    rotationY = 0.0f;
 	uint64_t hoistableGuid = 0;
-
-
 	uint32_t nowLevel = 0;
 
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		if (stream.IsWriting)
-		{
-
-
-			serialize_float(stream, x);
-			serialize_float(stream, y);
-			serialize_float(stream, z);
-			serialize_float(stream, rotationY);
-
-			// uint64_t must be serialized as two 32-bit halves
-			uint32_t guid_low = static_cast<uint32_t>(hoistableGuid);
-			uint32_t guid_high = static_cast<uint32_t>(hoistableGuid >> 32);
-			serialize_bits(stream, guid_low, 32);
-			serialize_bits(stream, guid_high, 32);
-			hoistableGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
-			serialize_bits(stream, nowLevel, 32);
-		}
-
-		else  // reading
-		{
-			serialize_float(stream, x);
-			serialize_float(stream, y);
-			serialize_float(stream, z);
-
-			serialize_float(stream, rotationY);
-
-			uint32_t guid_low;
-			uint32_t guid_high;
-			serialize_bits(stream, guid_low, 32);
-			serialize_bits(stream, guid_high, 32);
-			hoistableGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
-			serialize_bits(stream, nowLevel, 32);
-		}
+		serialize_float(stream, x);
+		serialize_float(stream, y);
+		serialize_float(stream, z);
+		serialize_float(stream, rotationY);
+		serialize_GUID(stream, hoistableGuid);
+		serialize_bits(stream, nowLevel, 32);
 
 		if (!stream.IsWriting)
 		{

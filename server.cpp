@@ -397,7 +397,41 @@ static void broadcastPosition(Server& server, int senderIndex, PositionMessage* 
 	}
 }
 
+static void broadcastHoistableAcquire(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
 
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, HOISTABLE_ACQUIRE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastHoistableRelease(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, HOISTABLE_RELEASE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
 
 static void broadcastHoistableUpdate(Server& server, int senderIndex, HoistableStateMessage* msg)
 {
@@ -557,9 +591,17 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 	case ENEMIES_UPDATE:
 		broadcastEnemyUpdate(server, clientIndex, static_cast<EnemiesStateMessage*>(message));
 		break;
+
+	case HOISTABLE_ACQUIRE:
+		broadcastHoistableAcquire(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
+	case HOISTABLE_RELEASE:
+		broadcastHoistableRelease(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
 	case HOISTABLE_UPDATE:
 		broadcastHoistableUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
 		break;
+
 	case SKIN_ANNOUNCE:
 		processSkinAnnouncement(server, clientIndex, static_cast<SkinAnnouncementMessage*>(message));
 		break;
