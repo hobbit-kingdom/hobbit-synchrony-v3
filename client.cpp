@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <vector>
 
+#include "cutils.h"
+
 #include "Hoistable.h"
 
 
@@ -953,8 +955,7 @@ static void ChatMessage(const std::string& message)
 	// Send network message
 	auto* xmsg = static_cast<ChatMsgMessage*>(g_Client->CreateMessage(CHAT_MESSAGE));
 	xmsg->player_guid = myGuid;
-	strncpy(xmsg->msg, message.c_str(), sizeof(xmsg->msg));
-	xmsg->msg[sizeof(xmsg->msg) - 1] = '\0';
+	strlcpy(xmsg->msg, message.c_str());
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
 	//	std::cout << "sent chat message\r\n";
@@ -977,8 +978,7 @@ static void ChatCommandNickname(const std::string& name)
 	// Send network message
 	auto* xmsg = static_cast<NicknameUpdateMessage*>(g_Client->CreateMessage(NICKNAME_UPDATE));
 	xmsg->player_guid = myGuid;
-	strncpy(xmsg->new_name, name.c_str(), sizeof(xmsg->new_name));
-	xmsg->new_name[sizeof(xmsg->new_name) - 1] = '\0';
+	strlcpy(xmsg->new_name, name.c_str());
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
 	//	std::cout << "sent nickname update\r\n";
@@ -999,8 +999,7 @@ static void ChatCommandStatus(const std::string& status)
 	// Send network message
 	auto* xmsg = static_cast<StatusUpdateMessage*>(g_Client->CreateMessage(STATUS_UPDATE));
 	xmsg->player_guid = myGuid;
-	strncpy(xmsg->new_status, status.c_str(), sizeof(xmsg->new_status));
-	xmsg->new_status[sizeof(xmsg->new_status) - 1] = '\0';
+	strlcpy(xmsg->new_status, status.c_str());
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 }
 

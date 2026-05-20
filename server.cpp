@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cutils.h"
+
 using namespace yojimbo;
 
 // ===========================================================================
@@ -317,6 +319,29 @@ static void broadcastSkinFile(Server& server, int senderIndex, uint64_t playerGu
 	}
 }
 
+static void sendNicknamesAndStatusesToClient(Server& server, int clientIndex)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == clientIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* msg_name = static_cast<NicknameUpdateMessage*>(server.CreateMessage(i, NICKNAME_UPDATE));
+
+		msg_name->player_guid = guidManager.getGuid(i);
+		strlcpy(msg_name->new_name, guidManager.getNickname(i).c_str());
+
+		server.SendMessage(i, channels::Gameplay, msg_name);
+		
+		auto* msg_status = static_cast<StatusUpdateMessage*>(server.CreateMessage(i, STATUS_UPDATE));
+
+		msg_status->player_guid = guidManager.getGuid(i);
+		strlcpy(msg_status->new_status, guidManager.getStatus(i).c_str());
+
+		server.SendMessage(i, channels::Gameplay, msg_status);
+	}
+}
+
 // ===========================================================================
 //  Server Adapter — handles connect/disconnect events
 // ===========================================================================
@@ -349,6 +374,7 @@ public:
 			server->SendMessage(clientIndex, channels::Gameplay, msg);
 
 			replayCachedSkinsToClient(*server, clientIndex);
+			sendNicknamesAndStatusesToClient(*server, clientIndex);
 		}
 	}
 
@@ -475,10 +501,12 @@ static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMe
 	}
 }
 
-static void broadcastNicknameUpdate(Server& server, int senderIndex, NicknameUpdateMessage* msg)
+static void processNicknameUpdate(Server& server, int senderIndex, NicknameUpdateMessage* msg)
 {
-	uint64_t senderGuid = guidManager.getGuid(senderIndex);
-
+	// 1. remember the name
+	guidManager.setNickname(senderIndex, msg->new_name);
+	
+	// 2. broadcast update to other players
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
 	{
 		if (i == senderIndex || !server.IsClientConnected(i))
@@ -488,17 +516,18 @@ static void broadcastNicknameUpdate(Server& server, int senderIndex, NicknameUpd
 			server.CreateMessage(i, NICKNAME_UPDATE));
 
 		broadcast->player_guid = msg->player_guid;
-		strncpy(broadcast->new_name, msg->new_name, sizeof(msg->new_name));
-		broadcast->new_name[sizeof(msg->new_name)-1] = '\0';
+		strlcpy(broadcast->new_name, msg->new_name);
 
 		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
 }
 
-static void broadcastStatusUpdate(Server& server, int senderIndex, StatusUpdateMessage* msg)
+static void processStatusUpdate(Server& server, int senderIndex, StatusUpdateMessage* msg)
 {
-	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+	// 1. remember the status
+	guidManager.setStatus(senderIndex, msg->new_status);
 
+	// 2. broadcast update to other players
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
 	{
 		if (i == senderIndex || !server.IsClientConnected(i))
@@ -508,8 +537,7 @@ static void broadcastStatusUpdate(Server& server, int senderIndex, StatusUpdateM
 			server.CreateMessage(i, STATUS_UPDATE));
 
 		broadcast->player_guid = msg->player_guid;
-		strncpy(broadcast->new_status, msg->new_status, sizeof(msg->new_status));
-		broadcast->new_status[sizeof(msg->new_status)-1] = '\0';
+		strlcpy(broadcast->new_status, msg->new_status);
 
 		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
@@ -528,8 +556,7 @@ static void broadcastChatMessage(Server& server, int senderIndex, ChatMsgMessage
 			server.CreateMessage(i, CHAT_MESSAGE));
 
 		broadcast->player_guid = msg->player_guid;
-		strncpy(broadcast->msg, msg->msg, sizeof(msg->msg));
-		broadcast->msg[sizeof(msg->msg)-1] = '\0';
+		strlcpy(broadcast->msg, msg->msg);
 
 		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
@@ -609,10 +636,10 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		processSkinFileTransfer(server, clientIndex, static_cast<SkinFileTransferMessage*>(message));
 		break;
 	case NICKNAME_UPDATE:
-		broadcastNicknameUpdate(server, clientIndex, static_cast<NicknameUpdateMessage*>(message));
+		processNicknameUpdate(server, clientIndex, static_cast<NicknameUpdateMessage*>(message));
 		break;
 	case STATUS_UPDATE:
-		broadcastStatusUpdate(server, clientIndex, static_cast<StatusUpdateMessage*>(message));
+		processStatusUpdate(server, clientIndex, static_cast<StatusUpdateMessage*>(message));
 		break;
 	case CHAT_MESSAGE:
 		broadcastChatMessage(server, clientIndex, static_cast<ChatMsgMessage*>(message));

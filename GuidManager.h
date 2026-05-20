@@ -11,6 +11,19 @@
 #include <unordered_map>
 #include <string>
 
+struct ClientData
+{
+	uint64_t guid;
+	std::string nickname;
+	std::string status;
+	
+	ClientData(uint64_t _guid) : guid(_guid)
+	{
+		nickname = "Username";
+		status = "Status";
+	}
+};
+
 class GuidManager
 {
 public:
@@ -33,6 +46,11 @@ public:
 
     /// Get the canonical diffuse texture filename for a GUID, eg. bilb3[d].xbmp.
     std::string getSkinFileName(uint64_t guid) const;
+    
+    const std::string &getNickname(int clientIndex) const;
+    void setNickname(int clientIndex, const std::string &newName);
+    const std::string &getStatus(int clientIndex) const;
+    void setStatus(int clientIndex, const std::string &newStatus);    
 
     /// Check if any GUIDs are available for assignment.
     bool hasAvailableGuids() const { return !availableGuids_.empty(); }
@@ -43,5 +61,5 @@ public:
 private:
     std::vector<uint64_t>                allGuids_;
     std::vector<uint64_t>                availableGuids_;
-    std::unordered_map<int, uint64_t>    clientGuidMap_;
+    std::unordered_map<int, ClientData>  clientGuidMap_;
 };
