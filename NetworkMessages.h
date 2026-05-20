@@ -46,7 +46,7 @@ enum GameMessageType
 		serialize_bits(stream, guid_low, 32); \
 		serialize_bits(stream, guid_high, 32); \
 		guid64 = (static_cast<uint64_t>(guid_high) << 32) | guid_low; \
-	} while(0);
+	} while(0)
 
 // both HOISTABLE_ACQUIRE & HOISTABLE_RELEASE
 struct HoistableAcquireReleaseMessage : public Message
@@ -137,13 +137,7 @@ struct PositionMessage : public Message
 		serialize_float(stream, animFrame);
 		serialize_float(stream, lastAnimFrame);
 
-		// uint64_t must be serialized as two 32-bit halves
-		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
-		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
+		serialize_GUID(stream, playerGuid);
 		serialize_bits(stream, bilboWeapon, 32);
 		serialize_bits(stream, nowLevel, 32);
 
@@ -177,12 +171,7 @@ struct GuidAssignMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(guid);
-		uint32_t guid_high = static_cast<uint32_t>(guid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
+		serialize_GUID(stream, guid);
 		return true;
 	}
 
@@ -197,14 +186,8 @@ struct SkinAnnouncementMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
-		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
+		serialize_GUID(stream, playerGuid);
 		serialize_string(stream, textureName, sizeof(textureName));
-
 		return true;
 	}
 
@@ -220,15 +203,9 @@ struct SkinFileTransferMessage : public BlockMessage
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
-		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
+		serialize_GUID(stream, playerGuid);
 		serialize_string(stream, textureName, sizeof(textureName));
 		serialize_string(stream, fileName, sizeof(fileName));
-
 		return true;
 	}
 
@@ -242,12 +219,7 @@ struct SkinClearMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(playerGuid);
-		uint32_t guid_high = static_cast<uint32_t>(playerGuid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		playerGuid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
-
+		serialize_GUID(stream, playerGuid);
 		return true;
 	}
 
@@ -283,11 +255,7 @@ struct EnemiesStateMessage : public Message
 					break;
 
 				uint64_t guid = pair.first;
-				// uint64_t must be serialized as two 32-bit halves
-				uint32_t guid_low = static_cast<uint32_t>(guid);
-				uint32_t guid_high = static_cast<uint32_t>(guid >> 32);
-				serialize_bits(stream, guid_low, 32);
-				serialize_bits(stream, guid_high, 32);
+				serialize_GUID(stream, guid);
 
 				Enemy e = NetworkClamp::sanitizeEnemy(pair.second);
 				serialize_float(stream, e.x);
@@ -315,12 +283,8 @@ struct EnemiesStateMessage : public Message
 			// Deserialize each enemy
 			for (uint32_t i = 0; i < numEnemies; ++i)
 			{
-
-				uint32_t guid_low;
-				uint32_t guid_high;
-				serialize_bits(stream, guid_low, 32);
-				serialize_bits(stream, guid_high, 32);
-				uint64_t guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+				uint64_t guid = 0;
+				serialize_GUID(stream, guid);
 
 				Enemy e;
 				serialize_float(stream, e.x);
@@ -352,13 +316,8 @@ struct NicknameUpdateMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(player_guid);
-		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_GUID(stream, player_guid);
 		serialize_string(stream, new_name, sizeof(new_name));
-
 		return true;
 	}
 
@@ -373,13 +332,8 @@ struct StatusUpdateMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(player_guid);
-		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_GUID(stream, player_guid);
 		serialize_string(stream, new_status, sizeof(new_status));
-
 		return true;
 	}
 
@@ -394,11 +348,7 @@ struct ChatMsgMessage : public Message
 	template <typename Stream>
 	bool Serialize(Stream& stream)
 	{
-		uint32_t guid_low = static_cast<uint32_t>(player_guid);
-		uint32_t guid_high = static_cast<uint32_t>(player_guid >> 32);
-		serialize_bits(stream, guid_low, 32);
-		serialize_bits(stream, guid_high, 32);
-		player_guid = (static_cast<uint64_t>(guid_high) << 32) | guid_low;
+		serialize_GUID(stream, player_guid);
 		serialize_string(stream, msg, sizeof(msg));
 
 		return true;
