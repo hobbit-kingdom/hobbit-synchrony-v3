@@ -100,6 +100,9 @@ public:
 
 		std::lock_guard<std::mutex> lock(objectStackMutex);
 
+		objectStackAddress = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F648));
+		objectStackSize = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F660));
+
 		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
 			uint32_t objStackAddress = objectStackAddress + offset;
 			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
@@ -123,6 +126,9 @@ public:
 
 		std::lock_guard<std::mutex> lock(objectStackMutex);
 
+		objectStackAddress = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F648));
+		objectStackSize = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F660));
+
 		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
 			uint32_t objStackAddress = objectStackAddress + offset;
 			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
@@ -142,59 +148,6 @@ public:
 	}
 
 	template <typename T>
-	uint32_t findGameObjByPattern(T pattern, uint32_t shift)
-	{
-		if (!isProcessSet()) return 0;
-
-		std::lock_guard<std::mutex> lock(objectStackMutex);
-
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
-			uint32_t objStackAddress = objectStackAddress + offset;
-			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
-			if (objAddrs != 0)
-			{
-				uint32_t patternAddrs = objAddrs + shift;
-				T objPattern = readData<T>(hobbitProcess, reinterpret_cast<LPVOID>(patternAddrs));
-				if (objPattern == pattern)
-				{
-					return objAddrs;
-				}
-			}
-		}
-		//hex
-		printf("Warning: Couldn't find pattern in the Game Object Stack\n");
-		return 0;
-	}
-	template <typename T>
-	uint32_t findGameObjByPattern(const std::vector<T>& pattern, uint32_t shift)
-	{
-		if (!isProcessSet()) return 0;
-
-		std::lock_guard<std::mutex> lock(objectStackMutex);
-
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE)
-		{
-			uint32_t objStackAddress = objectStackAddress + offset;
-			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
-			if (objAddrs != 0)
-			{
-				uint32_t patternAddrs = objAddrs + shift;
-				std::vector<T> objPattern = readData(hobbitProcess, reinterpret_cast<LPVOID>(patternAddrs), pattern.size() * sizeof(T));
-				if (memcmp(objPattern.data(), pattern.data(), pattern.size()) == 0)
-				{
-					return objAddrs;
-				}
-			}
-		}
-
-		std::string warning = "";
-		for (T e : pattern) warning += e + "_";
-		printf("Warning: Couldn't find %s Pattern in the Game Object Stack\n", warning.c_str());
-
-		return 0;
-	}
-
-	template <typename T>
 	std::vector<uint32_t> findAllGameObjByPattern(T pattern, uint32_t shift)
 	{
 		if (!isProcessSet()) return std::vector<uint32_t>(0);
@@ -202,6 +155,9 @@ public:
 		std::vector<uint32_t> gameObjs;
 
 		std::lock_guard<std::mutex> lock(objectStackMutex);
+
+		objectStackAddress = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F648));
+		objectStackSize = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(0x0076F660));
 
 		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE)
 		{
@@ -225,88 +181,6 @@ public:
 
 		return gameObjs;
 	}
-	template <typename T>
-	std::vector<uint32_t> findAllGameObjByPattern(const std::vector<T>& pattern, uint32_t shift)
-	{
-		if (!isProcessSet()) return std::vector<uint32_t>(0);
-
-		std::vector<uint32_t> gameObjs;
-
-		std::lock_guard<std::mutex> lock(objectStackMutex);
-
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE)
-		{
-			uint32_t objStackAddress = objectStackAddress + offset;
-			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
-			if (objAddrs != 0)
-			{
-				uint32_t patternAddrs = objAddrs + shift;
-				std::vector<T> objPattern = readData(hobbitProcess, reinterpret_cast<LPVOID>(patternAddrs), pattern.size() * sizeof(T));
-				if (memcmp(objPattern.data(), pattern.data(), pattern.size()) == 0)
-				{
-					gameObjs.push_back(objAddrs);
-				}
-			}
-		}
-
-		if (gameObjs.size() == 0)
-		{
-			std::string warningMsg = "";
-			for (T e : pattern) warningMsg += e + "_";
-			printf("Warning: Couldn't find %s Pattern in the Game Object Stack\n", warningMsg.c_str());
-		}
-
-		return gameObjs;
-	}
-
-
-	template <typename T, typename P>
-	std::vector<T> findReadAllGameObjByPattern(P pattern, uint32_t patternShift, uint32_t readShift)
-	{
-
-		if (!isProcessSet()) return std::vector<T>();
-		std::vector<T>  gameObjs;
-
-		std::lock_guard<std::mutex> lock(objectStackMutex);
-
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
-			uint32_t objStackAddress = objectStackAddress + offset;
-			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
-			if (objAddrs != 0)
-			{
-				uint32_t patternAddrs = objAddrs + patternShift;
-				P objPattern = readData<P>(hobbitProcess, reinterpret_cast<LPVOID>(patternAddrs));
-				if (objPattern == pattern)
-				{
-					patternAddrs = objAddrs + readShift;
-					T objPattern = readData<T>(hobbitProcess, reinterpret_cast<LPVOID>(patternAddrs));
-					gameObjs.push_back(objPattern);
-				}
-			}
-		}
-		return gameObjs;
-	}
-	template <typename T, typename P>
-
-	std::vector<uint32_t> getAllObjects() {
-		if (!isProcessSet()) return std::vector<uint32_t>(0);
-
-		std::vector<uint32_t> foundObjects;
-
-		std::lock_guard<std::mutex> lock(objectStackMutex);
-
-		for (size_t offset = 0; offset < objectStackSize * OBJECT_PTR_SIZE; offset += OBJECT_PTR_SIZE) {
-			uint32_t objStackAddress = objectStackAddress + offset;
-			uint32_t objAddrs = readData<uint32_t>(hobbitProcess, reinterpret_cast<LPVOID>(objStackAddress));
-			if (objAddrs != 0)
-			{
-				foundObjects.push_back(objAddrs);
-			}
-		}
-
-		return foundObjects;
-	}
-
 
 private:
 	HANDLE hobbitProcess = 0;

@@ -91,6 +91,9 @@ static std::string localSkinConfigError;
 std::unordered_map<uint32_t, uint32_t> animDataMap;
 static std::unordered_map<uint32_t, float> animFrameRanges;
 
+CRITICAL_SECTION enemiesCriticalSection;
+std::unordered_map<uint64_t, Enemy> enemy_updates;
+bool enemies_updated = false;
 
 std::unordered_map<uint64_t, NPC*> enemies;
 const uint32_t X_POSITION_PTR = 0x0075BA3C; // address of bilbo *g_pBilbo variable
@@ -135,6 +138,29 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 
 	LeaveCriticalSection(&hoistablesCriticalSection);
+
+	/* update enemies */
+	EnterCriticalSection(&enemiesCriticalSection);
+
+	if(enemies_updated) {
+		for (auto enemyUpdate : enemy_updates)
+		{
+			const auto enemyIt = enemies.find(enemyUpdate.first);
+			if (enemyIt == enemies.end() || enemyIt->second == nullptr || !enemyIt->second->isValid())
+				continue;
+
+			NPC* badBoy = enemyIt->second;
+			badBoy->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
+			badBoy->setRotationY(enemyUpdate.second.rot);
+			badBoy->setHealth(enemyUpdate.second.health);
+			if (badBoy->getAnimation() != enemyUpdate.second.anim)
+				badBoy->setNPCAnim(enemyUpdate.second.anim);
+
+		}
+		enemies_updated = false;
+	}
+
+	LeaveCriticalSection(&enemiesCriticalSection);
 }
 
 void SetupBilboHook(void)
@@ -816,6 +842,12 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 
 	std::unordered_map<uint64_t, Enemy> updates = msg->enemies;
 
+	EnterCriticalSection(&enemiesCriticalSection);
+	enemy_updates = updates;
+	enemies_updated = true;
+	LeaveCriticalSection(&enemiesCriticalSection);
+
+	/*
 	for (auto enemyUpdate : updates)
 	{
 		const auto enemyIt = enemies.find(enemyUpdate.first);
@@ -830,6 +862,7 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 			badBoy->setNPCAnim(enemyUpdate.second.anim);
 
 	}
+	*/
 }
 
 static void processNicknameUpdate(NicknameUpdateMessage* msg)
@@ -1041,6 +1074,7 @@ static int clientMain()
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&hoistablesCriticalSection);
+	InitializeCriticalSection(&enemiesCriticalSection);
 	SetupBilboHook();
 
 	uint64_t clientId = 0;
@@ -1141,25 +1175,6 @@ static int clientMain()
 
 					client.SendMessage(channels::Gameplay, msgEnemy);
 					//////////////////////////////////
-/*
-					for (auto hoists : hoistables)
-					{
-						auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
-
-						Vector3 v = hoists.second->getPosition();
-
-						msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
-						msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
-						msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
-
-						msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(hoists.second->getRotationY());
-
-						msgHoistable->hoistableGuid = hoists.first;
-						msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
-
-						client.SendMessage(channels::Gameplay, msgHoistable);
-					}
-*/
 				}
 
 				lastSend = time;
