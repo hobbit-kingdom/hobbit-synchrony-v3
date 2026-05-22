@@ -72,15 +72,10 @@ public:
 
 	void setWeapon(uint32_t weaponId);
 
-	// --- Raw overloads (write uint32_t bit patterns) ---
-
-	void setPositionX(uint32_t value);
-	void setPositionY(uint32_t value);
-	void setPositionZ(uint32_t value);
-	void setPosition(uint32_t x, uint32_t y, uint32_t z);
-	void setRotationY(uint32_t value);
 	void setGUID(uint32_t newGUID);
 	void setAIMode(int mode);
+
+	bool isActivated() const;
 
 private:
 	HobbitProcessAnalyzer* analyzer_ = nullptr;

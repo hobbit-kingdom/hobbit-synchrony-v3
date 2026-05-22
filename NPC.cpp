@@ -6,6 +6,8 @@
 #include "NPC.h"
 #include <iostream>
 
+#include "meridian.hpp"
+
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -128,6 +130,14 @@ void NPC::setPosition(float x, float y, float z)
 	setPositionX(x);
 	setPositionY(y);
 	setPositionZ(z);
+	
+/*
+	object* theObject = (object*)objectAddress_;
+	if(theObject) {
+		vector3 ve = { x,y,z };
+		theObject->Move(ve, false);
+	}
+*/
 }
 
 
@@ -138,46 +148,19 @@ Vector3 NPC::getPosition() const
 }
 
 // ---------------------------------------------------------------------------
-// Position — raw uint32_t
-// ---------------------------------------------------------------------------
-
-void NPC::setPositionX(uint32_t value)
-{
-	for (uint32_t addr : positionXAddresses_)
-		analyzer_->writeData(addr, value);
-}
-
-void NPC::setPositionY(uint32_t value)
-{
-	for (uint32_t addr : positionXAddresses_)
-		analyzer_->writeData(addr + 0x4, value);
-}
-
-void NPC::setPositionZ(uint32_t value)
-{
-	for (uint32_t addr : positionXAddresses_)
-		analyzer_->writeData(addr + 0x8, value);
-}
-
-void NPC::setPosition(uint32_t x, uint32_t y, uint32_t z)
-{
-	setPositionX(x);
-	setPositionY(y);
-	setPositionZ(z);
-}
-
-// ---------------------------------------------------------------------------
 // Rotation
 // ---------------------------------------------------------------------------
 
 void NPC::setRotationY(float value)
 {
 	analyzer_->writeData(rotationYAddr_, value);
-}
-
-void NPC::setRotationY(uint32_t value)
-{
-	analyzer_->writeData(rotationYAddr_, value);
+/*
+	object* theObject = (object*)objectAddress_;
+	if(theObject) {
+		radian3 ve = { 0.f,value,0.f };
+		theObject->SetRotation(ve);
+	}
+*/
 }
 
 float NPC::getRotationY() const
@@ -425,4 +408,13 @@ void NPC::setAIMode(int mode)
 			*pointerAI = 247;
 		}
 	}
+}
+
+bool NPC::isActivated() const
+{
+	const char* theObject = (const char*)objectAddress_;
+	if(theObject) {
+		return !!(theObject[0x7F] & 0x10);
+	}	
+	return false;
 }

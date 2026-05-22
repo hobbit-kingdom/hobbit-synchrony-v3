@@ -71,4 +71,6 @@ public:
 	/// Advance interpolation and write the result to the NPC.
 	/// @param t  Interpolation factor clamped to [0, 1].
 	void tickLerp(float t);
+
+	void setPlayerAnim(int anim);
 };

@@ -75,6 +75,7 @@ static uint64_t myStatusGuid = 0;
 static std::string myNickname = "Username";
 
 // --- Remote players ---
+CRITICAL_SECTION playersCriticalSection;
 static std::vector<Player> activePlayers;
 
 static std::vector<uint64_t> playerGuids;
@@ -98,6 +99,8 @@ bool enemies_updated = false;
 std::unordered_map<uint64_t, NPC*> enemies;
 const uint32_t X_POSITION_PTR = 0x0075BA3C; // address of bilbo *g_pBilbo variable
 
+static int g_enemies_ai_mode = 0;
+
 struct HoistableUpdateStruct
 {
 	Hoistable *pObject;
@@ -106,10 +109,11 @@ struct HoistableUpdateStruct
 	bool updated = false;
 };
 
+CRITICAL_SECTION hoistablesCriticalSection;
 std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
 static Hoistable *g_currentHoistable = nullptr;
 
-CRITICAL_SECTION hoistablesCriticalSection;
+static double g_time = NetDefaults::INITIAL_TIME;
 
 typedef void (bilbo:: *pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
@@ -150,6 +154,10 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 				continue;
 
 			NPC* badBoy = enemyIt->second;
+
+			if(!badBoy->isActivated())
+				continue;
+
 			badBoy->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
 			badBoy->setRotationY(enemyUpdate.second.rot);
 			badBoy->setHealth(enemyUpdate.second.health);
@@ -161,6 +169,60 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 
 	LeaveCriticalSection(&enemiesCriticalSection);
+
+	// Interpolate all remote players
+	EnterCriticalSection(&playersCriticalSection);
+
+	for (auto& player : activePlayers)
+	{
+		// --- Animation ---
+		if (player.animation == player.targetAnimation)
+		{/*
+			// Same animation — smoothly lerp frames
+			float range = getClampedFrameRange(player.animation, msg->lastAnimFrame);
+
+			player.prevAnimFrame = player.animFrame;
+
+			if (range > 0.0f)
+			{
+				float prevWrapped = fmod(player.prevAnimFrame, range);
+				float delta = msg->animFrame - prevWrapped;
+				if (delta < -range / 2.0f)
+					delta += range;
+				player.targetAnimFrame = player.prevAnimFrame + delta;
+			}
+			else
+			{
+				player.targetAnimFrame = msg->animFrame;
+			}
+
+			player.prevLastAnimFrame = player.lastAnimFrame;
+			player.targetLastAnimFrame = range;*/
+		}
+		else
+		{/*
+			// Different animation — snap immediately
+			float range = getClampedFrameRange(player.animation, msg->lastAnimFrame);
+
+			player.animation = msg->animation;
+			player.animFrame = msg->animFrame;
+			player.lastAnimFrame = range;
+			player.prevAnimFrame = msg->animFrame;
+			player.targetAnimFrame = msg->animFrame;
+			player.prevLastAnimFrame = player.lastAnimFrame;
+			player.targetLastAnimFrame = player.lastAnimFrame;
+*/
+			// Apply new animation to NPC right away
+			player.setPlayerAnim(player.targetAnimation);
+		}
+
+		double elapsed = g_time - player.lerpStartTime;
+		float t = static_cast<float>(elapsed / NetDefaults::LERP_DURATION);
+		if (t > 1.0f) t = 1.0f;
+		player.tickLerp(t);
+	}
+
+	LeaveCriticalSection(&playersCriticalSection);
 }
 
 void SetupBilboHook(void)
@@ -479,8 +541,8 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 	player.targetY = msg->y;
 	player.targetZ = msg->z;
 
-
-	if (player.bilboWeapon != msg->bilboWeapon) player.setWeapon(msg->bilboWeapon);
+	if (player.bilboWeapon != msg->bilboWeapon) 
+		player.setWeapon(msg->bilboWeapon);
 	player.nowLevel = msg->nowLevel;
 
 	// Don't render NPC for the local player
@@ -490,58 +552,8 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 	// --- Rotation ---
 	player.targetRotationY = msg->rotationY;
 
-	// --- Animation ---
-	if (player.animation == msg->animation)
-	{
-		// Same animation — smoothly lerp frames
-		float range = getClampedFrameRange(msg->animation, msg->lastAnimFrame);
-
-		player.prevAnimFrame = player.animFrame;
-
-		if (range > 0.0f)
-		{
-			float prevWrapped = fmod(player.prevAnimFrame, range);
-			float delta = msg->animFrame - prevWrapped;
-			if (delta < -range / 2.0f)
-				delta += range;
-			player.targetAnimFrame = player.prevAnimFrame + delta;
-		}
-		else
-		{
-			player.targetAnimFrame = msg->animFrame;
-		}
-
-		player.prevLastAnimFrame = player.lastAnimFrame;
-		player.targetLastAnimFrame = range;
-	}
-	else
-	{
-		// Different animation — snap immediately
-		float range = getClampedFrameRange(msg->animation, msg->lastAnimFrame);
-
-		player.animation = msg->animation;
-		player.animFrame = msg->animFrame;
-		player.lastAnimFrame = range;
-		player.prevAnimFrame = msg->animFrame;
-		player.targetAnimFrame = msg->animFrame;
-		player.prevLastAnimFrame = player.lastAnimFrame;
-		player.targetLastAnimFrame = player.lastAnimFrame;
-
-		// Apply new animation to NPC right away
-		if (player.npc && player.npc->isValid())
-		{
-			if (msg->animation >= 0 && msg->animation <= 200)
-				player.npc->setNPCAnim(msg->animation);
-		}
-	}
-
-	/* is it worth it ? these two updated in Player::tickLerp anyway */
-	if (player.nickname_marker)
-		player.nickname_marker->setPosition(msg->x, msg->y + 120.f, msg->z);
-	if (player.status_marker)
-		player.status_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
-
-	player.targetAnimation = msg->animation;
+	if (msg->animation >= 0 && msg->animation <= 200)
+		player.targetAnimation = msg->animation;
 	player.lerpStartTime = currentTime;
 	applySkinMetadataToPlayer(player);
 }
@@ -572,29 +584,15 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 		newPlayer.npc = new NPC(processAnalyzer);
 		newPlayer.npc->initializeByGuid(newPlayer.npcGuid);
 
-		if (newPlayer.npc->isValid())
-		{
-			newPlayer.npc->setPosition(msg->x, msg->y, msg->z);
-			newPlayer.npc->setRotationY(msg->rotationY);
-			if (msg->animation >= 0 && msg->animation <= 200)
-			{
-				newPlayer.npc->setNPCAnim(msg->animation);
-				//newPlayer.npc->setAnimFrames(msg->animFrame, msg->lastAnimFrame);
-			}
-			newPlayer.npc->setWeapon(msg->bilboWeapon);
-		}
-
 		uint64_t nicknameGuid = (newPlayer.npcGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
 
 		newPlayer.nickname_marker = new Marker(processAnalyzer);
 		newPlayer.nickname_marker->initializeByGuid(nicknameGuid);
-		newPlayer.nickname_marker->setPosition(msg->x, msg->y + 120.f, msg->z);
 
 		uint64_t statusGuid = (newPlayer.npcGuid & 0xFFFFFFFF) | 0x0D8AD91200000000ull;
 
 		newPlayer.status_marker = new Marker(processAnalyzer);
 		newPlayer.status_marker->initializeByGuid(statusGuid);
-		newPlayer.status_marker->setPosition(msg->x, msg->y + 100.f, msg->z);
 	}
 
 	activePlayers.push_back(newPlayer);
@@ -724,15 +722,17 @@ static void sendLocalSkinData(Client& client)
 static void processPositionUpdate(PositionMessage* msg, double currentTime)
 {
 	if (msg->nowLevel != nowLevel)
-	{
 		return;
-	}
+
+	EnterCriticalSection(&playersCriticalSection);
 
 	Player* existing = findPlayerByGuid(msg->playerGuid);
 	if (existing)
 		updateExistingPlayer(*existing, msg, currentTime);
 	else
 		addNewPlayer(msg, currentTime);
+
+	LeaveCriticalSection(&playersCriticalSection);
 	/*
 	std::cout << "Player " << std::hex << msg->playerGuid << std::dec
 		<< ": pos(" << msg->x << ", "
@@ -1041,9 +1041,8 @@ static void ChatCommandChangeAIMode(const std::string& aiMode)
 	if (!g_Client || myGuid == 0)
 		return;
 
-
-
-	changeEnemiesAIMode(stoi(aiMode));
+	g_enemies_ai_mode = stoi(aiMode);
+	changeEnemiesAIMode(g_enemies_ai_mode);
 }
 
 // ===========================================================================
@@ -1054,8 +1053,7 @@ static int clientMain()
 {
 	printf("\nConnecting client with a server-issued token...\n");
 
-	double time = NetDefaults::INITIAL_TIME;
-	double lastSend = time;
+	double lastSend = g_time;
 
 	// Read server address
 	std::string serverIP = readSecureServerIP();
@@ -1063,7 +1061,7 @@ static int clientMain()
 	// Connect
 	ClientServerConfig config;
 	ConfigureGameNetworking(config);
-	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, time);
+	Client client(GetDefaultAllocator(), Address("0.0.0.0"), config, gameAdapter, g_time);
 
 	// add chat commands
 	g_Client = &client;
@@ -1073,6 +1071,7 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
 
 	// try to hook bilbo's OnAdvanceLogic
+	InitializeCriticalSection(&playersCriticalSection);
 	InitializeCriticalSection(&hoistablesCriticalSection);
 	InitializeCriticalSection(&enemiesCriticalSection);
 	SetupBilboHook();
@@ -1118,7 +1117,7 @@ static int clientMain()
 			Message* msg = client.ReceiveMessage(ch);
 			while (msg)
 			{
-				processMessage(client, msg, time);
+				processMessage(client, msg, g_time);
 
 				client.ReleaseMessage(msg);
 				msg = client.ReceiveMessage(ch);
@@ -1127,22 +1126,13 @@ static int clientMain()
 
 		sendLocalSkinData(client);
 
-		// Interpolate all remote players
-		for (auto& player : activePlayers)
-		{
-			double elapsed = time - player.lerpStartTime;
-			float t = static_cast<float>(elapsed / NetDefaults::LERP_DURATION);
-			if (t > 1.0f) t = 1.0f;
-			player.tickLerp(t);
-		}
-
 		if (client.IsDisconnected())
 			break;
 
 		// Send local player state at the configured tick rate
 		if (client.IsConnected() && myGuid != 0)
 		{
-			if (time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
+			if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
 			{
 				readLocalPlayerState();
 
@@ -1177,7 +1167,11 @@ static int clientMain()
 					//////////////////////////////////
 				}
 
-				lastSend = time;
+				if (isHost == 0)
+					changeEnemiesAIMode(g_enemies_ai_mode);
+				
+
+				lastSend = g_time;
 			}
 		}
 
@@ -1257,8 +1251,8 @@ static int clientMain()
 			marker2.setPosition(p2.x, p2.y, p2.z);
 		}
 		*/
-		time += NetDefaults::DELTA_TIME;
-		client.AdvanceTime(time);
+		g_time += NetDefaults::DELTA_TIME;
+		client.AdvanceTime(g_time);
 
 		if (client.ConnectionFailed())
 			break;

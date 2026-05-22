@@ -28,6 +28,11 @@ struct vector3
 	f32 X, Y, Z;
 };
 
+struct radian3
+{
+	f32 X, Y, Z; // really Pitch, Yaw, Roll
+};
+
 struct bbox
 {
 	vector3 Min;
@@ -55,9 +60,9 @@ public:
 	virtual void OnKill() = 0;
 	virtual void __something1() = 0;
 	virtual void OnAdvanceLogic(f32 DeltaTime) = 0;
-	virtual void Move(vector3& NewPos, xbool unk) = 0;
-	virtual void MoveRel(vector3& DeltaPos, xbool unk) = 0;
-	virtual void __something2() = 0;
+	virtual void Move(const vector3& NewPos, xbool unk) = 0;
+	virtual void MoveRel(const vector3& DeltaPos, xbool unk) = 0;
+	virtual void SetRotation(const radian3& Orient) = 0;
 	virtual void __something3() = 0;
 	virtual void __something4() = 0;
 	virtual void __something5() = 0;

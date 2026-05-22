@@ -98,3 +98,11 @@ void Player::tickLerp(float t)
 		//npc->setAnimFrames(wrappedFrame, lastAnimFrame);
 	}
 }
+
+void Player::setPlayerAnim(int anim)
+{
+	if(npc && npc->isValid()) {
+		npc->setNPCAnim(anim);
+		animation = anim;
+	}
+}
