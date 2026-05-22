@@ -119,7 +119,7 @@ float Hoistable::getRotationY() const
 void Hoistable::MakeHoistable(bool bHoistable)
 {
 	object* theObject = (object*)objectAddress_;
-	if(theObject) {
+	if (theObject) {
 		ed_property prop = {};
 		theObject->GetProperty(prop, "Is Hoistable");
 		prop.m_Value.m_xboolValue = (xbool)!!bHoistable;

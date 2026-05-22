@@ -1045,6 +1045,22 @@ static void ChatCommandChangeAIMode(const std::string& aiMode)
 	changeEnemiesAIMode(g_enemies_ai_mode);
 }
 
+static void ChatCommandDamage(const std::string& damage)
+{
+	if (!processAnalyzer)
+		return;
+
+	try
+	{
+		float dmgValue = std::stof(damage);
+		processAnalyzer->writeData(0x00572D8E, dmgValue);
+	}
+	catch (...)
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Invalid damage value.");
+	}
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -1069,6 +1085,7 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/name", "<nickname> - Change your nickname", ChatCommandNickname);
 	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
 	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
+	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
