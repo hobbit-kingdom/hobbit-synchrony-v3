@@ -1,6 +1,21 @@
-#Hobbit Sycnhorny v3
+# Hobbit Sycnhorny v3
 
-Description coming soon
+The Hobbit Synchrony is a mod that brings Multiplayer to The Hobbit 2003 Game. Play the game with your friends with up to 8 players or even more! The gameplay is still work in progress and subject to change. The mod is still in the testing and in the works - new features are being worked on.
+
+Download here: https://github.com/hobbit-kingdom/hobbit-synchrony-v3/releases
+
+## Video Showcase
+[<img width="50%" alt="Gameplay showcase" src="https://github.com/user-attachments/assets/d02c8aa2-772a-41de-bc9f-2c95044876f5" />](https://www.youtube.com/watch?v=4Yf1T2Yr1dc)
+
+
+## Installation
+
+Go to the [releases](https://github.com/hobbit-kingdom/hobbit-synchrony-v3/releases) section and download the .zip. Copy the contents of the .zip to the root of your Game folder. Then follow the README.TXT provided with the mod to run the multiplayer.
+
+## Join our Discord
+[<img width="2048" height="512" alt="banner 3" src="https://github.com/user-attachments/assets/e346271c-95f9-4f28-982a-3b98206df26f" />](https://discord.gg/uuMsVFX397)
+
+# For Developers
 
 ## Skin Sync
 
@@ -13,7 +28,7 @@ The multiplayer layer now supports a GUID-bound skin registry:
 
 To enable it for a client, copy `skin_config.example.txt` to `skin_config.txt` and point `file_path` at your texture file.
 
-##yojimbo
+## yojimbo
 
 Network library used for this project
 
