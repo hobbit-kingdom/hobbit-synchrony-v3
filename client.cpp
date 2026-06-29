@@ -29,7 +29,8 @@
 #include <string>
 
 #include "ChatOverlay.h"
-#include "meridian.hpp"
+#include "meridian.hpp"        // bilbo class + existing hooks (still needed by the rest of this file)
+#include "minhook/MinHook.h"   // CreateStoneProjectile detour (MinHook is compiled into the project)
 
 using namespace yojimbo;
 
@@ -103,7 +104,7 @@ static int g_enemies_ai_mode = 0;
 
 struct HoistableUpdateStruct
 {
-	Hoistable *pObject;
+	Hoistable* pObject;
 	float x, y, z;
 	float yaw;
 	bool updated = false;
@@ -111,30 +112,60 @@ struct HoistableUpdateStruct
 
 CRITICAL_SECTION hoistablesCriticalSection;
 std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
-static Hoistable *g_currentHoistable = nullptr;
+static Hoistable* g_currentHoistable = nullptr;
+
+// --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
+CRITICAL_SECTION throwCriticalSection;
+
+// outgoing: set by the CreateStoneProjectile hook when the LOCAL player throws
+volatile bool    g_haveThrow = false;
+Vector3          g_lastThrowFrom{};
+Vector3          g_lastThrowTo{};
+
+// incoming: remote throws queued by the net thread, spawned on the game thread
+struct PendingThrow { uint64_t guid; Vector3 from; Vector3 to; };
+static std::vector<PendingThrow> g_incomingThrows;
+
+// Projectile::CreateProjectile(eProjectileType, owner, vector3 from, vector3 to) @ 0x004B53A0
+// type 0x19 = "Normal Rock" (Bilbo's native stone). Spawning from code avoids the
+// audio-event path that crashes; from/to are 12-byte structs passed by value (__cdecl).
+typedef uint64_t(__cdecl* CreateProjectile_t)(uint32_t type, uint64_t owner, Vector3 from, Vector3 to);
+static const CreateProjectile_t game_CreateProjectile = reinterpret_cast<CreateProjectile_t>(0x004B53A0);
 
 static double g_time = NetDefaults::INITIAL_TIME;
 
-typedef void (bilbo:: *pOnAdvanceLogic_t)(float fDeltaTime);
+typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
 
 class hook_bilbo
 {
-	public:
+public:
 	void OnAdvanceLogic(float fDeltaTime);
 };
 
 void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 {
-	bilbo *pBilbo = (bilbo*)this;
+	bilbo* pBilbo = (bilbo*)this;
 	(pBilbo->*pOnAdvanceLogic_orig)(fDeltaTime);
+
+	// spawn any remote players' thrown stones (must run on the game thread)
+	EnterCriticalSection(&throwCriticalSection);
+	for (const PendingThrow& p : g_incomingThrows)
+	{
+		// owner: the throwing player's in-game object GUID. p.guid is the network
+		// player GUID — map it to the remote player's NPC object guid if you have it,
+		// otherwise 0 spawns an unowned rock (visual). type 0x19 = Normal Rock.
+		game_CreateProjectile(0x19, p.guid, p.from, p.to);
+	}
+	g_incomingThrows.clear();
+	LeaveCriticalSection(&throwCriticalSection);
 
 	// update hoistables position
 	EnterCriticalSection(&hoistablesCriticalSection);
 
-	for(auto it = hoistables.begin(); it != hoistables.end(); it++) {
-		HoistableUpdateStruct &upd = it->second;
-		if(upd.updated) {
+	for (auto it = hoistables.begin(); it != hoistables.end(); it++) {
+		HoistableUpdateStruct& upd = it->second;
+		if (upd.updated) {
 			upd.pObject->setPosition(upd.x, upd.y, upd.z);
 			upd.pObject->setRotationY(upd.yaw);
 			upd.updated = false;
@@ -146,7 +177,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	/* update enemies */
 	EnterCriticalSection(&enemiesCriticalSection);
 
-	if(enemies_updated) {
+	if (enemies_updated) {
 		for (auto enemyUpdate : enemy_updates)
 		{
 			const auto enemyIt = enemies.find(enemyUpdate.first);
@@ -155,7 +186,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 			NPC* badBoy = enemyIt->second;
 
-			if(!badBoy->isActivated())
+			if (!badBoy->isActivated())
 				continue;
 
 			badBoy->setPosition(enemyUpdate.second.x, enemyUpdate.second.y, enemyUpdate.second.z);
@@ -212,7 +243,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 			player.prevLastAnimFrame = player.lastAnimFrame;
 			player.targetLastAnimFrame = player.lastAnimFrame;
 */
-			// Apply new animation to NPC right away
+// Apply new animation to NPC right away
 			player.setPlayerAnim(player.targetAnimation);
 		}
 
@@ -225,12 +256,14 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	LeaveCriticalSection(&playersCriticalSection);
 }
 
+void InstallStoneHook();   // forward decl (defined further below)
+
 void SetupBilboHook(void)
 {
 	LPDWORD pAddressInVMT = LPDWORD(0x006e9828);
 
 	LPVOID pOriginal = LPVOID(0x0041e360);
-	void (hook_bilbo::*pDetour_)(float fDeltaTime) = &hook_bilbo::OnAdvanceLogic;
+	void (hook_bilbo:: * pDetour_)(float fDeltaTime) = &hook_bilbo::OnAdvanceLogic;
 	DWORD pDetour;
 
 	memcpy(&pDetour, &pDetour_, 4);
@@ -240,6 +273,8 @@ void SetupBilboHook(void)
 	VirtualProtect(pAddressInVMT, 4, PAGE_EXECUTE_READWRITE, &oldProtect);
 	*pAddressInVMT = pDetour;
 	VirtualProtect(pAddressInVMT, 4, oldProtect, &oldProtect);
+
+	InstallStoneHook();   // detour bilbo::CreateStoneProjectile to capture throw destination
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -388,6 +423,46 @@ static Vector3 getBilboPos(void)
 	return pos;
 }
 
+
+// --- capture the player's stone-throw destination (no SDK needed) -----------
+// bilbo::CreateStoneProjectile(this, const vector3& from, const vector3& to) @ 0x00424C30
+// __thiscall: this in ECX; from/to are vector3* on the stack. We hook it as
+// __fastcall so ECX maps to `self`, the unused EDX is a filler, then from/to.
+// The game's vector3 is just 3 contiguous floats, so our Vector3 maps 1:1.
+
+// (g_haveThrow / g_lastThrowFrom / g_lastThrowTo are declared up top with the
+//  rest of the throw-networking state.)
+
+typedef void(__fastcall* CreateStoneProjectile_t)(
+	void* self, void* edx, const Vector3* from, const Vector3* to);
+static CreateStoneProjectile_t oCreateStoneProjectile = nullptr;
+
+static void __fastcall hkCreateStoneProjectile(
+	void* self, void* edx, const Vector3* from, const Vector3* to)
+{
+	EnterCriticalSection(&throwCriticalSection);
+	g_lastThrowFrom = *from;
+	g_lastThrowTo = *to;            // copy the destination out
+	g_haveThrow = true;            // net loop will pick this up and send STONE_THROW
+	LeaveCriticalSection(&throwCriticalSection);
+
+	char buf[160];
+	sprintf_s(buf, "[stone] from (%.1f, %.1f, %.1f)  ->  TO (%.1f, %.1f, %.1f)\n",
+		from->x, from->y, from->z, to->x, to->y, to->z);
+	OutputDebugStringA(buf);          // view in DebugView, or use your own logger
+	std::cout << buf << "\n";
+	oCreateStoneProjectile(self, edx, from, to);   // let the real throw happen
+}
+
+void InstallStoneHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+	void* target = reinterpret_cast<void*>(0x00424C30);   // raw address (ASLR off)
+	MH_CreateHook(target, &hkCreateStoneProjectile,
+		reinterpret_cast<void**>(&oCreateStoneProjectile));
+	MH_EnableHook(target);
+}
+
 static void readLocalPlayerState()
 {
 	localPos = getBilboPos();
@@ -396,6 +471,8 @@ static void readLocalPlayerState()
 	localAnimation = processAnalyzer->readData<uint32_t>(bilboAnimPtr);
 	if (!(localAnimation >= 0 && localAnimation <= 200))
 		localAnimation = 1;
+
+
 
 	// Cache animation data pointer
 	uint32_t animData = processAnalyzer->readData<uint32_t>(bilboAnimPtr + 0x4);
@@ -541,7 +618,7 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 	player.targetY = msg->y;
 	player.targetZ = msg->z;
 
-	if (player.bilboWeapon != msg->bilboWeapon) 
+	if (player.bilboWeapon != msg->bilboWeapon)
 		player.setWeapon(msg->bilboWeapon);
 	player.nowLevel = msg->nowLevel;
 
@@ -756,7 +833,7 @@ static void processHoistableAcquire(HoistableAcquireReleaseMessage* msg, double 
 	EnterCriticalSection(&hoistablesCriticalSection);
 
 	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
-	Hoistable *pHoistable;
+	Hoistable* pHoistable;
 
 	if (hoistableIt == hoistables.end()) {
 		HoistableUpdateStruct upd;
@@ -765,8 +842,9 @@ static void processHoistableAcquire(HoistableAcquireReleaseMessage* msg, double 
 		hoistables.emplace(msg->hoistableGuid, upd);
 
 		pHoistable = upd.pObject;
-	} else {
-		HoistableUpdateStruct &upd = hoistableIt->second;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
 		pHoistable = upd.pObject;
 	}
 
@@ -784,7 +862,7 @@ static void processHoistableRelease(HoistableAcquireReleaseMessage* msg, double 
 	EnterCriticalSection(&hoistablesCriticalSection);
 
 	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
-	Hoistable *pHoistable;
+	Hoistable* pHoistable;
 
 	if (hoistableIt == hoistables.end()) {
 		HoistableUpdateStruct upd;
@@ -793,8 +871,9 @@ static void processHoistableRelease(HoistableAcquireReleaseMessage* msg, double 
 		hoistables.emplace(msg->hoistableGuid, upd);
 
 		pHoistable = upd.pObject;
-	} else {
-		HoistableUpdateStruct &upd = hoistableIt->second;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
 		pHoistable = upd.pObject;
 	}
 
@@ -823,8 +902,9 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentT
 		upd.updated = true;
 
 		hoistables.emplace(msg->hoistableGuid, upd);
-	} else {
-		HoistableUpdateStruct &upd = hoistableIt->second;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
 
 		upd.x = msg->x;
 		upd.y = msg->y;
@@ -922,6 +1002,23 @@ static void processChatMessage(ChatMsgMessage* msg)
 	g_ChatOverlay.AddSystemMessage("[" + sender_name + "] " + msg->msg);
 }
 
+static void processStoneThrow(StoneThrowMessage* msg)
+{
+	// A remote player threw a stone. We can't spawn from here (net thread) —
+	// queue it and let OnAdvanceLogic (game thread) call CreateProjectile.
+	if (msg->playerGuid == myGuid)
+		return; // ignore our own throw echoed back
+
+	PendingThrow p;
+	p.guid = msg->playerGuid;
+	p.from = { msg->fromX, msg->fromY, msg->fromZ };
+	p.to = { msg->toX,   msg->toY,   msg->toZ };
+
+	EnterCriticalSection(&throwCriticalSection);
+	g_incomingThrows.push_back(p);
+	LeaveCriticalSection(&throwCriticalSection);
+}
+
 static void processMessage(Client& /*client*/, Message* message, double time)
 {
 	switch (message->GetType())
@@ -970,6 +1067,9 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 		break;
 	case CHAT_MESSAGE:
 		processChatMessage(static_cast<ChatMsgMessage*>(message));
+		break;
+	case STONE_THROW:
+		if (gameManager.isOnLevel()) processStoneThrow(static_cast<StoneThrowMessage*>(message));
 		break;
 
 	default:
@@ -1091,6 +1191,7 @@ static int clientMain()
 	InitializeCriticalSection(&playersCriticalSection);
 	InitializeCriticalSection(&hoistablesCriticalSection);
 	InitializeCriticalSection(&enemiesCriticalSection);
+	InitializeCriticalSection(&throwCriticalSection);
 	SetupBilboHook();
 
 	uint64_t clientId = 0;
@@ -1149,6 +1250,28 @@ static int clientMain()
 		// Send local player state at the configured tick rate
 		if (client.IsConnected() && myGuid != 0)
 		{
+			// Event-driven: if the local player threw a stone, send it immediately
+			// (not gated by the position tick rate).
+			if (g_haveThrow)
+			{
+				EnterCriticalSection(&throwCriticalSection);
+				Vector3 from = g_lastThrowFrom;
+				Vector3 to = g_lastThrowTo;
+				g_haveThrow = false;
+				LeaveCriticalSection(&throwCriticalSection);
+
+				auto* tmsg = static_cast<StoneThrowMessage*>(client.CreateMessage(STONE_THROW));
+				tmsg->playerGuid = myGuid;
+				tmsg->fromX = NetworkClamp::sanitizePosition(from.x);
+				tmsg->fromY = NetworkClamp::sanitizePosition(from.y);
+				tmsg->fromZ = NetworkClamp::sanitizePosition(from.z);
+				tmsg->toX = NetworkClamp::sanitizePosition(to.x);
+				tmsg->toY = NetworkClamp::sanitizePosition(to.y);
+				tmsg->toZ = NetworkClamp::sanitizePosition(to.z);
+				tmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+				client.SendMessage(channels::Gameplay, tmsg);
+			}
+
 			if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
 			{
 				readLocalPlayerState();
@@ -1186,7 +1309,7 @@ static int clientMain()
 
 				if (isHost == 0)
 					changeEnemiesAIMode(g_enemies_ai_mode);
-				
+
 
 				lastSend = g_time;
 			}
@@ -1194,11 +1317,11 @@ static int clientMain()
 
 		// update hoistable
 		{
-			bilbo *pBilbo = *((bilbo**)X_POSITION_PTR);
-			if(pBilbo) { // bilbo doesn't exist if we're still in menu
+			bilbo* pBilbo = *((bilbo**)X_POSITION_PTR);
+			if (pBilbo) { // bilbo doesn't exist if we're still in menu
 				guid hoist_guid = pBilbo->_get_nearest_hoistable();
 
-				if(!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
+				if (!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
 					// acquire
 					g_currentHoistable = new Hoistable(processAnalyzer);
 					g_currentHoistable->initializeByGuid(hoist_guid.Guid);
@@ -1214,7 +1337,7 @@ static int clientMain()
 					std::cout << "hoistable acquire\r\n";
 				}
 
-				if(g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
+				if (g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
 					// release
 					auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
 
@@ -1230,7 +1353,7 @@ static int clientMain()
 					std::cout << "hoistable release\r\n";
 				}
 
-				if(g_currentHoistable) {
+				if (g_currentHoistable) {
 					// update
 					auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
 

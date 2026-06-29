@@ -562,6 +562,31 @@ static void broadcastChatMessage(Server& server, int senderIndex, ChatMsgMessage
 	}
 }
 
+static void broadcastStoneThrow(Server& server, int senderIndex, StoneThrowMessage* msg)
+{
+	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<StoneThrowMessage*>(
+			server.CreateMessage(i, STONE_THROW));
+
+		broadcast->playerGuid = senderGuid;   // trust the server's mapping, not the client's claim
+		broadcast->fromX = msg->fromX;
+		broadcast->fromY = msg->fromY;
+		broadcast->fromZ = msg->fromZ;
+		broadcast->toX = msg->toX;
+		broadcast->toY = msg->toY;
+		broadcast->toZ = msg->toZ;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
 	(void) msg;
@@ -643,6 +668,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case CHAT_MESSAGE:
 		broadcastChatMessage(server, clientIndex, static_cast<ChatMsgMessage*>(message));
+		break;
+	case STONE_THROW:
+		broadcastStoneThrow(server, clientIndex, static_cast<StoneThrowMessage*>(message));
 		break;
 	default:
 		break;

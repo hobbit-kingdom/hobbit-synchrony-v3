@@ -21,7 +21,12 @@ public:
 	}
 	void updatePtrToProcess()
 	{
-		hobbitProcess = getProcess("Meridian.exe");
+		// The DLL is injected into the game, so always operate on our OWN process.
+		// Searching by name returns the first "Meridian.exe", so a second instance
+		// would attach to the first instance's memory and corrupt/crash it.
+		// GetCurrentProcess() returns a pseudo-handle (-1) that works with
+		// ReadProcessMemory/WriteProcessMemory/VirtualProtectEx and must not be closed.
+		hobbitProcess = GetCurrentProcess();
 	}
 
 	using ProcessAnalyzerTypeWrapped::readData;
@@ -36,7 +41,9 @@ public:
 	}
 	bool isGameRunning()
 	{
-		return  getProcess("Meridian.exe") != nullptr;
+		// We're injected into the game process, so it is running by definition.
+		// (The old name-based lookup also leaked an OpenProcess handle on every call.)
+		return true;
 	}
 
 	template <typename T>

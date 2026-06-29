@@ -35,6 +35,7 @@ enum GameMessageType
 	NICKNAME_UPDATE,
 	STATUS_UPDATE,
 	CHAT_MESSAGE,
+	STONE_THROW,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -350,6 +351,50 @@ struct ChatMsgMessage : public Message
 	{
 		serialize_GUID(stream, player_guid);
 		serialize_string(stream, msg, sizeof(msg));
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
+// StoneThrowMessage — a player threw a stone from one point to another
+// ---------------------------------------------------------------------------
+
+struct StoneThrowMessage : public Message
+{
+	uint64_t playerGuid = 0;   // who threw it
+	float    fromX = 0.0f;     // spawn point (hand)
+	float    fromY = 0.0f;
+	float    fromZ = 0.0f;
+	float    toX = 0.0f;       // destination / aim point
+	float    toY = 0.0f;
+	float    toZ = 0.0f;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, playerGuid);
+		serialize_float(stream, fromX);
+		serialize_float(stream, fromY);
+		serialize_float(stream, fromZ);
+		serialize_float(stream, toX);
+		serialize_float(stream, toY);
+		serialize_float(stream, toZ);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			fromX = NetworkClamp::sanitizePosition(fromX);
+			fromY = NetworkClamp::sanitizePosition(fromY);
+			fromZ = NetworkClamp::sanitizePosition(fromZ);
+			toX = NetworkClamp::sanitizePosition(toX);
+			toY = NetworkClamp::sanitizePosition(toY);
+			toZ = NetworkClamp::sanitizePosition(toZ);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
 
 		return true;
 	}
