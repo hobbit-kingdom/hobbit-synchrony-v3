@@ -38,6 +38,7 @@ public:
 
 	// set nickname
 	std::string nickname = "Username";
+	std::string status = "Status";
 
 	// --- Interpolation: position ---
 	float prevX = 0.0f, prevY = 0.0f, prevZ = 0.0f;

@@ -13,6 +13,7 @@
 #include <conio.h>
 #include <cstdio>
 #include <csignal>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <unordered_map>
@@ -75,6 +76,7 @@ static uint64_t myNicknameGuid = 0;
 static uint64_t myStatusGuid = 0;
 
 static std::string myNickname = "Username";
+static std::string myStatus = "Status";
 
 // --- Remote players ---
 CRITICAL_SECTION playersCriticalSection;
@@ -89,6 +91,8 @@ static bool localSkinLoaded = false;
 static bool localSkinUploadAttempted = false;
 static std::string localSkinConfigPath;
 static std::string localSkinConfigError;
+static std::unordered_map<uint64_t, std::string> pendingNicknames;
+static std::unordered_map<uint64_t, std::string> pendingStatuses;
 
 // --- Animation data caches ---
 std::unordered_map<uint32_t, uint32_t> animDataMap;
@@ -352,6 +356,146 @@ static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition&
 	return false;
 }
 
+static std::string resolveLocalProfileConfigPath()
+{
+	if (!localSkinConfigPath.empty())
+		return localSkinConfigPath;
+
+	std::vector<std::string> candidates;
+	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SkinSync::LocalSkinConfigFile));
+
+	const std::string exeDirectory = getModuleDirectory(nullptr);
+	if (!exeDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / SkinSync::LocalSkinConfigFile);
+
+	const std::string dllDirectory = getModuleDirectory(moduleInstance);
+	if (!dllDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / SkinSync::LocalSkinConfigFile);
+
+	for (const auto& candidate : candidates)
+	{
+		std::error_code error;
+		if (SkinSync::fs::exists(SkinSync::fs::path(candidate), error))
+			return candidate;
+	}
+
+	return candidates.empty() ? std::string(SkinSync::LocalSkinConfigFile) : candidates.front();
+}
+
+static std::string sanitizeIdentityValue(const std::string& value, size_t maxLength)
+{
+	std::string result;
+	result.reserve(value.size());
+	for (char ch : value)
+	{
+		if (ch != '\r' && ch != '\n')
+			result.push_back(ch);
+	}
+
+	if (maxLength > 0 && result.size() >= maxLength)
+		result.resize(maxLength - 1);
+
+	return result;
+}
+
+static void parseLocalProfileConfigLine(const std::string& line, std::string& nickname, std::string& status)
+{
+	const size_t separator = line.find('=');
+	if (separator == std::string::npos)
+		return;
+
+	std::string key = SkinSync::trim(line.substr(0, separator));
+	std::string value = SkinSync::trim(line.substr(separator + 1));
+
+	std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+
+	if (key == "name" || key == "nickname")
+		nickname = sanitizeIdentityValue(value, sizeof(NicknameUpdateMessage::new_name));
+	else if (key == "status")
+		status = sanitizeIdentityValue(value, sizeof(StatusUpdateMessage::new_status));
+}
+
+static bool loadLocalPlayerProfile(std::string& nickname, std::string& status, std::string* errorMessage = nullptr)
+{
+	nickname = "Username";
+	status = "Status";
+
+	const std::string configPath = resolveLocalProfileConfigPath();
+	std::ifstream configFile(configPath);
+	if (!configFile.is_open())
+	{
+		if (errorMessage)
+			errorMessage->clear();
+		return false;
+	}
+
+	std::string line;
+	while (std::getline(configFile, line))
+	{
+		line = SkinSync::trim(line);
+		if (line.empty() || line[0] == '#' || line[0] == ';')
+			continue;
+
+		parseLocalProfileConfigLine(line, nickname, status);
+	}
+
+	if (errorMessage)
+		errorMessage->clear();
+	return true;
+}
+
+static bool saveLocalPlayerProfile(const std::string& nickname, const std::string& status, std::string* errorMessage = nullptr)
+{
+	const std::string configPath = resolveLocalProfileConfigPath();
+	std::vector<std::string> lines;
+	std::ifstream input(configPath);
+	if (input.is_open())
+	{
+		std::string line;
+		while (std::getline(input, line))
+		{
+			std::string trimmed = SkinSync::trim(line);
+			if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';' || trimmed.find('=') == std::string::npos)
+			{
+				lines.push_back(line);
+				continue;
+			}
+
+			std::string key = SkinSync::trim(trimmed.substr(0, trimmed.find('=')));
+			std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+				return static_cast<char>(std::tolower(ch));
+			});
+
+			if (key == "name" || key == "nickname")
+				continue;
+			if (key == "status")
+				continue;
+
+			lines.push_back(line);
+		}
+	}
+
+	lines.push_back("name=" + sanitizeIdentityValue(nickname, sizeof(NicknameUpdateMessage::new_name)));
+	lines.push_back("status=" + sanitizeIdentityValue(status, sizeof(StatusUpdateMessage::new_status)));
+
+	std::ofstream output(configPath, std::ios::trunc);
+	if (!output.is_open())
+	{
+		if (errorMessage)
+			*errorMessage = "could not write profile config: " + configPath;
+		return false;
+	}
+
+	for (const std::string& line : lines)
+		output << line << "\n";
+
+	if (errorMessage)
+		errorMessage->clear();
+	return output.good();
+}
+
 static void clearActivePlayers()
 {
 	EnterCriticalSection(&playersCriticalSection);
@@ -405,6 +549,8 @@ static void resetClientSessionState()
 	myStatusGuid = 0;
 	localSkinUploadAttempted = false;
 	processedDataForThisLevel = false;
+	pendingNicknames.clear();
+	pendingStatuses.clear();
 }
 
 // ===========================================================================
@@ -663,6 +809,22 @@ static void applySkinMetadataToPlayer(Player& player)
 	player.textureFilePath = getSkinFilePathForGuid(player.npcGuid);
 }
 
+static void applyNameStatusMetadataToPlayer(Player& player)
+{
+	const auto nicknameIt = pendingNicknames.find(player.npcGuid);
+	if (nicknameIt != pendingNicknames.end())
+		player.nickname = nicknameIt->second;
+
+	const auto statusIt = pendingStatuses.find(player.npcGuid);
+	if (statusIt != pendingStatuses.end())
+		player.status = statusIt->second;
+
+	if (player.nickname_marker)
+		player.nickname_marker->setText(player.nickname.c_str());
+	if (player.status_marker)
+		player.status_marker->setText(player.status.c_str());
+}
+
 static void updateExistingPlayer(Player& player, PositionMessage* msg, double currentTime)
 {
 	// --- Snapshot previous position ---
@@ -688,6 +850,7 @@ static void updateExistingPlayer(Player& player, PositionMessage* msg, double cu
 		player.targetAnimation = msg->animation;
 	player.lerpStartTime = currentTime;
 	applySkinMetadataToPlayer(player);
+	applyNameStatusMetadataToPlayer(player);
 }
 
 static void addNewPlayer(PositionMessage* msg, double currentTime)
@@ -726,6 +889,8 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 		newPlayer.status_marker = new Marker(processAnalyzer);
 		newPlayer.status_marker->initializeByGuid(statusGuid);
 	}
+
+	applyNameStatusMetadataToPlayer(newPlayer);
 
 	activePlayers.push_back(newPlayer);
 }
@@ -1006,6 +1171,8 @@ static void processNicknameUpdate(NicknameUpdateMessage* msg)
 	std::cout << "player GUID = " << msg->player_guid << "\r\n";
 	std::cout << "new name = " << msg->new_name << "\r\n";
 
+	pendingNicknames[msg->player_guid] = msg->new_name;
+
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
 		std::cout << "playerFound\r\n";
@@ -1023,9 +1190,12 @@ static void processStatusUpdate(StatusUpdateMessage* msg)
 	std::cout << "player GUID = " << msg->player_guid << "\r\n";
 	std::cout << "new status = " << msg->new_status << "\r\n";
 
+	pendingStatuses[msg->player_guid] = msg->new_status;
+
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
 		std::cout << "playerFound\r\n";
+		pl->status = msg->new_status;
 		if (pl->status_marker) {
 			std::cout << "markerFound\r\n";
 			pl->status_marker->setText(msg->new_status);
@@ -1074,7 +1244,49 @@ static void processStoneThrow(StoneThrowMessage* msg)
 	LeaveCriticalSection(&throwCriticalSection);
 }
 
-static void processMessage(Client& /*client*/, Message* message, double time)
+static void applyLocalIdentityMarkers()
+{
+	if (myGuid == 0)
+		return;
+
+	Marker nicknameMarker(processAnalyzer);
+	nicknameMarker.initializeByGuid(myNicknameGuid);
+	nicknameMarker.setText(myNickname.c_str());
+
+	Marker statusMarker(processAnalyzer);
+	statusMarker.initializeByGuid(myStatusGuid);
+	statusMarker.setText(myStatus.c_str());
+}
+
+static void sendLocalNicknameUpdate(Client& client)
+{
+	if (myGuid == 0)
+		return;
+
+	auto* msg = static_cast<NicknameUpdateMessage*>(client.CreateMessage(NICKNAME_UPDATE));
+	msg->player_guid = myGuid;
+	strlcpy(msg->new_name, myNickname.c_str());
+	client.SendMessage(channels::Gameplay, msg);
+}
+
+static void sendLocalStatusUpdate(Client& client)
+{
+	if (myGuid == 0)
+		return;
+
+	auto* msg = static_cast<StatusUpdateMessage*>(client.CreateMessage(STATUS_UPDATE));
+	msg->player_guid = myGuid;
+	strlcpy(msg->new_status, myStatus.c_str());
+	client.SendMessage(channels::Gameplay, msg);
+}
+
+static void sendLocalIdentityToServer(Client& client)
+{
+	sendLocalNicknameUpdate(client);
+	sendLocalStatusUpdate(client);
+}
+
+static void processMessage(Client& client, Message* message, double time)
 {
 	switch (message->GetType())
 	{
@@ -1102,6 +1314,8 @@ static void processMessage(Client& /*client*/, Message* message, double time)
 
 		myNicknameGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
 		myStatusGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91200000000ull;
+		applyLocalIdentityMarkers();
+		sendLocalIdentityToServer(client);
 
 		break;
 	case SKIN_ANNOUNCE:
@@ -1156,22 +1370,15 @@ static void ChatCommandNickname(const std::string& name)
 	if (!g_Client || myGuid == 0)
 		return;
 
-	myNickname = name;
-
-	// Update local marker
-	Marker marker(processAnalyzer);
-	marker.initializeByGuid(myNicknameGuid);
-	marker.setText(name.c_str());
-
-	// Send network message
-	auto* xmsg = static_cast<NicknameUpdateMessage*>(g_Client->CreateMessage(NICKNAME_UPDATE));
-	xmsg->player_guid = myGuid;
-	strlcpy(xmsg->new_name, name.c_str());
-	g_Client->SendMessage(channels::Gameplay, xmsg);
+	myNickname = sanitizeIdentityValue(name, sizeof(NicknameUpdateMessage::new_name));
+	applyLocalIdentityMarkers();
+	sendLocalNicknameUpdate(*g_Client);
+	if (!saveLocalPlayerProfile(myNickname, myStatus))
+		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
 
 	//	std::cout << "sent nickname update\r\n";
 	//	std::cout << "player GUID = " << myGuid << "\r\n";
-	//	std::cout << "new name = " << xmsg->new_name << "\r\n";
+	//	std::cout << "new name = " << myNickname << "\r\n";
 }
 
 static void ChatCommandStatus(const std::string& status)
@@ -1179,16 +1386,11 @@ static void ChatCommandStatus(const std::string& status)
 	if (!g_Client || myGuid == 0)
 		return;
 
-	// Update local marker
-	Marker marker(processAnalyzer);
-	marker.initializeByGuid(myStatusGuid);
-	marker.setText(status.c_str());
-
-	// Send network message
-	auto* xmsg = static_cast<StatusUpdateMessage*>(g_Client->CreateMessage(STATUS_UPDATE));
-	xmsg->player_guid = myGuid;
-	strlcpy(xmsg->new_status, status.c_str());
-	g_Client->SendMessage(channels::Gameplay, xmsg);
+	myStatus = sanitizeIdentityValue(status, sizeof(StatusUpdateMessage::new_status));
+	applyLocalIdentityMarkers();
+	sendLocalStatusUpdate(*g_Client);
+	if (!saveLocalPlayerProfile(myNickname, myStatus))
+		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
 }
 
 static void ChatCommandChangeAIMode(const std::string& aiMode)
@@ -1547,6 +1749,25 @@ DWORD WINAPI mainThread(LPVOID)
 			<< "\n";
 	}
 
+	std::string profileError;
+	loadLocalPlayerProfile(myNickname, myStatus, &profileError);
+	if (!profileError.empty())
+	{
+		std::cout
+			<< "Name/status config disabled: "
+			<< profileError
+			<< "\n";
+	}
+	else
+	{
+		std::cout
+			<< "Default name/status: "
+			<< myNickname
+			<< " / "
+			<< myStatus
+			<< "\n";
+	}
+
 	//-----------------------------------------------------
 	// HOST INPUT
 	//-----------------------------------------------------
@@ -1619,6 +1840,3 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID)
 
 	return TRUE;
 }
-
-
-

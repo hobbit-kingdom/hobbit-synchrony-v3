@@ -326,19 +326,23 @@ static void sendNicknamesAndStatusesToClient(Server& server, int clientIndex)
 		if (i == clientIndex || !server.IsClientConnected(i))
 			continue;
 
-		auto* msg_name = static_cast<NicknameUpdateMessage*>(server.CreateMessage(i, NICKNAME_UPDATE));
+		const uint64_t playerGuid = guidManager.getGuid(i);
+		if (playerGuid == 0)
+			continue;
 
-		msg_name->player_guid = guidManager.getGuid(i);
+		auto* msg_name = static_cast<NicknameUpdateMessage*>(server.CreateMessage(clientIndex, NICKNAME_UPDATE));
+
+		msg_name->player_guid = playerGuid;
 		strlcpy(msg_name->new_name, guidManager.getNickname(i).c_str());
 
-		server.SendMessage(i, channels::Gameplay, msg_name);
+		server.SendMessage(clientIndex, channels::Gameplay, msg_name);
 		
-		auto* msg_status = static_cast<StatusUpdateMessage*>(server.CreateMessage(i, STATUS_UPDATE));
+		auto* msg_status = static_cast<StatusUpdateMessage*>(server.CreateMessage(clientIndex, STATUS_UPDATE));
 
-		msg_status->player_guid = guidManager.getGuid(i);
+		msg_status->player_guid = playerGuid;
 		strlcpy(msg_status->new_status, guidManager.getStatus(i).c_str());
 
-		server.SendMessage(i, channels::Gameplay, msg_status);
+		server.SendMessage(clientIndex, channels::Gameplay, msg_status);
 	}
 }
 
@@ -361,7 +365,9 @@ public:
 		uint64_t guid = guidManager.assignGuid(clientIndex);
 		if (guid == 0)
 		{
-			printf("No available GUIDs for client %d!\n", clientIndex);
+			printf("No available GUIDs for client %d! Disconnecting client.\n", clientIndex);
+			if (server)
+				server->DisconnectClient(clientIndex);
 			return;
 		}
 

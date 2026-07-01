@@ -61,5 +61,6 @@ public:
 private:
     std::vector<uint64_t>                allGuids_;
     std::vector<uint64_t>                availableGuids_;
-    std::unordered_map<int, ClientData>  clientGuidMap_;
+    std::unordered_map<int, uint64_t>    clientGuidMap_;
+    std::unordered_map<uint64_t, ClientData> guidData_;
 };
