@@ -410,6 +410,19 @@ void NPC::setAIMode(int mode)
 	}
 }
 
+void NPC::setTeam(int teamId)
+{
+	if (!isAnalyzerReady() || !isValid())
+		return;
+
+	uint32_t ObjectPtr = getObjectPtr();
+
+	char* pointerTeamId = (char*)ObjectPtr + 0x1a4;
+
+	*pointerTeamId = teamId;
+
+}
+
 bool NPC::isActivated() const
 {
 	const char* theObject = (const char*)objectAddress_;

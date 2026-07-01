@@ -81,9 +81,9 @@ void Player::tickLerp(float t)
 	//lastAnimFrame = targetLastAnimFrame;
 
 	// --- Marker(s) ---
-	if(nickname_marker)
+	if (nickname_marker)
 		nickname_marker->setPosition(x, y + 110.f, z);
-	if(status_marker)
+	if (status_marker)
 		status_marker->setPosition(x, y + 103.f, z);
 
 	if (animation > 0 && animation <= 200)
@@ -101,8 +101,16 @@ void Player::tickLerp(float t)
 
 void Player::setPlayerAnim(int anim)
 {
-	if(npc && npc->isValid()) {
+	if (npc && npc->isValid()) {
 		npc->setNPCAnim(anim);
 		animation = anim;
 	}
+}
+
+void Player::setTeam(int teamId)
+{
+	if (!npc || !npc->isValid())
+		return;
+
+	npc->setTeam(teamId);
 }

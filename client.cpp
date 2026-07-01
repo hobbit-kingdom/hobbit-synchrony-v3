@@ -421,7 +421,7 @@ static void parseLocalProfileConfigLine(const std::string& line, std::string& ni
 
 	std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
 		return static_cast<char>(std::tolower(ch));
-	});
+		});
 
 	if (key == "name" || key == "nickname")
 		nickname = sanitizeIdentityValue(value, sizeof(NicknameUpdateMessage::new_name));
@@ -489,7 +489,7 @@ static bool saveLocalPlayerProfile(const std::string& nickname, const std::strin
 			std::string key = SkinSync::trim(trimmed.substr(0, trimmed.find('=')));
 			std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
 				return static_cast<char>(std::tolower(ch));
-			});
+				});
 
 			if (key == "name" || key == "nickname")
 				continue;
@@ -1433,6 +1433,7 @@ static void ChatCommandChangeAIMode(const std::string& aiMode)
 	if (!g_Client || myGuid == 0)
 		return;
 
+	g_ChatOverlay.AddSystemMessage("[System] Setting ai mode to " + aiMode);
 	g_enemies_ai_mode = stoi(aiMode);
 	changeEnemiesAIMode(g_enemies_ai_mode);
 }
@@ -1464,6 +1465,16 @@ static void ChatCommandReconnect(const std::string&)
 	g_reconnectRequested.store(true);
 }
 
+static void ChatCommandSetTeam(const std::string& team)
+{
+	int teamId = std::stoi(team);
+
+	for (auto player : activePlayers)
+	{
+		player.setTeam(teamId);
+	}
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -1490,6 +1501,7 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
 	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
+	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);

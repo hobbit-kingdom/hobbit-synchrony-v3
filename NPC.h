@@ -74,6 +74,7 @@ public:
 
 	void setGUID(uint32_t newGUID);
 	void setAIMode(int mode);
+	void setTeam(int teamId);
 
 	bool isActivated() const;
 
