@@ -11,11 +11,14 @@
 #undef SendMessage
 
 #include <conio.h>
+#include <cerrno>
 #include <cstdio>
 #include <csignal>
 #include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <unordered_map>
 
 #include <algorithm>
@@ -389,16 +392,34 @@ static std::string sanitizeIdentityValue(const std::string& value, size_t maxLen
 {
 	std::string result;
 	result.reserve(value.size());
-	for (char ch : value)
+	for (unsigned char ch : value)
 	{
-		if (ch != '\r' && ch != '\n')
-			result.push_back(ch);
+		if (ch >= 32 && ch <= 126)
+			result.push_back(static_cast<char>(ch));
 	}
 
 	if (maxLength > 0 && result.size() >= maxLength)
 		result.resize(maxLength - 1);
 
 	return result;
+}
+
+static bool parseBoundedInt(const std::string& value, int minValue, int maxValue, int& result)
+{
+	std::string clean = SkinSync::trim(value);
+	if (clean.empty())
+		return false;
+
+	char* end = nullptr;
+	errno = 0;
+	long parsed = std::strtol(clean.c_str(), &end, 10);
+	if (errno == ERANGE || end == clean.c_str() || *end != '\0')
+		return false;
+	if (parsed < minValue || parsed > maxValue)
+		return false;
+
+	result = static_cast<int>(parsed);
+	return true;
 }
 
 static uint16_t sanitizeDamageValue(int value)
@@ -408,6 +429,38 @@ static uint16_t sanitizeDamageValue(int value)
 	if (value > 65535)
 		return 65535;
 	return static_cast<uint16_t>(value);
+}
+
+static uint32_t resolveLocalWeaponId(uint32_t weaponValue)
+{
+	if (NetworkClamp::sanitizeWeapon(weaponValue) == weaponValue)
+		return weaponValue;
+
+	struct WeaponMapping
+	{
+		uint32_t id;
+		uint64_t guid;
+	};
+
+	static constexpr WeaponMapping mappings[] =
+	{
+		{ 2u, 0x0D8AD910E885100Dull },
+		{ 0u, 0x0D8AD910E885100Bull },
+		{ 1u, 0x0D8AD910E885100Aull },
+		{ 3u, 0x0D8AD910E885100Cull }
+	};
+
+	if (!processAnalyzer)
+		return NetworkClamp::WeaponDefault;
+
+	for (const WeaponMapping& mapping : mappings)
+	{
+		uint32_t weaponObject = processAnalyzer->findGameObjByGUID(mapping.guid);
+		if (weaponObject && processAnalyzer->readData<uint32_t>(weaponObject + 0x260) == weaponValue)
+			return mapping.id;
+	}
+
+	return NetworkClamp::WeaponDefault;
 }
 
 static void parseLocalProfileConfigLine(const std::string& line, std::string& nickname, std::string& status, uint16_t& damage)
@@ -429,13 +482,9 @@ static void parseLocalProfileConfigLine(const std::string& line, std::string& ni
 		status = sanitizeIdentityValue(value, sizeof(StatusUpdateMessage::new_status));
 	else if (key == "damage" || key == "fake_bilbo_damage")
 	{
-		try
-		{
-			damage = sanitizeDamageValue(std::stoi(value));
-		}
-		catch (...)
-		{
-		}
+		int parsedDamage = 0;
+		if (parseBoundedInt(value, 0, 65535, parsedDamage))
+			damage = sanitizeDamageValue(parsedDamage);
 	}
 }
 
@@ -719,8 +768,9 @@ static void readLocalPlayerState()
 	localAnimFrame = processAnalyzer->readData<float>(baseAddr + 0x530);
 	localLastAnimFrame = processAnalyzer->readData<float>(baseAddr + 0x53C);
 
-	// Read weapon 
-	bilboWeapon = processAnalyzer->readData<uint32_t>(0x0075C738);
+	// Read weapon and convert the live game pointer value back to the network weapon id.
+	uint32_t rawBilboWeapon = processAnalyzer->readData<uint32_t>(0x0075C738);
+	bilboWeapon = resolveLocalWeaponId(rawBilboWeapon);
 	nowLevel = processAnalyzer->readData<uint32_t>(0x00762B5C);
 
 	// Track max frame range per animation
@@ -1202,47 +1252,50 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 
 static void processNicknameUpdate(NicknameUpdateMessage* msg)
 {
+	std::string newName = sanitizeIdentityValue(msg->new_name, sizeof(NicknameUpdateMessage::new_name));
 	std::cout << "processNicknameUpdate\r\n";
 	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "new name = " << msg->new_name << "\r\n";
+	std::cout << "new name = " << newName << "\r\n";
 
-	pendingNicknames[msg->player_guid] = msg->new_name;
+	pendingNicknames[msg->player_guid] = newName;
 
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
 		std::cout << "playerFound\r\n";
-		pl->nickname = msg->new_name;
+		pl->nickname = newName;
 		if (pl->nickname_marker) {
 			std::cout << "markerFound\r\n";
-			pl->nickname_marker->setText(msg->new_name);
+			pl->nickname_marker->setText(newName.c_str());
 		}
 	}
 }
 
 static void processStatusUpdate(StatusUpdateMessage* msg)
 {
+	std::string newStatus = sanitizeIdentityValue(msg->new_status, sizeof(StatusUpdateMessage::new_status));
 	std::cout << "processStatusUpdate\r\n";
 	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "new status = " << msg->new_status << "\r\n";
+	std::cout << "new status = " << newStatus << "\r\n";
 
-	pendingStatuses[msg->player_guid] = msg->new_status;
+	pendingStatuses[msg->player_guid] = newStatus;
 
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
 		std::cout << "playerFound\r\n";
-		pl->status = msg->new_status;
+		pl->status = newStatus;
 		if (pl->status_marker) {
 			std::cout << "markerFound\r\n";
-			pl->status_marker->setText(msg->new_status);
+			pl->status_marker->setText(newStatus.c_str());
 		}
 	}
 }
 
 static void processChatMessage(ChatMsgMessage* msg)
 {
+	std::string chatText = sanitizeIdentityValue(msg->msg, sizeof(ChatMsgMessage::msg));
 	std::cout << "processChatMessage\r\n";
 	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "msg = " << msg->msg << "\r\n";
+	std::cout << "msg = " << chatText << "\r\n";
 
 	std::string sender_name;
 
@@ -1259,7 +1312,7 @@ static void processChatMessage(ChatMsgMessage* msg)
 		}
 	}
 
-	g_ChatOverlay.AddSystemMessage("[" + sender_name + "] " + msg->msg);
+	g_ChatOverlay.AddSystemMessage("[" + sender_name + "] " + chatText);
 }
 
 static void processStoneThrow(StoneThrowMessage* msg)
@@ -1389,10 +1442,14 @@ static void ChatMessage(const std::string& message)
 	if (!g_Client || myGuid == 0)
 		return;
 
+	std::string cleanMessage = sanitizeIdentityValue(message, sizeof(ChatMsgMessage::msg));
+	if (cleanMessage.empty())
+		return;
+
 	// Send network message
 	auto* xmsg = static_cast<ChatMsgMessage*>(g_Client->CreateMessage(CHAT_MESSAGE));
 	xmsg->player_guid = myGuid;
-	strlcpy(xmsg->msg, message.c_str());
+	strlcpy(xmsg->msg, cleanMessage.c_str());
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
 	//	std::cout << "sent chat message\r\n";
@@ -1406,10 +1463,17 @@ static void ChatCommandNickname(const std::string& name)
 		return;
 
 	myNickname = sanitizeIdentityValue(name, sizeof(NicknameUpdateMessage::new_name));
+	if (myNickname.empty())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Invalid nickname.");
+		return;
+	}
+
 	applyLocalIdentityMarkers();
 	sendLocalNicknameUpdate(*g_Client);
 	if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
 		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
+	g_ChatOverlay.AddSystemMessage("[System] Name changed to " + myNickname + ".");
 
 	//	std::cout << "sent nickname update\r\n";
 	//	std::cout << "player GUID = " << myGuid << "\r\n";
@@ -1422,10 +1486,17 @@ static void ChatCommandStatus(const std::string& status)
 		return;
 
 	myStatus = sanitizeIdentityValue(status, sizeof(StatusUpdateMessage::new_status));
+	if (myStatus.empty())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Invalid status.");
+		return;
+	}
+
 	applyLocalIdentityMarkers();
 	sendLocalStatusUpdate(*g_Client);
 	if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
 		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
+	g_ChatOverlay.AddSystemMessage("[System] Status changed to " + myStatus + ".");
 }
 
 static void ChatCommandChangeAIMode(const std::string& aiMode)
@@ -1433,9 +1504,16 @@ static void ChatCommandChangeAIMode(const std::string& aiMode)
 	if (!g_Client || myGuid == 0)
 		return;
 
-	g_ChatOverlay.AddSystemMessage("[System] Setting ai mode to " + aiMode);
-	g_enemies_ai_mode = stoi(aiMode);
+	int parsedMode = 0;
+	if (!parseBoundedInt(aiMode, 0, 3, parsedMode))
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Invalid AI mode. Use 0, 1, 2, or 3.");
+		return;
+	}
+
+	g_enemies_ai_mode = parsedMode;
 	changeEnemiesAIMode(g_enemies_ai_mode);
+	g_ChatOverlay.AddSystemMessage("[System] AI mode set to " + std::to_string(parsedMode) + ".");
 }
 
 static void ChatCommandDamage(const std::string& damage)
@@ -1443,17 +1521,18 @@ static void ChatCommandDamage(const std::string& damage)
 	if (!processAnalyzer)
 		return;
 
-	try
+	int parsedDamage = 0;
+	if (parseBoundedInt(damage, 0, 65535, parsedDamage))
 	{
-		myFakeBilboDamage = sanitizeDamageValue(std::stoi(damage));
+		myFakeBilboDamage = sanitizeDamageValue(parsedDamage);
 		applyFakeBilboDamage();
 		if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
 			g_ChatOverlay.AddSystemMessage("[System] Failed to save damage config.");
 		g_ChatOverlay.AddSystemMessage("[System] Fake Bilbo damage set to " + std::to_string(myFakeBilboDamage) + ".");
 	}
-	catch (...)
+	else
 	{
-		g_ChatOverlay.AddSystemMessage("[System] Invalid damage value.");
+		g_ChatOverlay.AddSystemMessage("[System] Invalid damage value. Use 0 through 65535.");
 	}
 }
 
@@ -1467,12 +1546,18 @@ static void ChatCommandReconnect(const std::string&)
 
 static void ChatCommandSetTeam(const std::string& team)
 {
-	int teamId = std::stoi(team);
+	int teamId = 0;
+	if (!parseBoundedInt(team, 0, 2, teamId))
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Invalid team. Use 0, 1, or 2.");
+		return;
+	}
 
 	for (auto player : activePlayers)
 	{
 		player.setTeam(teamId);
 	}
+	g_ChatOverlay.AddSystemMessage("[System] Team set to " + std::to_string(teamId) + ".");
 }
 
 // ===========================================================================

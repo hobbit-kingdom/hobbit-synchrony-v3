@@ -65,6 +65,7 @@ public:
 	void setNpcGuid(uint64_t guid);
 	void setClientIndex(int index);
 	void setWeapon(int index);
+	void setTeam(int teamId);
 
 	/// Initialize all lerp fields to match the current state (no movement on first frame).
 	void initializeLerp(double currentTime);

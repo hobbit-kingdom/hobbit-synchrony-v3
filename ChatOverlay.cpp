@@ -3,6 +3,8 @@
 #include <Windows.h>
 #include <d3d9.h>
 #include <d3dx9.h>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -42,6 +44,67 @@ typedef BOOL (WINAPI *GetMessageW_t)(LPMSG, HWND, UINT, UINT);
 static GetMessageW_t oGetMessageW = nullptr;
 
 ChatOverlay g_ChatOverlay;
+
+static constexpr size_t MaxChatInputLength = 127;
+static constexpr size_t MaxChatDisplayLength = 256;
+
+static bool IsSafeChatChar(unsigned char ch)
+{
+	return ch >= 32 && ch <= 126;
+}
+
+static std::string SanitizeChatText(const std::string& text, size_t maxLength)
+{
+	std::string result;
+	result.reserve(text.size() < maxLength ? text.size() : maxLength);
+	for (unsigned char ch : text)
+	{
+		if (IsSafeChatChar(ch))
+		{
+			if (result.size() >= maxLength)
+				break;
+			result.push_back(static_cast<char>(ch));
+		}
+	}
+	return result;
+}
+
+static bool StartsWithCaseInsensitive(const std::string& text, const std::string& prefix)
+{
+	if (prefix.size() > text.size())
+		return false;
+
+	for (size_t i = 0; i < prefix.size(); ++i)
+	{
+		unsigned char lhs = static_cast<unsigned char>(text[i]);
+		unsigned char rhs = static_cast<unsigned char>(prefix[i]);
+		if (std::tolower(lhs) != std::tolower(rhs))
+			return false;
+	}
+	return true;
+}
+
+static int MeasureTextWidth(ID3DXFont* pFont, const std::string& text)
+{
+	if (!pFont || text.empty())
+		return 0;
+
+	std::string measured = text;
+	int trailingSpaces = 0;
+	while (!measured.empty() && measured.back() == ' ')
+	{
+		measured.pop_back();
+		++trailingSpaces;
+	}
+
+	RECT rect = { 0, 0, 0, 0 };
+	if (!measured.empty())
+		pFont->DrawTextA(NULL, measured.c_str(), -1, &rect, DT_CALCRECT | DT_NOCLIP, D3DCOLOR_XRGB(255, 255, 255));
+
+	RECT charRect = { 0, 0, 0, 0 };
+	pFont->DrawTextA(NULL, "X", -1, &charRect, DT_CALCRECT | DT_NOCLIP, D3DCOLOR_XRGB(255, 255, 255));
+	return (rect.right - rect.left) + trailingSpaces * (charRect.right - charRect.left);
+}
 
 // ===========================================================================
 //  Vertex / drawing helpers
@@ -208,8 +271,8 @@ static DWORD WINAPI KeyboardHookThread(LPVOID)
 
 static char MapVkToChar(int vk, bool shift)
 {
-	if (vk >= 'A' && vk <= 'Z') return shift ? vk : (vk + 32);
-	if (vk >= '0' && vk <= '9') return vk;
+	if (vk >= 'A' && vk <= 'Z') return static_cast<char>(shift ? vk : (vk + 32));
+	if (vk >= '0' && vk <= '9') return static_cast<char>(vk);
 
 	if (!shift)
 	{
@@ -295,8 +358,8 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				if (pressed && !wasPressed)
 				{
 					char c = MapVkToChar(vk, shift);
-					if (c && g_ChatOverlay.m_ChatBuffer.size() < 128)
-						g_ChatOverlay.m_ChatBuffer += c;
+					if (c)
+						g_ChatOverlay.AppendInputChar(c);
 				}
 				g_ChatOverlay.m_KeyState[vk] = pressed;
 			}
@@ -308,8 +371,8 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				if (pressed && !wasPressed)
 				{
 					char c = MapVkToChar(vk, shift);
-					if (c && g_ChatOverlay.m_ChatBuffer.size() < 128)
-						g_ChatOverlay.m_ChatBuffer += c;
+					if (c)
+						g_ChatOverlay.AppendInputChar(c);
 				}
 				g_ChatOverlay.m_KeyState[vk] = pressed;
 			}
@@ -322,6 +385,16 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				if (pressed && !wasPressed && !g_ChatOverlay.m_ChatBuffer.empty())
 					g_ChatOverlay.m_ChatBuffer.pop_back();
 				g_ChatOverlay.m_KeyState[VK_BACK] = pressed;
+			}
+
+			// Tab = autocomplete command
+			{
+				SHORT state = oGetAsyncKeyState(VK_TAB);
+				bool pressed = (state & 0x8000) != 0;
+				bool wasPressed = g_ChatOverlay.m_KeyState[VK_TAB];
+				if (pressed && !wasPressed)
+					g_ChatOverlay.AutocompleteCommand();
+				g_ChatOverlay.m_KeyState[VK_TAB] = pressed;
 			}
 
 			// Enter = send
@@ -386,11 +459,8 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 		{
 		case WM_CHAR:
 		{
-			char c = (char)wParam;
-			if (g_ChatOverlay.m_ChatBuffer == "/" && c == '/')
-				return 0;
-			if (c >= 32 && c <= 126 && g_ChatOverlay.m_ChatBuffer.size() < 128)
-				g_ChatOverlay.m_ChatBuffer += c;
+			if (wParam <= 0x7F)
+				g_ChatOverlay.AppendInputChar(static_cast<char>(wParam));
 			return 0;
 		}
 
@@ -404,6 +474,10 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 			case VK_BACK:
 				if (!g_ChatOverlay.m_ChatBuffer.empty())
 					g_ChatOverlay.m_ChatBuffer.pop_back();
+				return 0;
+
+			case VK_TAB:
+				g_ChatOverlay.AutocompleteCommand();
 				return 0;
 
 			case VK_RETURN:
@@ -524,10 +598,11 @@ void ChatOverlay::Shutdown()
 
 void ChatOverlay::SendChatMessage(const std::string& msg)
 {
-	if (msg.empty())
+	std::string clean = SanitizeChatText(msg, MaxChatDisplayLength);
+	if (clean.empty())
 		return;
 
-	m_ChatHistory.push_back({msg, GetTickCount()});
+	m_ChatHistory.push_back({clean, GetTickCount()});
 	m_LastMessageTime = GetTickCount();
 	if (m_ChatHistory.size() > 6)
 		m_ChatHistory.erase(m_ChatHistory.begin());
@@ -535,31 +610,64 @@ void ChatOverlay::SendChatMessage(const std::string& msg)
 
 void ChatOverlay::AddSystemMessage(const std::string& text)
 {
-	m_ChatHistory.push_back({text, GetTickCount()});
+	m_ChatHistory.push_back({SanitizeChatText(text, MaxChatDisplayLength), GetTickCount()});
 	m_LastMessageTime = GetTickCount();
 	if (m_ChatHistory.size() > 6)
 		m_ChatHistory.erase(m_ChatHistory.begin());
 }
 
+void ChatOverlay::AppendInputChar(char ch)
+{
+	if (m_ChatBuffer == "/" && ch == '/')
+		return;
+
+	if (!IsSafeChatChar(static_cast<unsigned char>(ch)) || m_ChatBuffer.size() >= MaxChatInputLength)
+		return;
+
+	m_ChatBuffer.push_back(ch);
+}
+
+std::string ChatOverlay::GetAutocompleteSuggestion() const
+{
+	if (m_ChatBuffer.empty() || m_ChatBuffer[0] != '/' || m_ChatBuffer.find(' ') != std::string::npos)
+		return std::string();
+
+	for (const ChatCommand& command : m_Commands)
+	{
+		if (StartsWithCaseInsensitive(command.cmd, m_ChatBuffer) && command.cmd.size() > m_ChatBuffer.size())
+			return command.cmd.substr(m_ChatBuffer.size());
+	}
+
+	return std::string();
+}
+
+void ChatOverlay::AutocompleteCommand()
+{
+	std::string suggestion = GetAutocompleteSuggestion();
+	if (!suggestion.empty())
+		m_ChatBuffer += suggestion;
+}
+
 void ChatOverlay::ProcessChatSend()
 {
-	if (m_ChatBuffer.empty())
+	std::string input = SanitizeChatText(m_ChatBuffer, MaxChatInputLength);
+	if (input.empty())
 	{
 		m_ChatOpen = false;
 		return;
 	}
 
-	if (m_ChatBuffer[0] == '/')
+	if (input[0] == '/')
 	{
-		std::string command = m_ChatBuffer;
+		std::string command = input;
 		size_t space = command.find(' ');
 		if (space != std::string::npos)
 			command = command.substr(0, space);
 
 		for(size_t i = 0; i < m_Commands.size(); i++) {
-			if(m_Commands[i].cmd == command) {
+			if(StartsWithCaseInsensitive(m_Commands[i].cmd, command) && m_Commands[i].cmd.size() == command.size()) {
 				std::string params = (space != std::string::npos)
-					? m_ChatBuffer.substr(space + 1) : "";
+					? input.substr(space + 1) : "";
 				m_Commands[i].callback(params);
 				goto found;
 			}
@@ -573,7 +681,7 @@ void ChatOverlay::ProcessChatSend()
 		// AddSystemMessage("[Chat] " + m_ChatBuffer);
 
 		if(m_MsgCallback)
-			m_MsgCallback(m_ChatBuffer);
+			m_MsgCallback(input);
 	}
 
 	found:
@@ -631,12 +739,22 @@ void ChatOverlay::Render(LPDIRECT3DDEVICE9 pDevice)
 		DrawFilledRect(pDevice, 15, 650, 500, 30,
 			D3DCOLOR_ARGB(180, 0, 0, 0));
 
-		std::string text = "> " + m_ChatBuffer;
-		if ((GetTickCount64() / 500) % 2)
-			text += "_";
+		std::string text = "> " + SanitizeChatText(m_ChatBuffer, MaxChatInputLength);
+		std::string suggestion = GetAutocompleteSuggestion();
 
 		DrawTextSimple(m_Font, text, 25, 655,
 			D3DCOLOR_XRGB(255, 255, 255));
+
+		int typedWidth = MeasureTextWidth(m_Font, text);
+		if (!suggestion.empty())
+		{
+			DrawTextSimple(m_Font, suggestion, 25 + typedWidth, 655,
+				D3DCOLOR_ARGB(120, 255, 255, 255));
+		}
+
+		if ((GetTickCount64() / 500) % 2)
+			DrawTextSimple(m_Font, "_", 25 + typedWidth, 655,
+				D3DCOLOR_XRGB(255, 255, 255));
 	}
 
 	if (stateBlock)

@@ -56,6 +56,9 @@ class ChatOverlay
 	void SendChatMessage(const std::string& msg);
 	void AddSystemMessage(const std::string& text);
 	void ProcessChatSend();
+	void AppendInputChar(char ch);
+	void AutocompleteCommand();
+	std::string GetAutocompleteSuggestion() const;
 
 	void Render(LPDIRECT3DDEVICE9 pDevice);
 
