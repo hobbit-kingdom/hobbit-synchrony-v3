@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 #include "cutils.h"
@@ -351,6 +352,60 @@ static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition&
 	return false;
 }
 
+static void clearActivePlayers()
+{
+	EnterCriticalSection(&playersCriticalSection);
+	for (auto& p : activePlayers)
+	{
+		if (p.npc)
+		{
+			delete p.npc;
+			p.npc = nullptr;
+		}
+		if (p.nickname_marker)
+		{
+			delete p.nickname_marker;
+			p.nickname_marker = nullptr;
+		}
+		if (p.status_marker)
+		{
+			delete p.status_marker;
+			p.status_marker = nullptr;
+		}
+	}
+	activePlayers.clear();
+	LeaveCriticalSection(&playersCriticalSection);
+}
+
+static void clearEnemies()
+{
+	EnterCriticalSection(&enemiesCriticalSection);
+	for (auto& pair : enemies)
+	{
+		if (pair.second)
+		{
+			delete pair.second;
+		}
+	}
+	enemies.clear();
+	LeaveCriticalSection(&enemiesCriticalSection);
+}
+
+static void resetClientSessionState()
+{
+	clearActivePlayers();
+	clearEnemies();
+	if (g_currentHoistable)
+	{
+		delete g_currentHoistable;
+		g_currentHoistable = nullptr;
+	}
+	myGuid = 0;
+	myNicknameGuid = 0;
+	myStatusGuid = 0;
+	localSkinUploadAttempted = false;
+	processedDataForThisLevel = false;
+}
 
 // ===========================================================================
 //  Game Memory Reading
@@ -358,7 +413,7 @@ static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition&
 
 static void readGamePointers()
 {
-	activePlayers.clear();
+	clearActivePlayers();
 	nowLevel = processAnalyzer->readData<uint32_t>(0x00762B5C);
 
 
@@ -367,7 +422,7 @@ static void readGamePointers()
 		0x560 + processAnalyzer->readData<uint32_t>(X_POSITION_PTR));
 
 	//Enemies 
-	enemies.clear();
+	clearEnemies();
 	printf("List Enemies\n");
 
 	//
@@ -1161,6 +1216,14 @@ static void ChatCommandDamage(const std::string& damage)
 	}
 }
 
+static std::atomic<bool> g_reconnectRequested(false);
+
+static void ChatCommandReconnect(const std::string&)
+{
+	g_ChatOverlay.AddSystemMessage("[System] Reconnect requested...");
+	g_reconnectRequested.store(true);
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -1186,6 +1249,7 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
 	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
 	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
+	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
@@ -1194,213 +1258,222 @@ static int clientMain()
 	InitializeCriticalSection(&throwCriticalSection);
 	SetupBilboHook();
 
-	uint64_t clientId = 0;
-	uint8_t connectToken[ConnectTokenBytes] = {};
-	if (!SecureConnect::requestConnectTokenFromServer(serverIP, clientId, connectToken))
-	{
-		printf("Failed to request connect token from %s:%d\n", serverIP.c_str(), SecureConnect::ConnectTokenPort);
-		return 1;
-	}
-
-	printf("Client ID from server token: %.16" PRIx64 "\n", clientId);
-	client.Connect(clientId, connectToken);
-
-	char addrStr[256];
-	client.GetAddress().ToString(addrStr, sizeof(addrStr));
-	printf("Client address: %s\n", addrStr);
-
 	signal(SIGINT, interruptHandler);
+
+	bool firstConnectAttempt = true;
+	bool connectionMessageShown = false;
 
 	// --- Game loop ---
 	while (!quit)
 	{
-		client.SendPackets();
-		client.ReceivePackets();
-
-		if (gameManager.isOnLevel() && !processedDataForThisLevel)
+		if (firstConnectAttempt)
 		{
-			readGamePointers();
-			processedDataForThisLevel = true;
-		}
-		if (!gameManager.isOnLevel())
-		{
-			processedDataForThisLevel = false;
-			activePlayers.clear();
-			enemies.clear();
-		}
-
-		// Process incoming messages on all channels
-		for (int ch = 0; ch < config.numChannels; ch++)
-		{
-			Message* msg = client.ReceiveMessage(ch);
-			while (msg)
+			firstConnectAttempt = false;
+			uint64_t clientId = 0;
+			uint8_t connectToken[ConnectTokenBytes] = {};
+			if (!SecureConnect::requestConnectTokenFromServer(serverIP, clientId, connectToken))
 			{
-				processMessage(client, msg, g_time);
+				printf("Failed to request connect token from %s:%d\n", serverIP.c_str(), SecureConnect::ConnectTokenPort);
+				g_ChatOverlay.AddSystemMessage("[System] Failed to request connect token from server.");
+			}
+			else
+			{
+				printf("Client ID from server token: %.16" PRIx64 "\n", clientId);
+				client.Connect(clientId, connectToken);
 
-				client.ReleaseMessage(msg);
-				msg = client.ReceiveMessage(ch);
+				char addrStr[256];
+				client.GetAddress().ToString(addrStr, sizeof(addrStr));
+				printf("Client address: %s\n", addrStr);
 			}
 		}
 
-		sendLocalSkinData(client);
-
-		if (client.IsDisconnected())
-			break;
-
-		// Send local player state at the configured tick rate
-		if (client.IsConnected() && myGuid != 0)
+		if (g_reconnectRequested.exchange(false))
 		{
-			// Event-driven: if the local player threw a stone, send it immediately
-			// (not gated by the position tick rate).
-			if (g_haveThrow)
-			{
-				EnterCriticalSection(&throwCriticalSection);
-				Vector3 from = g_lastThrowFrom;
-				Vector3 to = g_lastThrowTo;
-				g_haveThrow = false;
-				LeaveCriticalSection(&throwCriticalSection);
+			connectionMessageShown = false;
+			g_ChatOverlay.AddSystemMessage("[System] Attempting to reconnect...");
 
-				auto* tmsg = static_cast<StoneThrowMessage*>(client.CreateMessage(STONE_THROW));
-				tmsg->playerGuid = myGuid;
-				tmsg->fromX = NetworkClamp::sanitizePosition(from.x);
-				tmsg->fromY = NetworkClamp::sanitizePosition(from.y);
-				tmsg->fromZ = NetworkClamp::sanitizePosition(from.z);
-				tmsg->toX = NetworkClamp::sanitizePosition(to.x);
-				tmsg->toY = NetworkClamp::sanitizePosition(to.y);
-				tmsg->toZ = NetworkClamp::sanitizePosition(to.z);
-				tmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
-				client.SendMessage(channels::Gameplay, tmsg);
+			client.Disconnect();
+			resetClientSessionState();
+
+			uint64_t clientId = 0;
+			uint8_t connectToken[ConnectTokenBytes] = {};
+			if (!SecureConnect::requestConnectTokenFromServer(serverIP, clientId, connectToken))
+			{
+				printf("Failed to request connect token from %s:%d for reconnect\n", serverIP.c_str(), SecureConnect::ConnectTokenPort);
+				g_ChatOverlay.AddSystemMessage("[System] Reconnect failed: couldn't get token from server.");
+			}
+			else
+			{
+				printf("Reconnecting client with Client ID: %.16" PRIx64 "\n", clientId);
+				client.Connect(clientId, connectToken);
+				g_ChatOverlay.AddSystemMessage("[System] Reconnecting to server...");
+			}
+		}
+
+		if (client.IsConnected() || client.IsConnecting())
+		{
+			client.SendPackets();
+			client.ReceivePackets();
+
+			if (gameManager.isOnLevel() && !processedDataForThisLevel)
+			{
+				readGamePointers();
+				processedDataForThisLevel = true;
+			}
+			if (!gameManager.isOnLevel())
+			{
+				processedDataForThisLevel = false;
+				clearActivePlayers();
+				clearEnemies();
 			}
 
-			if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
+			// Process incoming messages on all channels
+			for (int ch = 0; ch < config.numChannels; ch++)
 			{
-				readLocalPlayerState();
-
-				auto* msg = static_cast<PositionMessage*>(client.CreateMessage(POSITION_UPDATE));
-				msg->x = NetworkClamp::sanitizePosition(localPos.x);
-				msg->y = NetworkClamp::sanitizePosition(localPos.y);
-				msg->z = NetworkClamp::sanitizePosition(localPos.z);
-				msg->rotationY = NetworkClamp::sanitizeRotationRadians(localRot.y);
-				msg->animation = NetworkClamp::sanitizeAnimation(localAnimation);
-				msg->animFrame = NetworkClamp::sanitizeAnimationFrame(localAnimFrame);
-				msg->lastAnimFrame = NetworkClamp::sanitizeAnimationFrame(localLastAnimFrame);
-				msg->playerGuid = myGuid;
-
-				msg->bilboWeapon = NetworkClamp::sanitizeWeapon(bilboWeapon);
-				msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
-
-				client.SendMessage(channels::Gameplay, msg);
-
-				if (isHost == 1)
+				Message* msg = client.ReceiveMessage(ch);
+				while (msg)
 				{
-					//ENEMIES
-					//////////////////////////////////
-					std::unordered_map<uint64_t, Enemy> enemiesPosSnap = readEnemiesState();
+					processMessage(client, msg, g_time);
 
-					auto* msgEnemy = static_cast<EnemiesStateMessage*>(client.CreateMessage(ENEMIES_UPDATE));
+					client.ReleaseMessage(msg);
+					msg = client.ReceiveMessage(ch);
+				}
+			}
 
-					msgEnemy->enemies = enemiesPosSnap;
+			sendLocalSkinData(client);
 
-					msgEnemy->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+			// Send local player state at the configured tick rate
+			if (client.IsConnected() && myGuid != 0)
+			{
+				// Event-driven: if the local player threw a stone, send it immediately
+				if (g_haveThrow)
+				{
+					EnterCriticalSection(&throwCriticalSection);
+					Vector3 from = g_lastThrowFrom;
+					Vector3 to = g_lastThrowTo;
+					g_haveThrow = false;
+					LeaveCriticalSection(&throwCriticalSection);
 
-					client.SendMessage(channels::Gameplay, msgEnemy);
-					//////////////////////////////////
+					auto* tmsg = static_cast<StoneThrowMessage*>(client.CreateMessage(STONE_THROW));
+					tmsg->playerGuid = myGuid;
+					tmsg->fromX = NetworkClamp::sanitizePosition(from.x);
+					tmsg->fromY = NetworkClamp::sanitizePosition(from.y);
+					tmsg->fromZ = NetworkClamp::sanitizePosition(from.z);
+					tmsg->toX = NetworkClamp::sanitizePosition(to.x);
+					tmsg->toY = NetworkClamp::sanitizePosition(to.y);
+					tmsg->toZ = NetworkClamp::sanitizePosition(to.z);
+					tmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+					client.SendMessage(channels::Gameplay, tmsg);
 				}
 
-				if (isHost == 0)
-					changeEnemiesAIMode(g_enemies_ai_mode);
+				if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
+				{
+					readLocalPlayerState();
 
-
-				lastSend = g_time;
-			}
-		}
-
-		// update hoistable
-		{
-			bilbo* pBilbo = *((bilbo**)X_POSITION_PTR);
-			if (pBilbo) { // bilbo doesn't exist if we're still in menu
-				guid hoist_guid = pBilbo->_get_nearest_hoistable();
-
-				if (!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
-					// acquire
-					g_currentHoistable = new Hoistable(processAnalyzer);
-					g_currentHoistable->initializeByGuid(hoist_guid.Guid);
-
-					auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_ACQUIRE));
-
-					msg->hoistableGuid = g_currentHoistable->getGUID();
+					auto* msg = static_cast<PositionMessage*>(client.CreateMessage(POSITION_UPDATE));
+					msg->x = NetworkClamp::sanitizePosition(localPos.x);
+					msg->y = NetworkClamp::sanitizePosition(localPos.y);
+					msg->z = NetworkClamp::sanitizePosition(localPos.z);
+					msg->rotationY = NetworkClamp::sanitizeRotationRadians(localRot.y);
+					msg->animation = NetworkClamp::sanitizeAnimation(localAnimation);
+					msg->animFrame = NetworkClamp::sanitizeAnimationFrame(localAnimFrame);
+					msg->lastAnimFrame = NetworkClamp::sanitizeAnimationFrame(localLastAnimFrame);
 					msg->playerGuid = myGuid;
+
+					msg->bilboWeapon = NetworkClamp::sanitizeWeapon(bilboWeapon);
 					msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 					client.SendMessage(channels::Gameplay, msg);
 
-					std::cout << "hoistable acquire\r\n";
+					if (isHost == 1)
+					{
+						//ENEMIES
+						std::unordered_map<uint64_t, Enemy> enemiesPosSnap = readEnemiesState();
+						auto* msgEnemy = static_cast<EnemiesStateMessage*>(client.CreateMessage(ENEMIES_UPDATE));
+						msgEnemy->enemies = enemiesPosSnap;
+						msgEnemy->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+						client.SendMessage(channels::Gameplay, msgEnemy);
+					}
+
+					if (isHost == 0)
+						changeEnemiesAIMode(g_enemies_ai_mode);
+
+					lastSend = g_time;
 				}
+			}
 
-				if (g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
-					// release
-					auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
+			// update hoistable
+			{
+				bilbo* pBilbo = *((bilbo**)X_POSITION_PTR);
+				if (pBilbo) {
+					guid hoist_guid = pBilbo->_get_nearest_hoistable();
 
-					msg->hoistableGuid = g_currentHoistable->getGUID();
-					msg->playerGuid = myGuid;
-					msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+					if (!g_currentHoistable && hoist_guid.Guid != 0 && pBilbo->_get_state() == BS_HOISTING) {
+						g_currentHoistable = new Hoistable(processAnalyzer);
+						g_currentHoistable->initializeByGuid(hoist_guid.Guid);
 
-					client.SendMessage(channels::Gameplay, msg);
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_ACQUIRE));
+						msg->hoistableGuid = g_currentHoistable->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-					delete g_currentHoistable;
-					g_currentHoistable = nullptr;
+						client.SendMessage(channels::Gameplay, msg);
+						std::cout << "hoistable acquire\r\n";
+					}
 
-					std::cout << "hoistable release\r\n";
-				}
+					if (g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(HOISTABLE_RELEASE));
+						msg->hoistableGuid = g_currentHoistable->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-				if (g_currentHoistable) {
-					// update
-					auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
+						client.SendMessage(channels::Gameplay, msg);
 
-					Vector3 v = g_currentHoistable->getPosition();
+						delete g_currentHoistable;
+						g_currentHoistable = nullptr;
+						std::cout << "hoistable release\r\n";
+					}
 
-					msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
-					msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
-					msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
+					if (g_currentHoistable) {
+						auto* msgHoistable = static_cast<HoistableStateMessage*>(client.CreateMessage(HOISTABLE_UPDATE));
+						Vector3 v = g_currentHoistable->getPosition();
+						msgHoistable->x = NetworkClamp::sanitizePosition(v.x);
+						msgHoistable->y = NetworkClamp::sanitizePosition(v.y);
+						msgHoistable->z = NetworkClamp::sanitizePosition(v.z);
+						msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentHoistable->getRotationY());
+						msgHoistable->hoistableGuid = g_currentHoistable->getGUID();
+						msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-					msgHoistable->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentHoistable->getRotationY());
-
-					msgHoistable->hoistableGuid = g_currentHoistable->getGUID();
-					msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
-
-					client.SendMessage(channels::Gameplay, msgHoistable);
+						client.SendMessage(channels::Gameplay, msgHoistable);
+					}
 				}
 			}
 		}
-
-		// update marker(s)
-		/*
+		else
 		{
-			Marker marker(processAnalyzer);
-			marker.initializeByGuid(myNicknameGuid);
-
-			Vector3 p = getBilboPos();
-			p.y += 110.f;
-			marker.setPosition(p.x, p.y, p.z);
-
-			Marker marker2(processAnalyzer);
-			marker2.initializeByGuid(myStatusGuid);
-
-			Vector3 p2 = getBilboPos();
-			p2.y += 103.f;
-			marker2.setPosition(p2.x, p2.y, p2.z);
+			if (!connectionMessageShown)
+			{
+				connectionMessageShown = true;
+				if (client.ConnectionFailed())
+				{
+					g_ChatOverlay.AddSystemMessage("[System] Connection failed! Type /reconnect to try again.");
+				}
+				else
+				{
+					g_ChatOverlay.AddSystemMessage("[System] Disconnected from server. Type /reconnect to try again.");
+				}
+				resetClientSessionState();
+			}
 		}
-		*/
+
 		g_time += NetDefaults::DELTA_TIME;
 		client.AdvanceTime(g_time);
-
-		if (client.ConnectionFailed())
-			break;
 
 		yojimbo_sleep(NetDefaults::DELTA_TIME);
 	}
 
 	client.Disconnect();
+	resetClientSessionState();
 	g_Client = nullptr;
 	return 0;
 }
@@ -1546,7 +1619,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID)
 
 	return TRUE;
 }
-
 
 
 
