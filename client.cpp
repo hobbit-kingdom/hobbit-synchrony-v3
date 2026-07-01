@@ -77,6 +77,9 @@ static uint64_t myStatusGuid = 0;
 
 static std::string myNickname = "Username";
 static std::string myStatus = "Status";
+static uint16_t myFakeBilboDamage = 10;
+
+static constexpr uint32_t FakeBilboDamageAddress = 0x00572D8E;
 
 // --- Remote players ---
 CRITICAL_SECTION playersCriticalSection;
@@ -398,7 +401,16 @@ static std::string sanitizeIdentityValue(const std::string& value, size_t maxLen
 	return result;
 }
 
-static void parseLocalProfileConfigLine(const std::string& line, std::string& nickname, std::string& status)
+static uint16_t sanitizeDamageValue(int value)
+{
+	if (value < 0)
+		return 0;
+	if (value > 65535)
+		return 65535;
+	return static_cast<uint16_t>(value);
+}
+
+static void parseLocalProfileConfigLine(const std::string& line, std::string& nickname, std::string& status, uint16_t& damage)
 {
 	const size_t separator = line.find('=');
 	if (separator == std::string::npos)
@@ -415,12 +427,23 @@ static void parseLocalProfileConfigLine(const std::string& line, std::string& ni
 		nickname = sanitizeIdentityValue(value, sizeof(NicknameUpdateMessage::new_name));
 	else if (key == "status")
 		status = sanitizeIdentityValue(value, sizeof(StatusUpdateMessage::new_status));
+	else if (key == "damage" || key == "fake_bilbo_damage")
+	{
+		try
+		{
+			damage = sanitizeDamageValue(std::stoi(value));
+		}
+		catch (...)
+		{
+		}
+	}
 }
 
-static bool loadLocalPlayerProfile(std::string& nickname, std::string& status, std::string* errorMessage = nullptr)
+static bool loadLocalPlayerProfile(std::string& nickname, std::string& status, uint16_t& damage, std::string* errorMessage = nullptr)
 {
 	nickname = "Username";
 	status = "Status";
+	damage = 10;
 
 	const std::string configPath = resolveLocalProfileConfigPath();
 	std::ifstream configFile(configPath);
@@ -438,7 +461,7 @@ static bool loadLocalPlayerProfile(std::string& nickname, std::string& status, s
 		if (line.empty() || line[0] == '#' || line[0] == ';')
 			continue;
 
-		parseLocalProfileConfigLine(line, nickname, status);
+		parseLocalProfileConfigLine(line, nickname, status, damage);
 	}
 
 	if (errorMessage)
@@ -446,7 +469,7 @@ static bool loadLocalPlayerProfile(std::string& nickname, std::string& status, s
 	return true;
 }
 
-static bool saveLocalPlayerProfile(const std::string& nickname, const std::string& status, std::string* errorMessage = nullptr)
+static bool saveLocalPlayerProfile(const std::string& nickname, const std::string& status, uint16_t damage, std::string* errorMessage = nullptr)
 {
 	const std::string configPath = resolveLocalProfileConfigPath();
 	std::vector<std::string> lines;
@@ -472,6 +495,8 @@ static bool saveLocalPlayerProfile(const std::string& nickname, const std::strin
 				continue;
 			if (key == "status")
 				continue;
+			if (key == "damage" || key == "fake_bilbo_damage")
+				continue;
 
 			lines.push_back(line);
 		}
@@ -479,6 +504,7 @@ static bool saveLocalPlayerProfile(const std::string& nickname, const std::strin
 
 	lines.push_back("name=" + sanitizeIdentityValue(nickname, sizeof(NicknameUpdateMessage::new_name)));
 	lines.push_back("status=" + sanitizeIdentityValue(status, sizeof(StatusUpdateMessage::new_status)));
+	lines.push_back("damage=" + std::to_string(damage));
 
 	std::ofstream output(configPath, std::ios::trunc);
 	if (!output.is_open())
@@ -553,6 +579,14 @@ static void resetClientSessionState()
 	pendingStatuses.clear();
 }
 
+static void applyFakeBilboDamage()
+{
+	if (!processAnalyzer)
+		return;
+
+	processAnalyzer->writeData<uint16_t>(FakeBilboDamageAddress, myFakeBilboDamage);
+}
+
 // ===========================================================================
 //  Game Memory Reading
 // ===========================================================================
@@ -612,6 +646,7 @@ static void readGamePointers()
 	}
 
 	printf("Enemies Found: %d", enemies.size());
+	applyFakeBilboDamage();
 
 }
 
@@ -1373,7 +1408,7 @@ static void ChatCommandNickname(const std::string& name)
 	myNickname = sanitizeIdentityValue(name, sizeof(NicknameUpdateMessage::new_name));
 	applyLocalIdentityMarkers();
 	sendLocalNicknameUpdate(*g_Client);
-	if (!saveLocalPlayerProfile(myNickname, myStatus))
+	if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
 		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
 
 	//	std::cout << "sent nickname update\r\n";
@@ -1389,7 +1424,7 @@ static void ChatCommandStatus(const std::string& status)
 	myStatus = sanitizeIdentityValue(status, sizeof(StatusUpdateMessage::new_status));
 	applyLocalIdentityMarkers();
 	sendLocalStatusUpdate(*g_Client);
-	if (!saveLocalPlayerProfile(myNickname, myStatus))
+	if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
 		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
 }
 
@@ -1409,8 +1444,11 @@ static void ChatCommandDamage(const std::string& damage)
 
 	try
 	{
-		float dmgValue = std::stof(damage);
-		processAnalyzer->writeData(0x00572D8E, dmgValue);
+		myFakeBilboDamage = sanitizeDamageValue(std::stoi(damage));
+		applyFakeBilboDamage();
+		if (!saveLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage))
+			g_ChatOverlay.AddSystemMessage("[System] Failed to save damage config.");
+		g_ChatOverlay.AddSystemMessage("[System] Fake Bilbo damage set to " + std::to_string(myFakeBilboDamage) + ".");
 	}
 	catch (...)
 	{
@@ -1750,21 +1788,23 @@ DWORD WINAPI mainThread(LPVOID)
 	}
 
 	std::string profileError;
-	loadLocalPlayerProfile(myNickname, myStatus, &profileError);
+	loadLocalPlayerProfile(myNickname, myStatus, myFakeBilboDamage, &profileError);
 	if (!profileError.empty())
 	{
 		std::cout
-			<< "Name/status config disabled: "
+			<< "Profile config disabled: "
 			<< profileError
 			<< "\n";
 	}
 	else
 	{
 		std::cout
-			<< "Default name/status: "
+			<< "Default name/status/damage: "
 			<< myNickname
 			<< " / "
 			<< myStatus
+			<< " / "
+			<< myFakeBilboDamage
 			<< "\n";
 	}
 

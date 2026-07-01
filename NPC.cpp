@@ -130,14 +130,14 @@ void NPC::setPosition(float x, float y, float z)
 	setPositionX(x);
 	setPositionY(y);
 	setPositionZ(z);
-	
-/*
-	object* theObject = (object*)objectAddress_;
-	if(theObject) {
-		vector3 ve = { x,y,z };
-		theObject->Move(ve, false);
-	}
-*/
+
+	/*
+		object* theObject = (object*)objectAddress_;
+		if(theObject) {
+			vector3 ve = { x,y,z };
+			theObject->Move(ve, false);
+		}
+	*/
 }
 
 
@@ -154,13 +154,13 @@ Vector3 NPC::getPosition() const
 void NPC::setRotationY(float value)
 {
 	analyzer_->writeData(rotationYAddr_, value);
-/*
-	object* theObject = (object*)objectAddress_;
-	if(theObject) {
-		radian3 ve = { 0.f,value,0.f };
-		theObject->SetRotation(ve);
-	}
-*/
+	/*
+		object* theObject = (object*)objectAddress_;
+		if(theObject) {
+			radian3 ve = { 0.f,value,0.f };
+			theObject->SetRotation(ve);
+		}
+	*/
 }
 
 float NPC::getRotationY() const
@@ -195,36 +195,36 @@ typedef void(__thiscall anim_track_controller::* SetAnimPROCPTR)(int anim_id, fl
 void NPC::setNPCAnim(int anim)
 {
 
-    uint32_t animAdd1 = analyzer_->readData<uint32_t>(0x304 + objectAddress_);
-    uint32_t animAdd2 = analyzer_->readData<uint32_t>(0x50 + animAdd1);
-    uint32_t animAdd4 = analyzer_->readData<uint32_t>(0x10C + animAdd2);
+	uint32_t animAdd1 = analyzer_->readData<uint32_t>(0x304 + objectAddress_);
+	uint32_t animAdd2 = analyzer_->readData<uint32_t>(0x50 + animAdd1);
+	uint32_t animAdd4 = analyzer_->readData<uint32_t>(0x10C + animAdd2);
 
-//    std::cout << analyzer_->readData<uint32_t>(animAdd4) << "\n";
+	//    std::cout << analyzer_->readData<uint32_t>(animAdd4) << "\n";
 
-    if (animAdd4 == 0)
-    {
-        //strcpy(anim_result, "ERROR");
-    }
-    else if (analyzer_->readData<uint32_t>(animAdd4) == 7289932)  // 7289932
-    {
-        anim_track_controller* pController = (anim_track_controller*)animAdd4;
+	if (animAdd4 == 0)
+	{
+		//strcpy(anim_result, "ERROR");
+	}
+	else if (analyzer_->readData<uint32_t>(animAdd4) == 7289932)  // 7289932
+	{
+		anim_track_controller* pController = (anim_track_controller*)animAdd4;
 
-        uint32_t _SetAnimPTR = 0x5434B0;
-        SetAnimPROCPTR SetAnimPTR;
-        memcpy(&SetAnimPTR, &_SetAnimPTR, 4);
+		uint32_t _SetAnimPTR = 0x5434B0;
+		SetAnimPROCPTR SetAnimPTR;
+		memcpy(&SetAnimPTR, &_SetAnimPTR, 4);
 
-        (pController->*SetAnimPTR)(anim, 0.15f);
+		(pController->*SetAnimPTR)(anim, 0.15f);
 
-        /*
-        uint32_t animationAddress = 0x8 + animAdd4;
-        int *pI = (int*)animationAddress;
+		/*
+		uint32_t animationAddress = 0x8 + animAdd4;
+		int *pI = (int*)animationAddress;
 
-        *pI = anim;
-        */
+		*pI = anim;
+		*/
 
-        //strcpy(anim_result, "ANIM OK");
-    }
-    else std::cout << "bad anim" << "\n";
+		//strcpy(anim_result, "ANIM OK");
+	}
+	else std::cout << "bad anim" << "\n";
 }
 
 
@@ -260,7 +260,7 @@ void NPC::setAnimFrames(float frame, float lastFrame)
 // ---------------------------------------------------------------------------
 
 void NPC::setWeapon(uint32_t weaponId)
-{/*
+{
 	if (!isAnalyzerReady() || !isValid())
 		return;
 
@@ -286,7 +286,7 @@ void NPC::setWeapon(uint32_t weaponId)
 		uint32_t ObjectPtr = getObjectPtr();
 		analyzer_->writeData(ObjectPtr + 0x260, weaponId);
 	}
-*/}
+}
 
 // ---------------------------------------------------------------------------
 // Internal: Pointer resolution
@@ -413,8 +413,8 @@ void NPC::setAIMode(int mode)
 bool NPC::isActivated() const
 {
 	const char* theObject = (const char*)objectAddress_;
-	if(theObject) {
+	if (theObject) {
 		return !!(theObject[0x7F] & 0x10);
-	}	
+	}
 	return false;
 }
