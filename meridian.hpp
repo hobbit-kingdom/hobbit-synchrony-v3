@@ -70,7 +70,7 @@ public:
 	virtual void SetRotation(const radian3& Orient) = 0;
 	virtual void __something3() = 0;
 	virtual void __something4() = 0;
-	virtual void __something5() = 0;
+	virtual const vector3 &GetPosition(void) = 0;
 	virtual void __something6() = 0;
 	virtual void __something7() = 0;
 	virtual void __something8() = 0;
@@ -224,7 +224,8 @@ struct ed_property_value
 	bbox    m_BBox;
 	xcolor  m_xcolorValue;
 	vector3 m_vec3Value;
-	u32 unk1[4];
+	radian3 m_rad3Value;
+	u32 unk1[1];
 	guid    m_guidValue;
 	u32 unk2;
 	s32     m_s32Value;

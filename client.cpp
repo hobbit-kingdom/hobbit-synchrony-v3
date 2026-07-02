@@ -132,6 +132,9 @@ std::unordered_map<uint64_t, uint8_t> webWallStates; // GUID -> state byte at +0
 static std::unordered_map<uint64_t, uint8_t> webWallStatesCache; // для отслеживания изменений
 static bool webWallStatesDirty = false;
 
+static CRITICAL_SECTION webWallUpdates_CS;
+static std::vector<uint64_t> webWallsTornList;
+
 // --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
 CRITICAL_SECTION throwCriticalSection;
 
@@ -154,6 +157,8 @@ static double g_time = NetDefaults::INITIAL_TIME;
 
 typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
+
+static bool g_bBreakWeb = false;
 
 class hook_bilbo
 {
@@ -277,6 +282,63 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 
 	LeaveCriticalSection(&playersCriticalSection);
+
+	if(g_bBreakWeb) {
+
+		// Найти объект по GUID
+		uint32_t objAddr = processAnalyzer->findGameObjByGUID(0xCD588A8C3A80CC00ull);
+		if (objAddr == 0) {
+			printf("no web\n");
+			return;
+		}
+
+		// Применить состояние
+		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
+		if(1) {
+			object *pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+
+			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
+			unsigned address = 0x004ef370;
+
+			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
+
+			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+		}
+
+		g_bBreakWeb = false;
+	}
+
+	EnterCriticalSection(&webWallUpdates_CS);
+
+	while(webWallsTornList.size()) {
+		uint64_t Guid = webWallsTornList.back();
+
+		// Найти объект по GUID
+		uint32_t objAddr = processAnalyzer->findGameObjByGUID(Guid);
+		if (objAddr == 0) {
+			printf("no web\n");
+			return;
+		}
+
+		// Применить состояние
+		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
+		if(1) {
+			object *pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+
+			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
+			unsigned address = 0x004ef370;
+
+			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
+
+			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+		}
+
+		webWallsTornList.pop_back();
+	}
+
+	LeaveCriticalSection(&webWallUpdates_CS);
 }
 
 void InstallStoneHook();   // forward decl (defined further below)
@@ -1412,18 +1474,11 @@ static void processWebWallUpdate(WebWallUpdateMessage* msg)
 	if (msg->nowLevel != nowLevel)
 		return;
 
-	if (!processAnalyzer)
-		return;
-
-	// Найти объект по GUID
-	uint32_t objAddr = processAnalyzer->findGameObjByGUID(msg->wallGuid);
-	if (objAddr == 0)
-		return;
-
-	// Применить состояние
-	processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
-
-	printf("Applied WebWall update: GUID %llu -> state %d\n", msg->wallGuid, msg->state);
+	if(msg->state) {
+		EnterCriticalSection(&webWallUpdates_CS);
+		webWallsTornList.push_back(msg->wallGuid);
+		LeaveCriticalSection(&webWallUpdates_CS);
+	}
 }
 
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
@@ -1779,6 +1834,11 @@ static void ChatCommandSetTeam(const std::string& team)
 	g_ChatOverlay.AddSystemMessage("[System] Team set to " + std::to_string(teamId) + ".");
 }
 
+static void ChatCommandBreakWeb(const std::string& team)
+{
+	g_bBreakWeb = true;
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -1807,12 +1867,15 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
 
+	g_ChatOverlay.AddCommand("/breakWeb", "xx", ChatCommandBreakWeb);
+
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
 	InitializeCriticalSection(&hoistablesCriticalSection);
 	InitializeCriticalSection(&enemiesCriticalSection);
 	InitializeCriticalSection(&throwCriticalSection);
 	InitializeCriticalSection(&webWallsCriticalSection);
+	InitializeCriticalSection(&webWallUpdates_CS);
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
