@@ -127,6 +127,51 @@ void Hoistable::MakeHoistable(bool bHoistable)
 	}
 }
 
+void Hoistable::EnablePushBlock(bool bEnable)
+{/*
+	object* theObject = (object*)objectAddress_;
+	if (theObject) {
+		ed_property prop = {};
+		theObject->GetProperty(prop, "Disabled");
+		prop.m_Value.m_xboolValue = (xbool)!!bEnable;
+		theObject->SetProperty("Disabled", prop);
+	}*/
+}
+
+Vector3 Hoistable::xGetPosition(void)
+{
+	Vector3 ret = {};
+
+	object* theObject = (object*)objectAddress_;
+	if (theObject) {
+		ed_property prop = {};
+		theObject->GetProperty(prop, "Position");
+		ret.x = prop.m_Value.m_vec3Value.X;
+		ret.y = prop.m_Value.m_vec3Value.Y;
+		ret.z = prop.m_Value.m_vec3Value.Z;
+	}
+
+	return ret;
+}
+
+void Hoistable::xSetPosition(float x, float y, float z)
+{
+	object* theObject = (object*)objectAddress_;
+	if (theObject) {
+		ed_property prop = {};
+		theObject->GetProperty(prop, "Position");
+		prop.m_Value.m_vec3Value.X = x;
+		prop.m_Value.m_vec3Value.Y = y;
+		prop.m_Value.m_vec3Value.Z = z;
+		theObject->SetProperty("Position", prop);
+	}
+}
+
+int Hoistable::objectClass(void)
+{
+	uint32_t objPtr = objectAddress_;
+	return analyzer_->readData<uint8_t>(objPtr + 0x7C);
+}
 
 void Hoistable::resolveObjectPtr(uint64_t guid)
 {

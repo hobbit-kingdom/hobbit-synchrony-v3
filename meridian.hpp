@@ -52,6 +52,11 @@ public:
 
 extern obj_mgr g_ObjMgr;
 
+enum CLASS_ID
+{
+	CLASS_PushBox = 0x25
+};
+
 class object
 {
 public:
@@ -164,6 +169,7 @@ class bilbo : public object
 {
 public:
 	BILBO_STATE _get_state(void);
+	guid _get_nearest_pushblock();
 	guid _get_nearest_hoistable();
 };
 

@@ -30,6 +30,12 @@ public:
 	void setRotationY(float value);
 
 	void MakeHoistable(bool bHoistable);
+	void EnablePushBlock(bool bEnable);
+
+	Vector3 xGetPosition(void);
+	void xSetPosition(float x, float y, float z);
+
+	int objectClass(void);
 
 private:
 	HobbitProcessAnalyzer* analyzer_ = nullptr;

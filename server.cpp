@@ -488,6 +488,66 @@ static void broadcastHoistableUpdate(Server& server, int senderIndex, HoistableS
 	}
 }
 
+static void broadcasPushBlockAcquire(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_ACQUIRE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastPushBlockRelease(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_RELEASE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastPushBlockUpdate(Server& server, int senderIndex, HoistableStateMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableStateMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_UPDATE));
+
+		// copy message
+		broadcast->x = msg->x;
+		broadcast->y = msg->y;
+		broadcast->z = msg->z;
+		broadcast->rotationY = msg->rotationY;
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 
 static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMessage* msg)
 {
@@ -658,6 +718,16 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case HOISTABLE_UPDATE:
 		broadcastHoistableUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
+		break;
+
+	case PUSHBLOCK_ACQUIRE:
+		broadcasPushBlockAcquire(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
+	case PUSHBLOCK_RELEASE:
+		broadcastPushBlockRelease(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
+	case PUSHBLOCK_UPDATE:
+		broadcastPushBlockUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
 		break;
 
 	case SKIN_ANNOUNCE:

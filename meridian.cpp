@@ -51,6 +51,12 @@ BILBO_STATE bilbo::_get_state(void)
 	return (BILBO_STATE)*pState;
 }
 
+guid bilbo::_get_nearest_pushblock(void)
+{
+	guid *pGuid = (guid*) (((u8*)this) + 0x5918);
+	return *pGuid;
+}
+
 guid bilbo::_get_nearest_hoistable(void)
 {
 	guid *pGuid = (guid*) (((u8*)this) + 0x5948);

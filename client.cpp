@@ -124,6 +124,7 @@ struct HoistableUpdateStruct
 CRITICAL_SECTION hoistablesCriticalSection;
 std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
 static Hoistable* g_currentHoistable = nullptr;
+static Hoistable* g_currentPushBlock = nullptr;
 
 // --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
 CRITICAL_SECTION throwCriticalSection;
@@ -171,13 +172,17 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	g_incomingThrows.clear();
 	LeaveCriticalSection(&throwCriticalSection);
 
-	// update hoistables position
+	// update hoistables and pushblock position
 	EnterCriticalSection(&hoistablesCriticalSection);
 
 	for (auto it = hoistables.begin(); it != hoistables.end(); it++) {
 		HoistableUpdateStruct& upd = it->second;
 		if (upd.updated) {
-			upd.pObject->setPosition(upd.x, upd.y, upd.z);
+			if(upd.pObject->objectClass() == CLASS_PushBox) {
+				upd.pObject->xSetPosition(upd.x, upd.y, upd.z);
+				printf("UPDATE PUHSHBOX %.2f  %.2f  %.2f\n", upd.x, upd.y, upd.z);
+			} else
+				upd.pObject->setPosition(upd.x, upd.y, upd.z);
 			upd.pObject->setRotationY(upd.yaw);
 			upd.updated = false;
 		}
@@ -618,6 +623,11 @@ static void resetClientSessionState()
 	{
 		delete g_currentHoistable;
 		g_currentHoistable = nullptr;
+	}
+	if (g_currentPushBlock)
+	{
+		delete g_currentPushBlock;
+		g_currentPushBlock = nullptr;
 	}
 	myGuid = 0;
 	myNicknameGuid = 0;
@@ -1221,6 +1231,98 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentT
 	LeaveCriticalSection(&hoistablesCriticalSection);
 }
 
+static void processPushBlockAcquire(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable* pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->EnablePushBlock(false);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processPushBlockRelease(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable* pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->EnablePushBlock(true);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processPushBlockUpdate(HoistableStateMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
+
+		hoistables.emplace(msg->hoistableGuid, upd);
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
+	}
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
 {
 	if (msg->nowLevel != nowLevel) return;
@@ -1393,6 +1495,16 @@ static void processMessage(Client& client, Message* message, double time)
 		break;
 	case HOISTABLE_UPDATE:
 		if (gameManager.isOnLevel()) processHoistableUpdate(static_cast<HoistableStateMessage*>(message), time);
+		break;
+
+	case PUSHBLOCK_ACQUIRE:
+		if (gameManager.isOnLevel()) processPushBlockAcquire(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
+	case PUSHBLOCK_RELEASE:
+		if (gameManager.isOnLevel()) processPushBlockRelease(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
+	case PUSHBLOCK_UPDATE:
+		if (gameManager.isOnLevel()) processPushBlockUpdate(static_cast<HoistableStateMessage*>(message), time);
 		break;
 
 	case GUID_ASSIGN:
@@ -1782,6 +1894,56 @@ static int clientMain()
 						msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 						client.SendMessage(channels::Gameplay, msgHoistable);
+					}
+				}
+			}
+
+			// update pushblock
+			{
+				bilbo* pBilbo = *((bilbo**)X_POSITION_PTR);
+				if (pBilbo) {
+					guid pb_guid = pBilbo->_get_nearest_pushblock();
+
+					/* is acquiring reliable ? */
+					if (!g_currentPushBlock && pb_guid.Guid != 0 && pBilbo->_get_state() == BS_PUSH_BLOCK) {
+						g_currentPushBlock = new Hoistable(processAnalyzer);
+						g_currentPushBlock->initializeByGuid(pb_guid.Guid);
+
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(PUSHBLOCK_ACQUIRE));
+						msg->hoistableGuid = g_currentPushBlock->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						client.SendMessage(channels::Gameplay, msg);
+						std::cout << "pushblock acquire\r\n";
+					}
+
+					if (g_currentPushBlock && pBilbo->_get_state() != BS_PUSH_BLOCK) {
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(PUSHBLOCK_RELEASE));
+						msg->hoistableGuid = g_currentPushBlock->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						client.SendMessage(channels::Gameplay, msg);
+
+						delete g_currentPushBlock;
+						g_currentPushBlock = nullptr;
+						std::cout << "pushblock release\r\n";
+					}
+
+					if (g_currentPushBlock) {
+						auto* msgUpdate = static_cast<HoistableStateMessage*>(client.CreateMessage(PUSHBLOCK_UPDATE));
+						Vector3 v = g_currentPushBlock->xGetPosition();
+						msgUpdate->x = NetworkClamp::sanitizePosition(v.x);
+						msgUpdate->y = NetworkClamp::sanitizePosition(v.y);
+						msgUpdate->z = NetworkClamp::sanitizePosition(v.z);
+						msgUpdate->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentPushBlock->getRotationY());
+						msgUpdate->hoistableGuid = g_currentPushBlock->getGUID();
+						msgUpdate->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						printf("SENT UPDATE PUSHBOX %.2f %.2f %.2f\n", msgUpdate->x, msgUpdate->y, msgUpdate->z);
+
+						client.SendMessage(channels::Gameplay, msgUpdate);
 					}
 				}
 			}
