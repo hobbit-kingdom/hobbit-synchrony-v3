@@ -32,6 +32,8 @@ enum GameMessageType
 	PUSHBLOCK_RELEASE,
 	PUSHBLOCK_UPDATE,
 
+	WEB_WALL_UPDATE,
+
 	GUID_ASSIGN,
 	SKIN_ANNOUNCE,
 	SKIN_FILE_TRANSFER,
@@ -52,6 +54,32 @@ enum GameMessageType
 		serialize_bits(stream, guid_high, 32); \
 		guid64 = (static_cast<uint64_t>(guid_high) << 32) | guid_low; \
 	} while(0)
+
+//Паутинка
+struct WebWallUpdateMessage : public Message
+{
+    uint64_t wallGuid = 0;
+    uint8_t  state = 0;      // байт по адресу +0x1C8
+    uint32_t nowLevel = 0;
+
+    template <typename Stream>
+    bool Serialize(Stream& stream)
+    {
+        serialize_GUID(stream, wallGuid);
+        serialize_bits(stream, state, 8);
+        serialize_bits(stream, nowLevel, 32);
+
+        if (!stream.IsWriting)
+        {
+            nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+        }
+
+        return true;
+    }
+
+    YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
 
 // both HOISTABLE_ACQUIRE & HOISTABLE_RELEASE
 struct HoistableAcquireReleaseMessage : public Message
