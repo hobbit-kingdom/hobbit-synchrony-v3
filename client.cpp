@@ -660,7 +660,15 @@ static void readGamePointers()
 	std::vector<uint32_t> allFriendAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000100000001, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allEnemieAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000200000002, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allRigidInstances = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x05, 0x7c); //put the values that indicate that thing
+	std::vector<uint32_t> allChests = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x24, 0x7c); //put the values that indicate that thing
+	std::vector<uint32_t> allPickups = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x22, 0x7c); //put the values that indicate that thing
+	std::vector<uint32_t> allSwitches = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x33, 0x7c); //put the values that indicate that thing
+	std::vector<uint32_t> allTriggers = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x35, 0x7c); //put the values that indicate that thing
+	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7c); //0x28 is class value, find by obj address + 0x7c
+
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
+
+	std::cout << "CHESTS AMOUNT: " << allChests.size() << "\n";
 
 	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
 
