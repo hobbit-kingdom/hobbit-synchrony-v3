@@ -42,6 +42,7 @@ enum GameMessageType
 	STATUS_UPDATE,
 	CHAT_MESSAGE,
 	STONE_THROW,
+	CHEST_OPEN,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -425,6 +426,28 @@ struct StoneThrowMessage : public Message
 			toX = NetworkClamp::sanitizePosition(toX);
 			toY = NetworkClamp::sanitizePosition(toY);
 			toZ = NetworkClamp::sanitizePosition(toZ);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct ChestOpenMessage : public Message
+{
+	uint64_t chestGuid = 0;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, chestGuid);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
 			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 		}
 

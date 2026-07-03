@@ -131,6 +131,7 @@ CRITICAL_SECTION webWallsCriticalSection;
 std::unordered_map<uint64_t, uint8_t> webWallStates; // GUID -> state byte at +0x1C8
 static std::unordered_map<uint64_t, uint8_t> webWallStatesCache; // для отслеживания изменений
 static bool webWallStatesDirty = false;
+static std::vector<uint32_t> allChests;
 
 static CRITICAL_SECTION webWallUpdates_CS;
 static std::vector<uint64_t> webWallsTornList;
@@ -147,6 +148,11 @@ Vector3          g_lastThrowTo{};
 struct PendingThrow { uint64_t guid; Vector3 from; Vector3 to; };
 static std::vector<PendingThrow> g_incomingThrows;
 
+CRITICAL_SECTION chestCriticalSection;
+static std::vector<uint64_t> g_outgoingChestOpens;
+static std::vector<uint64_t> g_incomingChestOpens;
+static bool g_suppressChestOpenHook = false;
+
 // Projectile::CreateProjectile(eProjectileType, owner, vector3 from, vector3 to) @ 0x004B53A0
 // type 0x19 = "Normal Rock" (Bilbo's native stone). Spawning from code avoids the
 // audio-event path that crashes; from/to are 12-byte structs passed by value (__cdecl).
@@ -159,6 +165,7 @@ typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
 
 static bool g_bBreakWeb = false;
+static void applyQueuedChestOpens();
 
 class hook_bilbo
 {
@@ -182,6 +189,8 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 	g_incomingThrows.clear();
 	LeaveCriticalSection(&throwCriticalSection);
+
+	applyQueuedChestOpens();
 
 	// update hoistables and pushblock position
 	EnterCriticalSection(&hoistablesCriticalSection);
@@ -283,7 +292,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 	LeaveCriticalSection(&playersCriticalSection);
 
-	if(g_bBreakWeb) {
+	if (g_bBreakWeb) {
 
 		// Найти объект по GUID
 		uint32_t objAddr = processAnalyzer->findGameObjByGUID(0xCD588A8C3A80CC00ull);
@@ -294,9 +303,9 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 		// Применить состояние
 		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
-		if(1) {
-			object *pObj = (object*)objAddr;
-			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+		if (1) {
+			object* pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
 
 			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
 			unsigned address = 0x004ef370;
@@ -311,7 +320,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 	EnterCriticalSection(&webWallUpdates_CS);
 
-	while(webWallsTornList.size()) {
+	while (webWallsTornList.size()) {
 		uint64_t Guid = webWallsTornList.back();
 
 		// Найти объект по GUID
@@ -323,9 +332,9 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 		// Применить состояние
 		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
-		if(1) {
-			object *pObj = (object*)objAddr;
-			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+		if (1) {
+			object* pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
 
 			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
 			unsigned address = 0x004ef370;
@@ -342,6 +351,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 }
 
 void InstallStoneHook();   // forward decl (defined further below)
+void InstallChestHook();   // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -360,6 +370,7 @@ void SetupBilboHook(void)
 	VirtualProtect(pAddressInVMT, 4, oldProtect, &oldProtect);
 
 	InstallStoneHook();   // detour bilbo::CreateStoneProjectile to capture throw destination
+	InstallChestHook();   // detour treasure_chest::Open to replicate opened chests
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -705,6 +716,12 @@ static void resetClientSessionState()
 	webWallStatesDirty = false;
 	LeaveCriticalSection(&webWallsCriticalSection);
 
+	EnterCriticalSection(&chestCriticalSection);
+	allChests.clear();
+	g_outgoingChestOpens.clear();
+	g_incomingChestOpens.clear();
+	LeaveCriticalSection(&chestCriticalSection);
+
 	myGuid = 0;
 	myNicknameGuid = 0;
 	myStatusGuid = 0;
@@ -746,14 +763,20 @@ static void readGamePointers()
 	std::vector<uint32_t> allFriendAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000100000001, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allEnemieAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000200000002, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
 	std::vector<uint32_t> allRigidInstances = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x05, 0x7c); //put the values that indicate that thing
-	std::vector<uint32_t> allChests = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x24, 0x7c); //put the values that indicate that thing
+	size_t chestCount = 0;
+	EnterCriticalSection(&chestCriticalSection);
+	allChests = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x24, 0x7c); //put the values that indicate that thing
+	chestCount = allChests.size();
+	LeaveCriticalSection(&chestCriticalSection);
 	std::vector<uint32_t> allPickups = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x22, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allSwitches = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x33, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allTriggers = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x35, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7c); //0x28 is class value, find by obj address + 0x7c
+
+
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
 
-	std::cout << "CHESTS AMOUNT: " << allChests.size() << "\n";
+	std::cout << "CHESTS AMOUNT: " << chestCount << "\n";
 
 	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
 
@@ -838,6 +861,82 @@ void InstallStoneHook()
 	MH_CreateHook(target, &hkCreateStoneProjectile,
 		reinterpret_cast<void**>(&oCreateStoneProjectile));
 	MH_EnableHook(target);
+}
+
+static bool isChestOpened(uint32_t chestAddress)
+{
+	return chestAddress != 0 && (processAnalyzer->readData<uint8_t>(chestAddress + 0x7B) & 0x08) != 0;
+}
+
+static uint32_t findChestAddressByGuid(uint64_t chestGuid)
+{
+	EnterCriticalSection(&chestCriticalSection);
+	std::vector<uint32_t> chests = allChests;
+	LeaveCriticalSection(&chestCriticalSection);
+
+	for (uint32_t chestAddress : chests)
+	{
+		if (chestAddress != 0 && processAnalyzer->readData<uint64_t>(chestAddress + 0x8) == chestGuid)
+			return chestAddress;
+	}
+
+	return processAnalyzer->findGameObjByGUID(chestGuid);
+}
+
+typedef void(__thiscall* ChestOpen_t)(void* self);
+static ChestOpen_t oChestOpen = nullptr;
+
+static void __fastcall hkChestOpen(void* self, void* edx)
+{
+	(void)edx;
+
+	uint64_t chestGuid = 0;
+
+	if (self)
+	{
+		uint32_t chestAddress = reinterpret_cast<uint32_t>(self);
+		chestGuid = processAnalyzer ? processAnalyzer->readData<uint64_t>(chestAddress + 0x8) : 0;
+	}
+
+	oChestOpen(self);
+
+	if (!g_suppressChestOpenHook && chestGuid != 0)
+	{
+		EnterCriticalSection(&chestCriticalSection);
+		g_outgoingChestOpens.push_back(chestGuid);
+		LeaveCriticalSection(&chestCriticalSection);
+	}
+}
+
+void InstallChestHook()
+{
+	MH_Initialize();
+	void* target = reinterpret_cast<void*>(0x004D5BD0);   // treasure_chest::Open
+	MH_CreateHook(target, &hkChestOpen,
+		reinterpret_cast<void**>(&oChestOpen));
+	MH_EnableHook(target);
+}
+
+static void applyQueuedChestOpens()
+{
+	if (!oChestOpen || !processAnalyzer)
+		return;
+
+	EnterCriticalSection(&chestCriticalSection);
+	std::vector<uint64_t> pending = g_incomingChestOpens;
+	g_incomingChestOpens.clear();
+	LeaveCriticalSection(&chestCriticalSection);
+
+	for (uint64_t chestGuid : pending)
+	{
+		uint32_t chestAddress = findChestAddressByGuid(chestGuid);
+		if (chestAddress == 0 || isChestOpened(chestAddress))
+			continue;
+
+		g_suppressChestOpenHook = true;
+		oChestOpen(reinterpret_cast<void*>(chestAddress));
+		g_suppressChestOpenHook = false;
+	}
 }
 
 static void readLocalPlayerState()
@@ -1476,7 +1575,7 @@ static void processWebWallUpdate(WebWallUpdateMessage* msg)
 	if (msg->nowLevel != nowLevel)
 		return;
 
-	if(msg->state) {
+	if (msg->state) {
 		EnterCriticalSection(&webWallUpdates_CS);
 		webWallsTornList.push_back(msg->wallGuid);
 		LeaveCriticalSection(&webWallUpdates_CS);
@@ -1594,6 +1693,16 @@ static void processStoneThrow(StoneThrowMessage* msg)
 	LeaveCriticalSection(&throwCriticalSection);
 }
 
+static void processChestOpen(ChestOpenMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->chestGuid == 0)
+		return;
+
+	EnterCriticalSection(&chestCriticalSection);
+	g_incomingChestOpens.push_back(msg->chestGuid);
+	LeaveCriticalSection(&chestCriticalSection);
+}
+
 static void applyLocalIdentityMarkers()
 {
 	if (myGuid == 0)
@@ -1703,6 +1812,9 @@ static void processMessage(Client& client, Message* message, double time)
 		break;
 	case STONE_THROW:
 		if (gameManager.isOnLevel()) processStoneThrow(static_cast<StoneThrowMessage*>(message));
+		break;
+	case CHEST_OPEN:
+		if (gameManager.isOnLevel()) processChestOpen(static_cast<ChestOpenMessage*>(message));
 		break;
 
 	default:
@@ -1878,6 +1990,7 @@ static int clientMain()
 	InitializeCriticalSection(&throwCriticalSection);
 	InitializeCriticalSection(&webWallsCriticalSection);
 	InitializeCriticalSection(&webWallUpdates_CS);
+	InitializeCriticalSection(&chestCriticalSection);
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
@@ -1947,6 +2060,12 @@ static int clientMain()
 				processedDataForThisLevel = false;
 				clearActivePlayers();
 				clearEnemies();
+
+				EnterCriticalSection(&chestCriticalSection);
+				allChests.clear();
+				g_outgoingChestOpens.clear();
+				g_incomingChestOpens.clear();
+				LeaveCriticalSection(&chestCriticalSection);
 			}
 
 			// Process incoming messages on all channels
@@ -1986,6 +2105,25 @@ static int clientMain()
 					tmsg->toZ = NetworkClamp::sanitizePosition(to.z);
 					tmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 					client.SendMessage(channels::Gameplay, tmsg);
+				}
+
+				if (gameManager.isOnLevel())
+				{
+					EnterCriticalSection(&chestCriticalSection);
+					std::vector<uint64_t> chestOpens = g_outgoingChestOpens;
+					g_outgoingChestOpens.clear();
+					LeaveCriticalSection(&chestCriticalSection);
+
+					for (uint64_t chestGuid : chestOpens)
+					{
+						auto* cmsg = static_cast<ChestOpenMessage*>(client.CreateMessage(CHEST_OPEN));
+						if (!cmsg)
+							continue;
+
+						cmsg->chestGuid = chestGuid;
+						cmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+						client.SendMessage(channels::Gameplay, cmsg);
+					}
 				}
 
 				if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())

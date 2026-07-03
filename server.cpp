@@ -672,6 +672,23 @@ static void broadcastStoneThrow(Server& server, int senderIndex, StoneThrowMessa
 	}
 }
 
+static void broadcastChestOpen(Server& server, int senderIndex, ChestOpenMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<ChestOpenMessage*>(
+			server.CreateMessage(i, CHEST_OPEN));
+
+		broadcast->chestGuid = msg->chestGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
 	(void)msg;
@@ -772,6 +789,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case STONE_THROW:
 		broadcastStoneThrow(server, clientIndex, static_cast<StoneThrowMessage*>(message));
+		break;
+	case CHEST_OPEN:
+		broadcastChestOpen(server, clientIndex, static_cast<ChestOpenMessage*>(message));
 		break;
 	default:
 		break;
