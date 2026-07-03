@@ -124,6 +124,16 @@ struct HoistableUpdateStruct
 CRITICAL_SECTION hoistablesCriticalSection;
 std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
 static Hoistable* g_currentHoistable = nullptr;
+static Hoistable* g_currentPushBlock = nullptr;
+
+// --- Web walls sync ---
+CRITICAL_SECTION webWallsCriticalSection;
+std::unordered_map<uint64_t, uint8_t> webWallStates; // GUID -> state byte at +0x1C8
+static std::unordered_map<uint64_t, uint8_t> webWallStatesCache; // для отслеживания изменений
+static bool webWallStatesDirty = false;
+
+static CRITICAL_SECTION webWallUpdates_CS;
+static std::vector<uint64_t> webWallsTornList;
 
 // --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
 CRITICAL_SECTION throwCriticalSection;
@@ -148,6 +158,8 @@ static double g_time = NetDefaults::INITIAL_TIME;
 typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
 
+static bool g_bBreakWeb = false;
+
 class hook_bilbo
 {
 public:
@@ -171,13 +183,18 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	g_incomingThrows.clear();
 	LeaveCriticalSection(&throwCriticalSection);
 
-	// update hoistables position
+	// update hoistables and pushblock position
 	EnterCriticalSection(&hoistablesCriticalSection);
 
 	for (auto it = hoistables.begin(); it != hoistables.end(); it++) {
 		HoistableUpdateStruct& upd = it->second;
 		if (upd.updated) {
-			upd.pObject->setPosition(upd.x, upd.y, upd.z);
+			if (upd.pObject->objectClass() == CLASS_PushBox) {
+				upd.pObject->xSetPosition(upd.x, upd.y, upd.z);
+				printf("UPDATE PUHSHBOX %.2f  %.2f  %.2f\n", upd.x, upd.y, upd.z);
+			}
+			else
+				upd.pObject->setPosition(upd.x, upd.y, upd.z);
 			upd.pObject->setRotationY(upd.yaw);
 			upd.updated = false;
 		}
@@ -265,6 +282,63 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 
 	LeaveCriticalSection(&playersCriticalSection);
+
+	if(g_bBreakWeb) {
+
+		// Найти объект по GUID
+		uint32_t objAddr = processAnalyzer->findGameObjByGUID(0xCD588A8C3A80CC00ull);
+		if (objAddr == 0) {
+			printf("no web\n");
+			return;
+		}
+
+		// Применить состояние
+		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
+		if(1) {
+			object *pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+
+			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
+			unsigned address = 0x004ef370;
+
+			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
+
+			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+		}
+
+		g_bBreakWeb = false;
+	}
+
+	EnterCriticalSection(&webWallUpdates_CS);
+
+	while(webWallsTornList.size()) {
+		uint64_t Guid = webWallsTornList.back();
+
+		// Найти объект по GUID
+		uint32_t objAddr = processAnalyzer->findGameObjByGUID(Guid);
+		if (objAddr == 0) {
+			printf("no web\n");
+			return;
+		}
+
+		// Применить состояние
+		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
+		if(1) {
+			object *pObj = (object*)objAddr;
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3 &Point);
+
+			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
+			unsigned address = 0x004ef370;
+
+			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
+
+			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+		}
+
+		webWallsTornList.pop_back();
+	}
+
+	LeaveCriticalSection(&webWallUpdates_CS);
 }
 
 void InstallStoneHook();   // forward decl (defined further below)
@@ -619,6 +693,18 @@ static void resetClientSessionState()
 		delete g_currentHoistable;
 		g_currentHoistable = nullptr;
 	}
+	if (g_currentPushBlock)
+	{
+		delete g_currentPushBlock;
+		g_currentPushBlock = nullptr;
+	}
+
+	EnterCriticalSection(&webWallsCriticalSection);
+	webWallStates.clear();
+	webWallStatesCache.clear();
+	webWallStatesDirty = false;
+	LeaveCriticalSection(&webWallsCriticalSection);
+
 	myGuid = 0;
 	myNicknameGuid = 0;
 	myStatusGuid = 0;
@@ -665,7 +751,6 @@ static void readGamePointers()
 	std::vector<uint32_t> allSwitches = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x33, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allTriggers = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x35, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7c); //0x28 is class value, find by obj address + 0x7c
-
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
 
 	std::cout << "CHESTS AMOUNT: " << allChests.size() << "\n";
@@ -704,7 +789,6 @@ static void readGamePointers()
 
 	printf("Enemies Found: %d", enemies.size());
 	applyFakeBilboDamage();
-
 }
 
 static Vector3 getBilboPos(void)
@@ -813,6 +897,72 @@ static void changeEnemiesAIMode(int mode)
 	{
 		enemy.second->setAIMode(mode);
 	}
+}
+
+// ===========================================================================
+//  Web Walls Synchronization
+// ===========================================================================
+
+static void readWebWallStates()
+{
+	if (!processAnalyzer)
+		return;
+
+	// Получаем все объекты класса 0x2B (WebWall)
+	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7C);
+
+	EnterCriticalSection(&webWallsCriticalSection);
+
+	webWallStatesDirty = false;
+
+	for (uint32_t addr : allWebWalls)
+	{
+		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x8);
+		if (guid == 0)
+			continue;
+
+		uint8_t currentState = processAnalyzer->readData<uint8_t>(addr + 0x1C8);
+
+		// Проверяем, изменилось ли состояние
+		auto it = webWallStatesCache.find(guid);
+		if (it == webWallStatesCache.end() || it->second != currentState)
+		{
+			webWallStates[guid] = currentState;
+			webWallStatesCache[guid] = currentState;
+			webWallStatesDirty = true;
+
+			printf("WebWall GUID %llu state changed to %d\n", guid, currentState);
+		}
+	}
+
+	LeaveCriticalSection(&webWallsCriticalSection);
+}
+
+static void sendWebWallUpdates(Client& client)
+{
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	if (!webWallStatesDirty)
+		return;
+
+	EnterCriticalSection(&webWallsCriticalSection);
+
+	for (const auto& pair : webWallStates)
+	{
+		auto* msg = static_cast<WebWallUpdateMessage*>(client.CreateMessage(WEB_WALL_UPDATE));
+		if (!msg)
+			continue;
+
+		msg->wallGuid = pair.first;
+		msg->state = pair.second;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+		client.SendMessage(channels::Gameplay, msg);
+	}
+
+	webWallStatesDirty = false;
+	LeaveCriticalSection(&webWallsCriticalSection);
 }
 
 // ===========================================================================
@@ -1229,6 +1379,110 @@ static void processHoistableUpdate(HoistableStateMessage* msg, double /*currentT
 	LeaveCriticalSection(&hoistablesCriticalSection);
 }
 
+static void processPushBlockAcquire(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable* pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->EnablePushBlock(false);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processPushBlockRelease(HoistableAcquireReleaseMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	// do we need it here ?
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	Hoistable* pHoistable;
+
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		hoistables.emplace(msg->hoistableGuid, upd);
+
+		pHoistable = upd.pObject;
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+		pHoistable = upd.pObject;
+	}
+
+	pHoistable->EnablePushBlock(true);
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processPushBlockUpdate(HoistableStateMessage* msg, double /*currentTime*/)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	EnterCriticalSection(&hoistablesCriticalSection);
+
+	const auto hoistableIt = hoistables.find(msg->hoistableGuid);
+	if (hoistableIt == hoistables.end()) {
+		HoistableUpdateStruct upd;
+
+		upd.pObject = new Hoistable(processAnalyzer);
+		upd.pObject->initializeByGuid(msg->hoistableGuid);
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
+
+		hoistables.emplace(msg->hoistableGuid, upd);
+	}
+	else {
+		HoistableUpdateStruct& upd = hoistableIt->second;
+
+		upd.x = msg->x;
+		upd.y = msg->y;
+		upd.z = msg->z;
+		upd.yaw = msg->rotationY;
+		upd.updated = true;
+	}
+
+	LeaveCriticalSection(&hoistablesCriticalSection);
+}
+
+static void processWebWallUpdate(WebWallUpdateMessage* msg)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	if(msg->state) {
+		EnterCriticalSection(&webWallUpdates_CS);
+		webWallsTornList.push_back(msg->wallGuid);
+		LeaveCriticalSection(&webWallUpdates_CS);
+	}
+}
+
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
 {
 	if (msg->nowLevel != nowLevel) return;
@@ -1403,6 +1657,20 @@ static void processMessage(Client& client, Message* message, double time)
 		if (gameManager.isOnLevel()) processHoistableUpdate(static_cast<HoistableStateMessage*>(message), time);
 		break;
 
+	case PUSHBLOCK_ACQUIRE:
+		if (gameManager.isOnLevel()) processPushBlockAcquire(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
+	case PUSHBLOCK_RELEASE:
+		if (gameManager.isOnLevel()) processPushBlockRelease(static_cast<HoistableAcquireReleaseMessage*>(message), time);
+		break;
+	case PUSHBLOCK_UPDATE:
+		if (gameManager.isOnLevel()) processPushBlockUpdate(static_cast<HoistableStateMessage*>(message), time);
+		break;
+
+	case WEB_WALL_UPDATE:
+		if (gameManager.isOnLevel()) processWebWallUpdate(static_cast<WebWallUpdateMessage*>(message));
+		break;
+
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
 		localSkinUploadAttempted = false;
@@ -1568,6 +1836,11 @@ static void ChatCommandSetTeam(const std::string& team)
 	g_ChatOverlay.AddSystemMessage("[System] Team set to " + std::to_string(teamId) + ".");
 }
 
+static void ChatCommandBreakWeb(const std::string& team)
+{
+	g_bBreakWeb = true;
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -1596,11 +1869,15 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
 
+	g_ChatOverlay.AddCommand("/breakWeb", "xx", ChatCommandBreakWeb);
+
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
 	InitializeCriticalSection(&hoistablesCriticalSection);
 	InitializeCriticalSection(&enemiesCriticalSection);
 	InitializeCriticalSection(&throwCriticalSection);
+	InitializeCriticalSection(&webWallsCriticalSection);
+	InitializeCriticalSection(&webWallUpdates_CS);
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
@@ -1745,6 +2022,15 @@ static int clientMain()
 
 					lastSend = g_time;
 				}
+
+				// ====== ЧИТАЕМ И ОТПРАВЛЯЕМ СОСТОЯНИЕ ПАУТИН ======
+				// Читаем состояние паутин каждый кадр
+				if (gameManager.isOnLevel())
+				{
+					readWebWallStates();
+					sendWebWallUpdates(client);
+				}
+				// ====== КОНЕЦ ======
 			}
 
 			// update hoistable
@@ -1790,6 +2076,56 @@ static int clientMain()
 						msgHoistable->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 						client.SendMessage(channels::Gameplay, msgHoistable);
+					}
+				}
+			}
+
+			// update pushblock
+			{
+				bilbo* pBilbo = *((bilbo**)X_POSITION_PTR);
+				if (pBilbo) {
+					guid pb_guid = pBilbo->_get_nearest_pushblock();
+
+					/* is acquiring reliable ? */
+					if (!g_currentPushBlock && pb_guid.Guid != 0 && pBilbo->_get_state() == BS_PUSH_BLOCK) {
+						g_currentPushBlock = new Hoistable(processAnalyzer);
+						g_currentPushBlock->initializeByGuid(pb_guid.Guid);
+
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(PUSHBLOCK_ACQUIRE));
+						msg->hoistableGuid = g_currentPushBlock->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						client.SendMessage(channels::Gameplay, msg);
+						std::cout << "pushblock acquire\r\n";
+					}
+
+					if (g_currentPushBlock && pBilbo->_get_state() != BS_PUSH_BLOCK) {
+						auto* msg = static_cast<HoistableAcquireReleaseMessage*>(client.CreateMessage(PUSHBLOCK_RELEASE));
+						msg->hoistableGuid = g_currentPushBlock->getGUID();
+						msg->playerGuid = myGuid;
+						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						client.SendMessage(channels::Gameplay, msg);
+
+						delete g_currentPushBlock;
+						g_currentPushBlock = nullptr;
+						std::cout << "pushblock release\r\n";
+					}
+
+					if (g_currentPushBlock) {
+						auto* msgUpdate = static_cast<HoistableStateMessage*>(client.CreateMessage(PUSHBLOCK_UPDATE));
+						Vector3 v = g_currentPushBlock->xGetPosition();
+						msgUpdate->x = NetworkClamp::sanitizePosition(v.x);
+						msgUpdate->y = NetworkClamp::sanitizePosition(v.y);
+						msgUpdate->z = NetworkClamp::sanitizePosition(v.z);
+						msgUpdate->rotationY = NetworkClamp::sanitizeRotationRadians(g_currentPushBlock->getRotationY());
+						msgUpdate->hoistableGuid = g_currentPushBlock->getGUID();
+						msgUpdate->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+
+						printf("SENT UPDATE PUSHBOX %.2f %.2f %.2f\n", msgUpdate->x, msgUpdate->y, msgUpdate->z);
+
+						client.SendMessage(channels::Gameplay, msgUpdate);
 					}
 				}
 			}

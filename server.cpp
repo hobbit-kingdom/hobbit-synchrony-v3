@@ -336,7 +336,7 @@ static void sendNicknamesAndStatusesToClient(Server& server, int clientIndex)
 		strlcpy(msg_name->new_name, guidManager.getNickname(i).c_str());
 
 		server.SendMessage(clientIndex, channels::Gameplay, msg_name);
-		
+
 		auto* msg_status = static_cast<StatusUpdateMessage*>(server.CreateMessage(clientIndex, STATUS_UPDATE));
 
 		msg_status->player_guid = playerGuid;
@@ -488,6 +488,85 @@ static void broadcastHoistableUpdate(Server& server, int senderIndex, HoistableS
 	}
 }
 
+static void broadcasPushBlockAcquire(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_ACQUIRE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastPushBlockRelease(Server& server, int senderIndex, HoistableAcquireReleaseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableAcquireReleaseMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_RELEASE));
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+		broadcast->playerGuid = msg->playerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastPushBlockUpdate(Server& server, int senderIndex, HoistableStateMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<HoistableStateMessage*>(
+			server.CreateMessage(i, PUSHBLOCK_UPDATE));
+
+		// copy message
+		broadcast->x = msg->x;
+		broadcast->y = msg->y;
+		broadcast->z = msg->z;
+		broadcast->rotationY = msg->rotationY;
+
+		broadcast->hoistableGuid = msg->hoistableGuid;
+
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+// ====== ФУНКЦИЯ ДЛЯ РЕТРАНСЛЯЦИИ ОБНОВЛЕНИЙ ПАУТИН ======
+static void broadcastWebWallUpdate(Server& server, int senderIndex, WebWallUpdateMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<WebWallUpdateMessage*>(
+			server.CreateMessage(i, WEB_WALL_UPDATE));
+
+		broadcast->wallGuid = msg->wallGuid;
+		broadcast->state = msg->state;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+// ====== КОНЕЦ ======
 
 static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMessage* msg)
 {
@@ -511,7 +590,7 @@ static void processNicknameUpdate(Server& server, int senderIndex, NicknameUpdat
 {
 	// 1. remember the name
 	guidManager.setNickname(senderIndex, msg->new_name);
-	
+
 	// 2. broadcast update to other players
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
 	{
@@ -595,7 +674,7 @@ static void broadcastStoneThrow(Server& server, int senderIndex, StoneThrowMessa
 
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
-	(void) msg;
+	(void)msg;
 
 	const uint64_t playerGuid = guidManager.getGuid(clientIndex);
 	if (playerGuid == 0)
@@ -659,6 +738,22 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 	case HOISTABLE_UPDATE:
 		broadcastHoistableUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
 		break;
+
+	case PUSHBLOCK_ACQUIRE:
+		broadcasPushBlockAcquire(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
+	case PUSHBLOCK_RELEASE:
+		broadcastPushBlockRelease(server, clientIndex, static_cast<HoistableAcquireReleaseMessage*>(message));
+		break;
+	case PUSHBLOCK_UPDATE:
+		broadcastPushBlockUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
+		break;
+
+		// ====== ДОБАВЛЯЕМ ОБРАБОТКУ WEB_WALL_UPDATE ======
+	case WEB_WALL_UPDATE:
+		broadcastWebWallUpdate(server, clientIndex, static_cast<WebWallUpdateMessage*>(message));
+		break;
+		// ====== КОНЕЦ ======
 
 	case SKIN_ANNOUNCE:
 		processSkinAnnouncement(server, clientIndex, static_cast<SkinAnnouncementMessage*>(message));
