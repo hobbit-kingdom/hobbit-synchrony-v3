@@ -199,8 +199,6 @@ static double g_time = NetDefaults::INITIAL_TIME;
 typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
 
-static bool g_bBreakWeb = false;
-
 class hook_bilbo
 {
 public:
@@ -361,17 +359,6 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	}
 
 	LeaveCriticalSection(&playersCriticalSection);
-
-	if (g_bBreakWeb) {
-		g_bBreakWeb = false;
-		// /breakWeb breaks every web wall we currently know about.
-		EnterCriticalSection(&webWallsCriticalSection);
-		EnterCriticalSection(&webWallUpdates_CS);
-		for (const auto& pair : webWallStates)
-			webWallsTornList.push_back(pair.first);
-		LeaveCriticalSection(&webWallUpdates_CS);
-		LeaveCriticalSection(&webWallsCriticalSection);
-	}
 
 	EnterCriticalSection(&webWallUpdates_CS);
 
@@ -2467,12 +2454,6 @@ static void ChatCommandSetTeam(const std::string& team)
 	g_ChatOverlay.AddSystemMessage("[System] Team set to " + std::to_string(teamId) + ".");
 }
 
-static void ChatCommandBreakWeb(const std::string& team)
-{
-	// Flags OnAdvanceLogic to queue every known web wall for breaking.
-	g_bBreakWeb = true;
-}
-
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -2500,8 +2481,6 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
-
-	g_ChatOverlay.AddCommand("/breakWeb", "xx", ChatCommandBreakWeb);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
