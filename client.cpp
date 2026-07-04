@@ -207,32 +207,37 @@ public:
 	void OnAdvanceLogic(float fDeltaTime);
 };
 
-static void breakWebWallByGuid(uint64_t guid)
+static bool breakWebWallByGuid(uint64_t guid)
 {
 	if (!processAnalyzer)
-		return;
+		return false;
 
 	uint32_t objAddr = processAnalyzer->findGameObjByGUID(guid);
 	if (objAddr == 0) {
 		printf("no web (GUID %llu not found)\n", guid);
-		return;
+		return false;
 	}
+
+	object* pObj = (object*)objAddr;
 
 	// Validate the object is actually a web wall (type tag 0x2B) before calling
 	// methods on it. If the web wall's area isn't loaded locally, the object may
 	// exist in the stack but have stale/uninitialized internal pointers.
-	uint8_t typeTag = processAnalyzer->readData<uint8_t>(objAddr + 0x7C);
-	if (typeTag != 0x2B) {
-		printf("GUID %llu is not a web wall (type 0x%02X), skipping\n", guid, typeTag);
-		return;
+	if (pObj->_typeId() != CLASS_WebWall) {
+		printf("GUID %llu is not a web wall (type 0x%02X), skipping\n", guid, pObj->_typeId());
+		return false;
 	}
 
-	object* pObj = (object*)objAddr;
+	if(!pObj->_isLoaded())
+		return false;
+
 	typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
 	pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
 	unsigned address = 0x004ef370;
 	memcpy(&web_wall_StartBreakAtPoint, &address, 4);
 	(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+
+	return true;
 }
 
 void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
@@ -370,16 +375,21 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 	EnterCriticalSection(&webWallUpdates_CS);
 
+	std::vector<uint64_t> next_frame;
+
 	while (!webWallsTornList.empty()) {
 		// Pop FIRST so a missing GUID can never re-lock the queue.
 		uint64_t guid = webWallsTornList.back();
 		webWallsTornList.pop_back();
 		LeaveCriticalSection(&webWallUpdates_CS);
 
-		breakWebWallByGuid(guid);
+		if(!breakWebWallByGuid(guid))
+			next_frame.push_back(guid);
 
 		EnterCriticalSection(&webWallUpdates_CS);
 	}
+
+	webWallsTornList = next_frame;
 
 	LeaveCriticalSection(&webWallUpdates_CS);
 }

@@ -54,7 +54,8 @@ extern obj_mgr g_ObjMgr;
 
 enum CLASS_ID
 {
-	CLASS_PushBox = 0x25
+	CLASS_PushBox = 0x25,
+	CLASS_WebWall = 0x2B
 };
 
 class object
@@ -109,6 +110,9 @@ public:
 	virtual void GetProperty(ed_property& outProp, const char* pPropName) = 0;
 
 	void SetObjSaveFlag(xbool flag);
+
+	u8 _typeId();
+	bool _isLoaded();
 };
 
 class marker : public object

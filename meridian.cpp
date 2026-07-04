@@ -44,6 +44,18 @@ void object::SetObjSaveFlag(xbool flag)
 		*pExtraFlags &= ~1;
 }
 
+u8 object::_typeId()
+{
+	u8* pTypeID = ((u8*)this) + 0x7c;
+	return *pTypeID;
+}
+
+bool object::_isLoaded()
+{
+	u8* pExtraFlags = ((u8*)this) + 0x7F;
+	return (*pExtraFlags) & 0x10;
+}
+
 // bilbo
 BILBO_STATE bilbo::_get_state(void)
 {
