@@ -43,6 +43,9 @@ enum GameMessageType
 	CHAT_MESSAGE,
 	STONE_THROW,
 	CHEST_OPEN,
+	PICKUP_COLLECT,
+	TRIGGER_ONPRESSB,
+	SWITCH_TOGGLE,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -78,8 +81,9 @@ struct WebWallUpdateMessage : public Message
         return true;
     }
 
-    YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
 };
+
 
 
 // both HOISTABLE_ACQUIRE & HOISTABLE_RELEASE
@@ -444,6 +448,74 @@ struct ChestOpenMessage : public Message
 	bool Serialize(Stream& stream)
 	{
 		serialize_GUID(stream, chestGuid);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct PickupCollectMessage : public Message
+{
+	uint64_t pickupGuid = 0;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, pickupGuid);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct TriggerOnPressBMessage : public Message
+{
+	uint64_t triggerGuid = 0;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, triggerGuid);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct SwitchToggleMessage : public Message
+{
+	uint64_t switchGuid = 0;
+	uint8_t  switchedOn = 0;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, switchGuid);
+		serialize_bits(stream, switchedOn, 8);
 		serialize_bits(stream, nowLevel, 32);
 
 		if (!stream.IsWriting)

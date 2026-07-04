@@ -689,6 +689,58 @@ static void broadcastChestOpen(Server& server, int senderIndex, ChestOpenMessage
 	}
 }
 
+static void broadcastPickupCollect(Server& server, int senderIndex, PickupCollectMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<PickupCollectMessage*>(
+			server.CreateMessage(i, PICKUP_COLLECT));
+
+		broadcast->pickupGuid = msg->pickupGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastTriggerOnPressB(Server& server, int senderIndex, TriggerOnPressBMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<TriggerOnPressBMessage*>(
+			server.CreateMessage(i, TRIGGER_ONPRESSB));
+
+		broadcast->triggerGuid = msg->triggerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastSwitchToggle(Server& server, int senderIndex, SwitchToggleMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<SwitchToggleMessage*>(
+			server.CreateMessage(i, SWITCH_TOGGLE));
+
+		broadcast->switchGuid = msg->switchGuid;
+		broadcast->switchedOn = msg->switchedOn;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
 	(void)msg;
@@ -792,6 +844,15 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case CHEST_OPEN:
 		broadcastChestOpen(server, clientIndex, static_cast<ChestOpenMessage*>(message));
+		break;
+	case PICKUP_COLLECT:
+		broadcastPickupCollect(server, clientIndex, static_cast<PickupCollectMessage*>(message));
+		break;
+	case TRIGGER_ONPRESSB:
+		broadcastTriggerOnPressB(server, clientIndex, static_cast<TriggerOnPressBMessage*>(message));
+		break;
+	case SWITCH_TOGGLE:
+		broadcastSwitchToggle(server, clientIndex, static_cast<SwitchToggleMessage*>(message));
 		break;
 	default:
 		break;

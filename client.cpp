@@ -133,6 +133,17 @@ static std::unordered_map<uint64_t, uint8_t> webWallStatesCache; // для от�
 static bool webWallStatesDirty = false;
 static std::vector<uint32_t> allChests;
 
+// --- Per-type object address caches (populated once per level in readGamePointers) ---
+// Scanning the obj stack every frame for every type caused noticeable jitter; instead we
+// snapshot addresses when the level loads and only re-scan on level change. The address
+// itself stays valid for the whole level (the engine doesn't move live objects). Objects
+// that get destroyed mid-level are filtered at use-time by validating the type tag byte,
+// so a stale cache entry is harmless.
+static std::vector<uint32_t> g_allPickupsAddrs;
+static std::vector<uint32_t> g_allSwitchesAddrs;
+static std::vector<uint32_t> g_allTriggersAddrs;
+static std::vector<uint32_t> g_allWebWallsAddrs;
+
 static CRITICAL_SECTION webWallUpdates_CS;
 static std::vector<uint64_t> webWallsTornList;
 
@@ -153,6 +164,30 @@ static std::vector<uint64_t> g_outgoingChestOpens;
 static std::vector<uint64_t> g_incomingChestOpens;
 static bool g_suppressChestOpenHook = false;
 
+// --- Pickup sync state ---
+CRITICAL_SECTION pickupCriticalSection;
+static std::unordered_map<uint64_t, uint16_t> pickupStatesCache;
+static std::vector<uint64_t> g_outgoingPickupCollects;
+static std::vector<uint64_t> g_incomingPickupCollects;
+
+// --- Trigger sync state ---
+CRITICAL_SECTION triggerCriticalSection;
+static std::unordered_map<uint64_t, uint32_t> triggerStatesCache;
+static std::vector<uint64_t> g_outgoingTriggerPressB;
+static std::vector<uint64_t> g_incomingTriggerPressB;
+
+// --- Switch sync state ---
+CRITICAL_SECTION switchCriticalSection;
+static std::unordered_map<uint64_t, uint32_t> switchStatesCache;
+static std::vector<std::pair<uint64_t, bool>> g_outgoingSwitchToggles;
+static std::vector<std::pair<uint64_t, bool>> g_incomingSwitchToggles;
+
+// Forward declarations for sync apply functions (defined later, called from OnAdvanceLogic)
+static void applyQueuedChestOpens();
+static void applyQueuedPickupCollects();
+static void applyQueuedTriggerPressB();
+static void applyQueuedSwitchToggles();
+
 // Projectile::CreateProjectile(eProjectileType, owner, vector3 from, vector3 to) @ 0x004B53A0
 // type 0x19 = "Normal Rock" (Bilbo's native stone). Spawning from code avoids the
 // audio-event path that crashes; from/to are 12-byte structs passed by value (__cdecl).
@@ -165,13 +200,40 @@ typedef void (bilbo::* pOnAdvanceLogic_t)(float fDeltaTime);
 pOnAdvanceLogic_t pOnAdvanceLogic_orig;
 
 static bool g_bBreakWeb = false;
-static void applyQueuedChestOpens();
 
 class hook_bilbo
 {
 public:
 	void OnAdvanceLogic(float fDeltaTime);
 };
+
+static void breakWebWallByGuid(uint64_t guid)
+{
+	if (!processAnalyzer)
+		return;
+
+	uint32_t objAddr = processAnalyzer->findGameObjByGUID(guid);
+	if (objAddr == 0) {
+		printf("no web (GUID %llu not found)\n", guid);
+		return;
+	}
+
+	// Validate the object is actually a web wall (type tag 0x2B) before calling
+	// methods on it. If the web wall's area isn't loaded locally, the object may
+	// exist in the stack but have stale/uninitialized internal pointers.
+	uint8_t typeTag = processAnalyzer->readData<uint8_t>(objAddr + 0x7C);
+	if (typeTag != 0x2B) {
+		printf("GUID %llu is not a web wall (type 0x%02X), skipping\n", guid, typeTag);
+		return;
+	}
+
+	object* pObj = (object*)objAddr;
+	typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
+	pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
+	unsigned address = 0x004ef370;
+	memcpy(&web_wall_StartBreakAtPoint, &address, 4);
+	(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
+}
 
 void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 {
@@ -191,6 +253,9 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	LeaveCriticalSection(&throwCriticalSection);
 
 	applyQueuedChestOpens();
+	applyQueuedPickupCollects();
+	applyQueuedTriggerPressB();
+	applyQueuedSwitchToggles();
 
 	// update hoistables and pushblock position
 	EnterCriticalSection(&hoistablesCriticalSection);
@@ -293,58 +358,27 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	LeaveCriticalSection(&playersCriticalSection);
 
 	if (g_bBreakWeb) {
-
-		// Найти объект по GUID
-		uint32_t objAddr = processAnalyzer->findGameObjByGUID(0xCD588A8C3A80CC00ull);
-		if (objAddr == 0) {
-			printf("no web\n");
-			return;
-		}
-
-		// Применить состояние
-		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
-		if (1) {
-			object* pObj = (object*)objAddr;
-			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
-
-			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
-			unsigned address = 0x004ef370;
-
-			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
-
-			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
-		}
-
 		g_bBreakWeb = false;
+		// /breakWeb breaks every web wall we currently know about.
+		EnterCriticalSection(&webWallsCriticalSection);
+		EnterCriticalSection(&webWallUpdates_CS);
+		for (const auto& pair : webWallStates)
+			webWallsTornList.push_back(pair.first);
+		LeaveCriticalSection(&webWallUpdates_CS);
+		LeaveCriticalSection(&webWallsCriticalSection);
 	}
 
 	EnterCriticalSection(&webWallUpdates_CS);
 
-	while (webWallsTornList.size()) {
-		uint64_t Guid = webWallsTornList.back();
-
-		// Найти объект по GUID
-		uint32_t objAddr = processAnalyzer->findGameObjByGUID(Guid);
-		if (objAddr == 0) {
-			printf("no web\n");
-			return;
-		}
-
-		// Применить состояние
-		//processAnalyzer->writeData<uint8_t>(objAddr + 0x1C8, msg->state);
-		if (1) {
-			object* pObj = (object*)objAddr;
-			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
-
-			pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
-			unsigned address = 0x004ef370;
-
-			memcpy(&web_wall_StartBreakAtPoint, &address, 4);
-
-			(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
-		}
-
+	while (!webWallsTornList.empty()) {
+		// Pop FIRST so a missing GUID can never re-lock the queue.
+		uint64_t guid = webWallsTornList.back();
 		webWallsTornList.pop_back();
+		LeaveCriticalSection(&webWallUpdates_CS);
+
+		breakWebWallByGuid(guid);
+
+		EnterCriticalSection(&webWallUpdates_CS);
 	}
 
 	LeaveCriticalSection(&webWallUpdates_CS);
@@ -714,6 +748,7 @@ static void resetClientSessionState()
 	webWallStates.clear();
 	webWallStatesCache.clear();
 	webWallStatesDirty = false;
+	g_allWebWallsAddrs.clear();
 	LeaveCriticalSection(&webWallsCriticalSection);
 
 	EnterCriticalSection(&chestCriticalSection);
@@ -721,6 +756,24 @@ static void resetClientSessionState()
 	g_outgoingChestOpens.clear();
 	g_incomingChestOpens.clear();
 	LeaveCriticalSection(&chestCriticalSection);
+
+	EnterCriticalSection(&pickupCriticalSection);
+	pickupStatesCache.clear();
+	g_outgoingPickupCollects.clear();
+	g_incomingPickupCollects.clear();
+	LeaveCriticalSection(&pickupCriticalSection);
+
+	EnterCriticalSection(&triggerCriticalSection);
+	triggerStatesCache.clear();
+	g_outgoingTriggerPressB.clear();
+	g_incomingTriggerPressB.clear();
+	LeaveCriticalSection(&triggerCriticalSection);
+
+	EnterCriticalSection(&switchCriticalSection);
+	switchStatesCache.clear();
+	g_outgoingSwitchToggles.clear();
+	g_incomingSwitchToggles.clear();
+	LeaveCriticalSection(&switchCriticalSection);
 
 	myGuid = 0;
 	myNicknameGuid = 0;
@@ -772,6 +825,15 @@ static void readGamePointers()
 	std::vector<uint32_t> allSwitches = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x33, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allTriggers = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x35, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7c); //0x28 is class value, find by obj address + 0x7c
+
+	// Snapshot per-type address caches for this level. The per-frame detect* functions
+	// iterate these cached lists instead of re-scanning the obj stack every frame,
+	// which was causing noticeable jitter. Addresses are validated at use-time against
+	// the type tag, so stale entries (destroyed mid-level objects) are skipped safely.
+	g_allPickupsAddrs = allPickups;
+	g_allSwitchesAddrs = allSwitches;
+	g_allTriggersAddrs = allTriggers;
+	g_allWebWallsAddrs = allWebWalls;
 
 
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
@@ -1007,15 +1069,17 @@ static void readWebWallStates()
 	if (!processAnalyzer)
 		return;
 
-	// Получаем все объекты класса 0x2B (WebWall)
-	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7C);
-
 	EnterCriticalSection(&webWallsCriticalSection);
 
-	webWallStatesDirty = false;
-
-	for (uint32_t addr : allWebWalls)
+	// Use the per-level cached address list; re-scanning the obj stack every frame
+	// was a major source of jitter. Cached addresses are validated against the type
+	// tag below, so destroyed/deactivated web walls are skipped harmlessly.
+	for (uint32_t addr : g_allWebWallsAddrs)
 	{
+		// Validate the cached address is still a live web wall.
+		if (processAnalyzer->readData<uint8_t>(addr + 0x7C) != 0x2B)
+			continue;
+
 		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x8);
 		if (guid == 0)
 			continue;
@@ -1062,6 +1126,442 @@ static void sendWebWallUpdates(Client& client)
 
 	webWallStatesDirty = false;
 	LeaveCriticalSection(&webWallsCriticalSection);
+}
+
+// ===========================================================================
+//  Pickup Synchronization
+// ===========================================================================
+
+// Pickup memory layout (from chests_sdk.h):
+//   +0x008  GUID (uint64_t)
+//   +0x07C  object type tag (uint8_t, 0x22 = pickup)
+//   +0x07F  objectFlags (uint8_t, bit0 = visible)
+//   +0x126  disabledFlags (uint8_t, bit0 = not-getable)
+//   +0x16E  stateFlags (uint16_t, PICKUP_PICKED_UP = 0x0004, PICKUP_CHASING = 0x0100)
+static constexpr uint8_t  PICKUP_CLASS_TAG = 0x22;
+static constexpr uint16_t PICKUP_PICKED_UP_FLAG = 0x0004;
+
+// bilbo::Pickups_GetPickup(object*) @ 0x00446330 — directly grants the pickup to
+// inventory (no chase animation). Same as the "Bilbo GetPickup" button in kingjoyer.
+static constexpr uint32_t BILBO_PICKUPS_GETPICKUP_ADDR = 0x00446330;
+typedef void(__thiscall* BilboPickupsGetPickup_t)(void* self, void* pickupObj);
+static const BilboPickupsGetPickup_t game_BilboPickupsGetPickup = reinterpret_cast<BilboPickupsGetPickup_t>(BILBO_PICKUPS_GETPICKUP_ADDR);
+
+static bool isPickupObject(uint32_t objAddr)
+{
+	return objAddr != 0
+		&& processAnalyzer->readData<uint8_t>(objAddr + 0x7C) == PICKUP_CLASS_TAG;
+}
+
+static uint64_t getPickupGuid(uint32_t objAddr)
+{
+	return processAnalyzer->readData<uint64_t>(objAddr + 0x08);
+}
+
+static uint16_t getPickupStateFlags(uint32_t objAddr)
+{
+	return processAnalyzer->readData<uint16_t>(objAddr + 0x16E);
+}
+
+static bool isPickupCollected(uint32_t objAddr)
+{
+	return (getPickupStateFlags(objAddr) & PICKUP_PICKED_UP_FLAG) != 0;
+}
+
+// Apply the visual hide to a pickup in the local game (flags-only, no SDK call).
+static void hidePickupLocally(uint32_t objAddr)
+{
+	if (objAddr == 0)
+		return;
+
+	uint8_t objFlags = processAnalyzer->readData<uint8_t>(objAddr + 0x7F);
+	uint8_t disFlags = processAnalyzer->readData<uint8_t>(objAddr + 0x126);
+	uint16_t stFlags = processAnalyzer->readData<uint16_t>(objAddr + 0x16E);
+
+	objFlags &= ~0x01;       // clear visible
+	disFlags |= 0x01;        // set not-getable
+	stFlags |= PICKUP_PICKED_UP_FLAG;
+
+	processAnalyzer->writeData<uint8_t>(objAddr + 0x7F, objFlags);
+	processAnalyzer->writeData<uint8_t>(objAddr + 0x126, disFlags);
+	processAnalyzer->writeData<uint16_t>(objAddr + 0x16E, stFlags);
+}
+
+// Scan all pickups for state changes (newly collected).
+// Runs on the game thread. Must be called after readGamePointers().
+static void detectPickupChanges()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&pickupCriticalSection);
+
+	for (uint32_t addr : g_allPickupsAddrs)
+	{
+		// Validate the cached address is still a live pickup (the engine may have
+		// destroyed it mid-level; the cache only refreshes on level change).
+		if (processAnalyzer->readData<uint8_t>(addr + 0x7C) != PICKUP_CLASS_TAG)
+			continue;
+
+		uint64_t guid = getPickupGuid(addr);
+		if (guid == 0)
+			continue;
+
+		uint16_t currentState = getPickupStateFlags(addr);
+
+		auto it = pickupStatesCache.find(guid);
+		if (it == pickupStatesCache.end())
+		{
+			// First time seeing this pickup — record its initial state
+			pickupStatesCache[guid] = currentState;
+		}
+		else if (it->second != currentState)
+		{
+			// State changed — check if it became collected
+			if ((currentState & PICKUP_PICKED_UP_FLAG) && !(it->second & PICKUP_PICKED_UP_FLAG))
+			{
+				g_outgoingPickupCollects.push_back(guid);
+				printf("Pickup collected locally: GUID %llu\n", guid);
+			}
+			pickupStatesCache[guid] = currentState;
+		}
+	}
+
+	LeaveCriticalSection(&pickupCriticalSection);
+}
+
+// Send outgoing pickup collect messages
+static void sendPickupCollects(Client& client)
+{
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	EnterCriticalSection(&pickupCriticalSection);
+	std::vector<uint64_t> pending = g_outgoingPickupCollects;
+	g_outgoingPickupCollects.clear();
+	LeaveCriticalSection(&pickupCriticalSection);
+
+	for (uint64_t pickupGuid : pending)
+	{
+		auto* msg = static_cast<PickupCollectMessage*>(client.CreateMessage(PICKUP_COLLECT));
+		if (!msg)
+			continue;
+
+		msg->pickupGuid = pickupGuid;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Process incoming pickup collect message
+static void processPickupCollect(PickupCollectMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->pickupGuid == 0)
+		return;
+
+	EnterCriticalSection(&pickupCriticalSection);
+	g_incomingPickupCollects.push_back(msg->pickupGuid);
+	LeaveCriticalSection(&pickupCriticalSection);
+}
+
+// Apply queued incoming pickup collects on the game thread.
+// Uses Bilbo_Pickups_GetPickup to directly grant the item to inventory
+// (no chase animation — same as the "Bilbo GetPickup" button in kingjoyer).
+static void applyQueuedPickupCollects()
+{
+	if (!processAnalyzer)
+		return;
+
+	// Get the Bilbo pointer for the grant call
+	uint32_t bilboPtr = processAnalyzer->readData<uint32_t>(0x0075BA3C);
+	if (bilboPtr == 0)
+		return;
+
+	EnterCriticalSection(&pickupCriticalSection);
+	std::vector<uint64_t> pending = g_incomingPickupCollects;
+	g_incomingPickupCollects.clear();
+	LeaveCriticalSection(&pickupCriticalSection);
+
+	for (uint64_t pickupGuid : pending)
+	{
+		uint32_t addr = processAnalyzer->findGameObjByGUID(pickupGuid);
+		if (addr == 0 || !isPickupObject(addr) || isPickupCollected(addr))
+			continue;
+
+		// Directly grant the pickup to inventory (no chase)
+		game_BilboPickupsGetPickup(reinterpret_cast<void*>(bilboPtr), reinterpret_cast<void*>(addr));
+		printf("Applied remote pickup collect: GUID %llu\n", pickupGuid);
+	}
+}
+
+// ===========================================================================
+//  Trigger Synchronization
+// ===========================================================================
+
+// Trigger memory layout (from triggers_sdk.h):
+//   +0x008  GUID (uint64_t)
+//   +0x07C  object type tag (uint8_t, 0x35 = trigger)
+//   +0x120  flags (uint32_t, TRIGGER_WAS_TRIGGERED = 0x10, TRIGGER_ENABLED = 0x08)
+//   trigger::OnPressB @ 0x004DD2D0 (game address, no ASLR)
+static constexpr uint8_t   TRIGGER_CLASS_TAG = 0x35;
+static constexpr uint32_t  TRIGGER_WAS_TRIGGERED_FLAG = 0x00000010;
+static constexpr uint32_t  TRIGGER_ENABLED_FLAG = 0x00000008;
+static constexpr uint32_t  TRIGGER_ONPRESSB_ADDR = 0x004DD2D0;
+
+typedef void(__thiscall* TriggerOnPressB_t)(void* self);
+static const TriggerOnPressB_t game_TriggerOnPressB = reinterpret_cast<TriggerOnPressB_t>(TRIGGER_ONPRESSB_ADDR);
+
+static bool isTriggerObject(uint32_t objAddr)
+{
+	return objAddr != 0
+		&& processAnalyzer->readData<uint8_t>(objAddr + 0x7C) == TRIGGER_CLASS_TAG;
+}
+
+static uint32_t getTriggerFlags(uint32_t objAddr)
+{
+	return processAnalyzer->readData<uint32_t>(objAddr + 0x120);
+}
+
+static bool isTriggerFired(uint32_t objAddr)
+{
+	return (getTriggerFlags(objAddr) & TRIGGER_WAS_TRIGGERED_FLAG) != 0;
+}
+
+// Scan all triggers for state changes (newly fired).
+static void detectTriggerChanges()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+
+	for (uint32_t addr : g_allTriggersAddrs)
+	{
+		if (processAnalyzer->readData<uint8_t>(addr + 0x7C) != TRIGGER_CLASS_TAG)
+			continue;
+
+		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x08);
+		if (guid == 0)
+			continue;
+
+		uint32_t currentFlags = getTriggerFlags(addr);
+
+		auto it = triggerStatesCache.find(guid);
+		if (it == triggerStatesCache.end())
+		{
+			triggerStatesCache[guid] = currentFlags;
+		}
+		else if (it->second != currentFlags)
+		{
+			// Check if TRIGGER_WAS_TRIGGERED just became set
+			if ((currentFlags & TRIGGER_WAS_TRIGGERED_FLAG) && !(it->second & TRIGGER_WAS_TRIGGERED_FLAG))
+			{
+				g_outgoingTriggerPressB.push_back(guid);
+				printf("Trigger fired locally: GUID %llu\n", guid);
+			}
+			triggerStatesCache[guid] = currentFlags;
+		}
+	}
+
+	LeaveCriticalSection(&triggerCriticalSection);
+}
+
+// Send outgoing trigger OnPressB messages
+static void sendTriggerPressB(Client& client)
+{
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	std::vector<uint64_t> pending = g_outgoingTriggerPressB;
+	g_outgoingTriggerPressB.clear();
+	LeaveCriticalSection(&triggerCriticalSection);
+
+	for (uint64_t triggerGuid : pending)
+	{
+		auto* msg = static_cast<TriggerOnPressBMessage*>(client.CreateMessage(TRIGGER_ONPRESSB));
+		if (!msg)
+			continue;
+
+		msg->triggerGuid = triggerGuid;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Process incoming trigger OnPressB message
+static void processTriggerOnPressB(TriggerOnPressBMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->triggerGuid == 0)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	g_incomingTriggerPressB.push_back(msg->triggerGuid);
+	LeaveCriticalSection(&triggerCriticalSection);
+}
+
+// Apply queued incoming trigger OnPressB on the game thread
+static void applyQueuedTriggerPressB()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	std::vector<uint64_t> pending = g_incomingTriggerPressB;
+	g_incomingTriggerPressB.clear();
+	LeaveCriticalSection(&triggerCriticalSection);
+
+	for (uint64_t triggerGuid : pending)
+	{
+		uint32_t addr = processAnalyzer->findGameObjByGUID(triggerGuid);
+		if (addr == 0 || !isTriggerObject(addr))
+			continue;
+
+		// Enable the trigger and fire OnPressB
+		uint32_t flags = getTriggerFlags(addr);
+		if (!(flags & TRIGGER_ENABLED_FLAG))
+		{
+			flags |= TRIGGER_ENABLED_FLAG;
+			processAnalyzer->writeData<uint32_t>(addr + 0x120, flags);
+		}
+
+		game_TriggerOnPressB(reinterpret_cast<void*>(addr));
+		printf("Applied remote trigger OnPressB: GUID %llu\n", triggerGuid);
+	}
+}
+
+// ===========================================================================
+//  Switch Synchronization
+// ===========================================================================
+
+// Switch memory layout (from triggers_sdk.h):
+//   +0x008  GUID (uint64_t)
+//   +0x07C  object type tag (uint8_t, 0x33 = switch)
+//   +0x160  stateFlags (uint32_t, SWITCH_ON = 0x00000002, bit1)
+//   Switch_Toggle @ 0x004d2f50, Switch_SetOn @ 0x004d2f20 (game addresses, no ASLR)
+static constexpr uint8_t   SWITCH_CLASS_TAG = 0x33;
+static constexpr uint32_t  SWITCH_ON_FLAG = 0x00000002;
+static constexpr uint32_t  SWITCH_TOGGLE_ADDR = 0x004d2f50;
+static constexpr uint32_t  SWITCH_SETON_ADDR = 0x004d2f20;
+
+typedef void(__thiscall* SwitchToggle_t)(void* self);
+static const SwitchToggle_t game_SwitchToggle = reinterpret_cast<SwitchToggle_t>(SWITCH_TOGGLE_ADDR);
+
+typedef void(__thiscall* SwitchSetOn_t)(void* self, int on);
+static const SwitchSetOn_t game_SwitchSetOn = reinterpret_cast<SwitchSetOn_t>(SWITCH_SETON_ADDR);
+
+static bool isSwitchObject(uint32_t objAddr)
+{
+	return objAddr != 0
+		&& processAnalyzer->readData<uint8_t>(objAddr + 0x7C) == SWITCH_CLASS_TAG;
+}
+
+static uint32_t getSwitchStateFlags(uint32_t objAddr)
+{
+	return processAnalyzer->readData<uint32_t>(objAddr + 0x160);
+}
+
+static bool isSwitchOn(uint32_t objAddr)
+{
+	return (getSwitchStateFlags(objAddr) & SWITCH_ON_FLAG) != 0;
+}
+
+// Scan all switches for state changes.
+static void detectSwitchChanges()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&switchCriticalSection);
+
+	for (uint32_t addr : g_allSwitchesAddrs)
+	{
+		if (processAnalyzer->readData<uint8_t>(addr + 0x7C) != SWITCH_CLASS_TAG)
+			continue;
+
+		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x08);
+		if (guid == 0)
+			continue;
+
+		uint32_t currentFlags = getSwitchStateFlags(addr);
+
+		auto it = switchStatesCache.find(guid);
+		if (it == switchStatesCache.end())
+		{
+			switchStatesCache[guid] = currentFlags;
+		}
+		else if (it->second != currentFlags)
+		{
+			// Switch state changed — record the new on/off state
+			bool nowOn = (currentFlags & SWITCH_ON_FLAG) != 0;
+			g_outgoingSwitchToggles.push_back({ guid, nowOn });
+			printf("Switch toggled locally: GUID %llu -> %s\n", guid, nowOn ? "ON" : "OFF");
+			switchStatesCache[guid] = currentFlags;
+		}
+	}
+
+	LeaveCriticalSection(&switchCriticalSection);
+}
+
+// Send outgoing switch toggle messages
+static void sendSwitchToggles(Client& client)
+{
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	EnterCriticalSection(&switchCriticalSection);
+	std::vector<std::pair<uint64_t, bool>> pending = g_outgoingSwitchToggles;
+	g_outgoingSwitchToggles.clear();
+	LeaveCriticalSection(&switchCriticalSection);
+
+	for (const auto& entry : pending)
+	{
+		auto* msg = static_cast<SwitchToggleMessage*>(client.CreateMessage(SWITCH_TOGGLE));
+		if (!msg)
+			continue;
+
+		msg->switchGuid = entry.first;
+		msg->switchedOn = entry.second ? 1 : 0;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Process incoming switch toggle message
+static void processSwitchToggle(SwitchToggleMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->switchGuid == 0)
+		return;
+
+	EnterCriticalSection(&switchCriticalSection);
+	g_incomingSwitchToggles.push_back({ msg->switchGuid, msg->switchedOn != 0 });
+	LeaveCriticalSection(&switchCriticalSection);
+}
+
+// Apply queued incoming switch toggles on the game thread
+static void applyQueuedSwitchToggles()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&switchCriticalSection);
+	std::vector<std::pair<uint64_t, bool>> pending = g_incomingSwitchToggles;
+	g_incomingSwitchToggles.clear();
+	LeaveCriticalSection(&switchCriticalSection);
+
+	for (const auto& entry : pending)
+	{
+		uint32_t addr = processAnalyzer->findGameObjByGUID(entry.first);
+		if (addr == 0 || !isSwitchObject(addr))
+			continue;
+
+		bool currentOn = isSwitchOn(addr);
+		if (currentOn == entry.second)
+			continue; // already in the desired state
+
+		game_SwitchSetOn(reinterpret_cast<void*>(addr), entry.second ? 1 : 0);
+		printf("Applied remote switch toggle: GUID %llu -> %s\n", entry.first, entry.second ? "ON" : "OFF");
+	}
 }
 
 // ===========================================================================
@@ -1816,6 +2316,15 @@ static void processMessage(Client& client, Message* message, double time)
 	case CHEST_OPEN:
 		if (gameManager.isOnLevel()) processChestOpen(static_cast<ChestOpenMessage*>(message));
 		break;
+	case PICKUP_COLLECT:
+		if (gameManager.isOnLevel()) processPickupCollect(static_cast<PickupCollectMessage*>(message));
+		break;
+	case TRIGGER_ONPRESSB:
+		if (gameManager.isOnLevel()) processTriggerOnPressB(static_cast<TriggerOnPressBMessage*>(message));
+		break;
+	case SWITCH_TOGGLE:
+		if (gameManager.isOnLevel()) processSwitchToggle(static_cast<SwitchToggleMessage*>(message));
+		break;
 
 	default:
 		break;
@@ -1950,6 +2459,7 @@ static void ChatCommandSetTeam(const std::string& team)
 
 static void ChatCommandBreakWeb(const std::string& team)
 {
+	// Flags OnAdvanceLogic to queue every known web wall for breaking.
 	g_bBreakWeb = true;
 }
 
@@ -1991,6 +2501,9 @@ static int clientMain()
 	InitializeCriticalSection(&webWallsCriticalSection);
 	InitializeCriticalSection(&webWallUpdates_CS);
 	InitializeCriticalSection(&chestCriticalSection);
+	InitializeCriticalSection(&pickupCriticalSection);
+	InitializeCriticalSection(&triggerCriticalSection);
+	InitializeCriticalSection(&switchCriticalSection);
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
@@ -2066,6 +2579,35 @@ static int clientMain()
 				g_outgoingChestOpens.clear();
 				g_incomingChestOpens.clear();
 				LeaveCriticalSection(&chestCriticalSection);
+
+				EnterCriticalSection(&pickupCriticalSection);
+				pickupStatesCache.clear();
+				g_outgoingPickupCollects.clear();
+				g_incomingPickupCollects.clear();
+				LeaveCriticalSection(&pickupCriticalSection);
+
+				EnterCriticalSection(&triggerCriticalSection);
+				triggerStatesCache.clear();
+				g_outgoingTriggerPressB.clear();
+				g_incomingTriggerPressB.clear();
+				LeaveCriticalSection(&triggerCriticalSection);
+
+				EnterCriticalSection(&switchCriticalSection);
+				switchStatesCache.clear();
+				g_outgoingSwitchToggles.clear();
+				g_incomingSwitchToggles.clear();
+				LeaveCriticalSection(&switchCriticalSection);
+
+				EnterCriticalSection(&webWallsCriticalSection);
+				webWallStates.clear();
+				webWallStatesCache.clear();
+				webWallStatesDirty = false;
+				g_allWebWallsAddrs.clear();
+				LeaveCriticalSection(&webWallsCriticalSection);
+
+				EnterCriticalSection(&webWallUpdates_CS);
+				webWallsTornList.clear();
+				LeaveCriticalSection(&webWallUpdates_CS);
 			}
 
 			// Process incoming messages on all channels
@@ -2124,6 +2666,18 @@ static int clientMain()
 						cmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 						client.SendMessage(channels::Gameplay, cmsg);
 					}
+
+					// Detect and send pickup collection events
+					detectPickupChanges();
+					sendPickupCollects(client);
+
+					// Detect and send trigger activation events
+					detectTriggerChanges();
+					sendTriggerPressB(client);
+
+					// Detect and send switch toggle events
+					detectSwitchChanges();
+					sendSwitchToggles(client);
 				}
 
 				if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
