@@ -247,10 +247,22 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	EnterCriticalSection(&throwCriticalSection);
 	for (const PendingThrow& p : g_incomingThrows)
 	{
+		char* Fire_Stone = (char*)0x0075BE88;
+		char* Explosive_Stone = (char*)0x0075BE84;
+		char* Freeze_Stone = (char*)0x0075BE8C;
+
 		// owner: the throwing player's in-game object GUID. p.guid is the network
 		// player GUID — map it to the remote player's NPC object guid if you have it,
 		// otherwise 0 spawns an unowned rock (visual). type 0x19 = Normal Rock.
-		game_CreateProjectile(0x19, p.guid, p.from, p.to);
+		
+		if (*Fire_Stone > 0)
+			game_CreateProjectile(0x1A, p.guid, p.from, p.to);
+		else if (*Explosive_Stone > 0)
+			game_CreateProjectile(0x1B, p.guid, p.from, p.to);
+		else if (*Freeze_Stone > 0)
+			game_CreateProjectile(0x1C, p.guid, p.from, p.to);
+		else
+			game_CreateProjectile(0x19, p.guid, p.from, p.to);
 	}
 	g_incomingThrows.clear();
 	LeaveCriticalSection(&throwCriticalSection);
