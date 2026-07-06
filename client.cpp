@@ -130,7 +130,7 @@ static Hoistable* g_currentPushBlock = nullptr;
 // --- Web walls sync ---
 CRITICAL_SECTION webWallsCriticalSection;
 std::unordered_map<uint64_t, uint8_t> webWallStates; // GUID -> state byte at +0x1C8
-static std::unordered_map<uint64_t, uint8_t> webWallStatesCache; // для отслеживания изменений
+static std::unordered_map<uint64_t, uint8_t> webWallStatesCache;
 static bool webWallStatesDirty = false;
 static std::vector<uint32_t> allChests;
 
@@ -147,6 +147,7 @@ static std::vector<uint32_t> g_allWebWallsAddrs;
 
 static CRITICAL_SECTION webWallUpdates_CS;
 static std::vector<uint64_t> webWallsTornList;
+static std::unordered_set<uint64_t> webWallsTornDone;
 
 // --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
 CRITICAL_SECTION throwCriticalSection;
@@ -384,21 +385,18 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 	EnterCriticalSection(&webWallUpdates_CS);
 
-	std::vector<uint64_t> next_frame;
-
 	while (!webWallsTornList.empty()) {
-		// Pop FIRST so a missing GUID can never re-lock the queue.
 		uint64_t guid = webWallsTornList.back();
 		webWallsTornList.pop_back();
 		LeaveCriticalSection(&webWallUpdates_CS);
 
-		if(!breakWebWallByGuid(guid))
-			next_frame.push_back(guid);
+		if (!breakWebWallByGuid(guid))
+			printf("WebWall GUID %llu break failed, skipping\n", guid);
+
+		webWallsTornDone.insert(guid);
 
 		EnterCriticalSection(&webWallUpdates_CS);
 	}
-
-	webWallsTornList = next_frame;
 
 	LeaveCriticalSection(&webWallUpdates_CS);
 }
@@ -769,6 +767,11 @@ static void resetClientSessionState()
 	webWallStatesDirty = false;
 	g_allWebWallsAddrs.clear();
 	LeaveCriticalSection(&webWallsCriticalSection);
+
+	EnterCriticalSection(&webWallUpdates_CS);
+	webWallsTornList.clear();
+	webWallsTornDone.clear();
+	LeaveCriticalSection(&webWallUpdates_CS);
 
 	EnterCriticalSection(&chestCriticalSection);
 	allChests.clear();
@@ -1148,6 +1151,7 @@ static void sendWebWallUpdates(Client& client)
 	}
 
 	webWallStatesDirty = false;
+	webWallStates.clear();
 	LeaveCriticalSection(&webWallsCriticalSection);
 }
 
@@ -2261,7 +2265,9 @@ static void processWebWallUpdate(WebWallUpdateMessage* msg)
 
 	if (msg->state) {
 		EnterCriticalSection(&webWallUpdates_CS);
-		webWallsTornList.push_back(msg->wallGuid);
+		if (!webWallsTornDone.count(msg->wallGuid)) {
+			webWallsTornList.push_back(msg->wallGuid);
+		}
 		LeaveCriticalSection(&webWallUpdates_CS);
 	}
 }
@@ -2790,6 +2796,7 @@ static int clientMain()
 
 				EnterCriticalSection(&webWallUpdates_CS);
 				webWallsTornList.clear();
+				webWallsTornDone.clear();
 				LeaveCriticalSection(&webWallUpdates_CS);
 			}
 
