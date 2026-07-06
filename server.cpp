@@ -659,13 +659,14 @@ static void broadcastStoneThrow(Server& server, int senderIndex, StoneThrowMessa
 		auto* broadcast = static_cast<StoneThrowMessage*>(
 			server.CreateMessage(i, STONE_THROW));
 
-		broadcast->playerGuid = senderGuid;   // trust the server's mapping, not the client's claim
+		broadcast->playerGuid = senderGuid;
 		broadcast->fromX = msg->fromX;
 		broadcast->fromY = msg->fromY;
 		broadcast->fromZ = msg->fromZ;
 		broadcast->toX = msg->toX;
 		broadcast->toY = msg->toY;
 		broadcast->toZ = msg->toZ;
+		broadcast->stoneType = msg->stoneType;
 		broadcast->nowLevel = msg->nowLevel;
 
 		server.SendMessage(i, channels::Gameplay, broadcast);

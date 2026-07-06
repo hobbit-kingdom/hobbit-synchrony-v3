@@ -156,9 +156,10 @@ CRITICAL_SECTION throwCriticalSection;
 volatile bool    g_haveThrow = false;
 Vector3          g_lastThrowFrom{};
 Vector3          g_lastThrowTo{};
+uint8_t          g_lastThrowType = 0x19;
 
 // incoming: remote throws queued by the net thread, spawned on the game thread
-struct PendingThrow { uint64_t guid; Vector3 from; Vector3 to; };
+struct PendingThrow { uint64_t guid; Vector3 from; Vector3 to; uint8_t type; };
 static std::vector<PendingThrow> g_incomingThrows;
 
 CRITICAL_SECTION chestCriticalSection;
@@ -224,22 +225,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	EnterCriticalSection(&throwCriticalSection);
 	for (const PendingThrow& p : g_incomingThrows)
 	{
-		char* Fire_Stone = (char*)0x0075BE88;
-		char* Explosive_Stone = (char*)0x0075BE84;
-		char* Freeze_Stone = (char*)0x0075BE8C;
-
-		// owner: the throwing player's in-game object GUID. p.guid is the network
-		// player GUID — map it to the remote player's NPC object guid if you have it,
-		// otherwise 0 spawns an unowned rock (visual). type 0x19 = Normal Rock.
-		
-		if (*Fire_Stone > 0)
-			game_CreateProjectile(0x1A, p.guid, p.from, p.to);
-		else if (*Explosive_Stone > 0)
-			game_CreateProjectile(0x1B, p.guid, p.from, p.to);
-		else if (*Freeze_Stone > 0)
-			game_CreateProjectile(0x1C, p.guid, p.from, p.to);
-		else
-			game_CreateProjectile(0x19, p.guid, p.from, p.to);
+		game_CreateProjectile(p.type, p.guid, p.from, p.to);
 	}
 	g_incomingThrows.clear();
 	LeaveCriticalSection(&throwCriticalSection);
@@ -923,18 +909,29 @@ static CreateStoneProjectile_t oCreateStoneProjectile = nullptr;
 static void __fastcall hkCreateStoneProjectile(
 	void* self, void* edx, const Vector3* from, const Vector3* to)
 {
+	// Determine stone type from the local player's globals at throw time
+	float Fire_Stone = *reinterpret_cast<float*>(0x0075BE88);
+	float Explosive_Stone = *reinterpret_cast<float*>(0x0075BE84);
+	float Freeze_Stone = *reinterpret_cast<float*>(0x0075BE8C);
+
+	uint8_t type = 0x19; // Normal Rock
+	if (Fire_Stone > 0.0f)
+		type = 0x1A;
+	else if (Explosive_Stone > 0.0f)
+		type = 0x1B;
+	else if (Freeze_Stone > 0.0f)
+		type = 0x1C;
+
 	EnterCriticalSection(&throwCriticalSection);
 	g_lastThrowFrom = *from;
-	g_lastThrowTo = *to;            // copy the destination out
-	g_haveThrow = true;            // net loop will pick this up and send STONE_THROW
+	g_lastThrowTo = *to;
+	g_lastThrowType = type;
+	g_haveThrow = true;
 	LeaveCriticalSection(&throwCriticalSection);
 
-	char buf[160];
-	sprintf_s(buf, "[stone] from (%.1f, %.1f, %.1f)  ->  TO (%.1f, %.1f, %.1f)\n",
-		from->x, from->y, from->z, to->x, to->y, to->z);
-	OutputDebugStringA(buf);          // view in DebugView, or use your own logger
-	std::cout << buf << "\n";
-	oCreateStoneProjectile(self, edx, from, to);   // let the real throw happen
+	printf("[stone] type 0x%02X from (%.1f, %.1f, %.1f)  ->  TO (%.1f, %.1f, %.1f)\n",
+		type, from->x, from->y, from->z, to->x, to->y, to->z);
+	oCreateStoneProjectile(self, edx, from, to);
 }
 
 void InstallStoneHook()
@@ -2361,15 +2358,14 @@ static void processChatMessage(ChatMsgMessage* msg)
 
 static void processStoneThrow(StoneThrowMessage* msg)
 {
-	// A remote player threw a stone. We can't spawn from here (net thread) —
-	// queue it and let OnAdvanceLogic (game thread) call CreateProjectile.
 	if (msg->playerGuid == myGuid)
-		return; // ignore our own throw echoed back
+		return;
 
 	PendingThrow p;
 	p.guid = msg->playerGuid;
 	p.from = { msg->fromX, msg->fromY, msg->fromZ };
 	p.to = { msg->toX,   msg->toY,   msg->toZ };
+	p.type = msg->stoneType;
 
 	EnterCriticalSection(&throwCriticalSection);
 	g_incomingThrows.push_back(p);
@@ -2817,6 +2813,7 @@ static int clientMain()
 					EnterCriticalSection(&throwCriticalSection);
 					Vector3 from = g_lastThrowFrom;
 					Vector3 to = g_lastThrowTo;
+					uint8_t type = g_lastThrowType;
 					g_haveThrow = false;
 					LeaveCriticalSection(&throwCriticalSection);
 
@@ -2828,6 +2825,7 @@ static int clientMain()
 					tmsg->toX = NetworkClamp::sanitizePosition(to.x);
 					tmsg->toY = NetworkClamp::sanitizePosition(to.y);
 					tmsg->toZ = NetworkClamp::sanitizePosition(to.z);
+					tmsg->stoneType = type;
 					tmsg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 					client.SendMessage(channels::Gameplay, tmsg);
 				}

@@ -412,6 +412,7 @@ struct StoneThrowMessage : public Message
 	float    toX = 0.0f;       // destination / aim point
 	float    toY = 0.0f;
 	float    toZ = 0.0f;
+	uint8_t  stoneType = 0x19; // 0x19=normal, 0x1A=fire, 0x1B=explosive, 0x1C=freeze
 	uint32_t nowLevel = 0;
 
 	template <typename Stream>
@@ -424,6 +425,7 @@ struct StoneThrowMessage : public Message
 		serialize_float(stream, toX);
 		serialize_float(stream, toY);
 		serialize_float(stream, toZ);
+		serialize_bits(stream, stoneType, 8);
 		serialize_bits(stream, nowLevel, 32);
 
 		if (!stream.IsWriting)
