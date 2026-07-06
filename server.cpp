@@ -548,25 +548,25 @@ static void broadcastPushBlockUpdate(Server& server, int senderIndex, HoistableS
 	}
 }
 
-// ====== ФУНКЦИЯ ДЛЯ РЕТРАНСЛЯЦИИ ОБНОВЛЕНИЙ ПАУТИН ======
-static void broadcastWebWallUpdate(Server& server, int senderIndex, WebWallUpdateMessage* msg)
+static void broadcastWebWallBreak(Server& server, int senderIndex, WebWallBreakMessage* msg)
 {
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
 	{
 		if (i == senderIndex || !server.IsClientConnected(i))
 			continue;
 
-		auto* broadcast = static_cast<WebWallUpdateMessage*>(
-			server.CreateMessage(i, WEB_WALL_UPDATE));
+		auto* broadcast = static_cast<WebWallBreakMessage*>(
+			server.CreateMessage(i, WEB_WALL_BREAK));
 
 		broadcast->wallGuid = msg->wallGuid;
-		broadcast->state = msg->state;
+		broadcast->breakX = msg->breakX;
+		broadcast->breakY = msg->breakY;
+		broadcast->breakZ = msg->breakZ;
 		broadcast->nowLevel = msg->nowLevel;
 
 		server.SendMessage(i, channels::Gameplay, broadcast);
 	}
 }
-// ====== КОНЕЦ ======
 
 static void broadcastEnemyUpdate(Server& server, int senderIndex, EnemiesStateMessage* msg)
 {
@@ -838,11 +838,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		broadcastPushBlockUpdate(server, clientIndex, static_cast<HoistableStateMessage*>(message));
 		break;
 
-		// ====== ДОБАВЛЯЕМ ОБРАБОТКУ WEB_WALL_UPDATE ======
-	case WEB_WALL_UPDATE:
-		broadcastWebWallUpdate(server, clientIndex, static_cast<WebWallUpdateMessage*>(message));
+	case WEB_WALL_BREAK:
+		broadcastWebWallBreak(server, clientIndex, static_cast<WebWallBreakMessage*>(message));
 		break;
-		// ====== КОНЕЦ ======
 
 	case SKIN_ANNOUNCE:
 		processSkinAnnouncement(server, clientIndex, static_cast<SkinAnnouncementMessage*>(message));

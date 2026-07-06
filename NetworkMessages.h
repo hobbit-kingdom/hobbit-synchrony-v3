@@ -32,7 +32,7 @@ enum GameMessageType
 	PUSHBLOCK_RELEASE,
 	PUSHBLOCK_UPDATE,
 
-	WEB_WALL_UPDATE,
+	WEB_WALL_BREAK,
 
 	GUID_ASSIGN,
 	SKIN_ANNOUNCE,
@@ -60,18 +60,21 @@ enum GameMessageType
 		guid64 = (static_cast<uint64_t>(guid_high) << 32) | guid_low; \
 	} while(0)
 
-//Паутинка
-struct WebWallUpdateMessage : public Message
+struct WebWallBreakMessage : public Message
 {
     uint64_t wallGuid = 0;
-    uint8_t  state = 0;      // байт по адресу +0x1C8
+    float    breakX = 0.0f;
+    float    breakY = 0.0f;
+    float    breakZ = 0.0f;
     uint32_t nowLevel = 0;
 
     template <typename Stream>
     bool Serialize(Stream& stream)
     {
         serialize_GUID(stream, wallGuid);
-        serialize_bits(stream, state, 8);
+        serialize_float(stream, breakX);
+        serialize_float(stream, breakY);
+        serialize_float(stream, breakZ);
         serialize_bits(stream, nowLevel, 32);
 
         if (!stream.IsWriting)

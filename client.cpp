@@ -40,7 +40,6 @@
 
 using namespace yojimbo;
 
-
 // ===========================================================================
 //  Globals
 // ===========================================================================
@@ -127,11 +126,12 @@ std::unordered_map<uint64_t, HoistableUpdateStruct> hoistables; // cache
 static Hoistable* g_currentHoistable = nullptr;
 static Hoistable* g_currentPushBlock = nullptr;
 
-// --- Web walls sync ---
-CRITICAL_SECTION webWallsCriticalSection;
-std::unordered_map<uint64_t, uint8_t> webWallStates; // GUID -> state byte at +0x1C8
-static std::unordered_map<uint64_t, uint8_t> webWallStatesCache;
-static bool webWallStatesDirty = false;
+// --- Web walls sync (hook-based) ---
+static CRITICAL_SECTION webWallBreak_CS;
+static bool g_haveWebWallBreak = false;
+static uint64_t g_lastWebWallGuid = 0;
+static Vector3 g_lastWebWallBreakPoint{};
+static std::unordered_set<uint64_t> g_sentWebWallBreaks;
 static std::vector<uint32_t> allChests;
 
 // --- Per-type object address caches (populated once per level in readGamePointers) ---
@@ -143,11 +143,11 @@ static std::vector<uint32_t> allChests;
 static std::vector<uint32_t> g_allPickupsAddrs;
 static std::vector<uint32_t> g_allSwitchesAddrs;
 static std::vector<uint32_t> g_allTriggersAddrs;
-static std::vector<uint32_t> g_allWebWallsAddrs;
 
-static CRITICAL_SECTION webWallUpdates_CS;
-static std::vector<uint64_t> webWallsTornList;
-static std::unordered_set<uint64_t> webWallsTornDone;
+struct PendingWebWallBreak { uint64_t guid; Vector3 point; };
+static CRITICAL_SECTION webWallBreakIncoming_CS;
+static std::vector<PendingWebWallBreak> g_incomingWebWallBreaks;
+static std::unordered_set<uint64_t> g_appliedWebWallBreaks;
 
 // --- stone-throw networking (cross-thread: hook + OnAdvanceLogic = game thread, net loop = net thread) ---
 CRITICAL_SECTION throwCriticalSection;
@@ -214,39 +214,6 @@ class hook_bilbo
 public:
 	void OnAdvanceLogic(float fDeltaTime);
 };
-
-static bool breakWebWallByGuid(uint64_t guid)
-{
-	if (!processAnalyzer)
-		return false;
-
-	uint32_t objAddr = processAnalyzer->findGameObjByGUID(guid);
-	if (objAddr == 0) {
-		printf("no web (GUID %llu not found)\n", guid);
-		return false;
-	}
-
-	object* pObj = (object*)objAddr;
-
-	// Validate the object is actually a web wall (type tag 0x2B) before calling
-	// methods on it. If the web wall's area isn't loaded locally, the object may
-	// exist in the stack but have stale/uninitialized internal pointers.
-	if (pObj->_typeId() != CLASS_WebWall) {
-		printf("GUID %llu is not a web wall (type 0x%02X), skipping\n", guid, pObj->_typeId());
-		return false;
-	}
-
-	if(!pObj->_isLoaded())
-		return false;
-
-	typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
-	pweb_wall_StartBreakAtPoint web_wall_StartBreakAtPoint;
-	unsigned address = 0x004ef370;
-	memcpy(&web_wall_StartBreakAtPoint, &address, 4);
-	(pObj->*web_wall_StartBreakAtPoint)(pObj->GetPosition());
-
-	return true;
-}
 
 void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 {
@@ -383,26 +350,55 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 	LeaveCriticalSection(&playersCriticalSection);
 
-	EnterCriticalSection(&webWallUpdates_CS);
+	// Apply incoming remote web wall breaks on the game thread
+	{
+		EnterCriticalSection(&webWallBreakIncoming_CS);
+		std::vector<PendingWebWallBreak> pending = g_incomingWebWallBreaks;
+		g_incomingWebWallBreaks.clear();
+		LeaveCriticalSection(&webWallBreakIncoming_CS);
 
-	while (!webWallsTornList.empty()) {
-		uint64_t guid = webWallsTornList.back();
-		webWallsTornList.pop_back();
-		LeaveCriticalSection(&webWallUpdates_CS);
+		for (const PendingWebWallBreak& wb : pending)
+		{
+			if (!processAnalyzer)
+				continue;
 
-		if (!breakWebWallByGuid(guid))
-			printf("WebWall GUID %llu break failed, skipping\n", guid);
+			// Skip if already applied or already sent (prevents feedback loop:
+			// applying calls StartBreakAtPoint which triggers our hook)
+			if (g_appliedWebWallBreaks.count(wb.guid))
+				continue;
 
-		webWallsTornDone.insert(guid);
+			// Mark as sent BEFORE calling StartBreakAtPoint so our own hook
+			// doesn't re-queue it for the network
+			g_appliedWebWallBreaks.insert(wb.guid);
 
-		EnterCriticalSection(&webWallUpdates_CS);
+			uint32_t objAddr = processAnalyzer->findGameObjByGUID(wb.guid);
+			if (objAddr == 0)
+				continue;
+
+			object* pObj = (object*)objAddr;
+			if (pObj->_typeId() != CLASS_WebWall || !pObj->_isLoaded())
+				continue;
+
+			// Also mark as sent in the outgoing dedup set so the hook
+			// won't try to re-broadcast this break
+			EnterCriticalSection(&webWallBreak_CS);
+			g_sentWebWallBreaks.insert(wb.guid);
+			LeaveCriticalSection(&webWallBreak_CS);
+
+			typedef void (object::* pweb_wall_StartBreakAtPoint)(const vector3& Point);
+			pweb_wall_StartBreakAtPoint fn;
+			unsigned addr = 0x004ef370;
+			memcpy(&fn, &addr, 4);
+			(pObj->*fn)(reinterpret_cast<const vector3&>(wb.point));
+
+			printf("Applied remote web wall break: GUID %llu\n", wb.guid);
+		}
 	}
-
-	LeaveCriticalSection(&webWallUpdates_CS);
 }
 
 void InstallStoneHook();   // forward decl (defined further below)
 void InstallChestHook();   // forward decl (defined further below)
+void InstallWebWallHook(); // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -422,6 +418,7 @@ void SetupBilboHook(void)
 
 	InstallStoneHook();   // detour bilbo::CreateStoneProjectile to capture throw destination
 	InstallChestHook();   // detour treasure_chest::Open to replicate opened chests
+	InstallWebWallHook(); // detour web_wall::StartBreakAtPoint to capture web cuts
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -761,17 +758,17 @@ static void resetClientSessionState()
 		g_currentPushBlock = nullptr;
 	}
 
-	EnterCriticalSection(&webWallsCriticalSection);
-	webWallStates.clear();
-	webWallStatesCache.clear();
-	webWallStatesDirty = false;
-	g_allWebWallsAddrs.clear();
-	LeaveCriticalSection(&webWallsCriticalSection);
+	EnterCriticalSection(&webWallBreak_CS);
+	g_haveWebWallBreak = false;
+	g_lastWebWallGuid = 0;
+	g_lastWebWallBreakPoint = {};
+	g_sentWebWallBreaks.clear();
+	LeaveCriticalSection(&webWallBreak_CS);
 
-	EnterCriticalSection(&webWallUpdates_CS);
-	webWallsTornList.clear();
-	webWallsTornDone.clear();
-	LeaveCriticalSection(&webWallUpdates_CS);
+	EnterCriticalSection(&webWallBreakIncoming_CS);
+	g_incomingWebWallBreaks.clear();
+	g_appliedWebWallBreaks.clear();
+	LeaveCriticalSection(&webWallBreakIncoming_CS);
 
 	EnterCriticalSection(&chestCriticalSection);
 	allChests.clear();
@@ -850,7 +847,6 @@ static void readGamePointers()
 	std::vector<uint32_t> allPickups = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x22, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allSwitches = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x33, 0x7c); //put the values that indicate that thing
 	std::vector<uint32_t> allTriggers = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x35, 0x7c); //put the values that indicate that thing
-	std::vector<uint32_t> allWebWalls = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x2B, 0x7c); //0x28 is class value, find by obj address + 0x7c
 
 	// Snapshot per-type address caches for this level. The per-frame detect* functions
 	// iterate these cached lists instead of re-scanning the obj stack every frame,
@@ -859,7 +855,6 @@ static void readGamePointers()
 	g_allPickupsAddrs = allPickups;
 	g_allSwitchesAddrs = allSwitches;
 	g_allTriggersAddrs = allTriggers;
-	g_allWebWallsAddrs = allWebWalls;
 
 
 	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
@@ -1087,72 +1082,74 @@ static void changeEnemiesAIMode(int mode)
 }
 
 // ===========================================================================
-//  Web Walls Synchronization
+//  Web Walls Synchronization (hook-based)
 // ===========================================================================
 
-static void readWebWallStates()
+// web_wall::StartBreakAtPoint(this, const vector3& Point) @ 0x004EF370
+// Hooked to detect local web cuts and send them to the network.
+// The this pointer is the web_wall object; its GUID lives at +0x08.
+
+typedef void(__fastcall* StartBreakAtPoint_t)(void* self, void* edx, const vector3& point);
+static StartBreakAtPoint_t oStartBreakAtPoint = nullptr;
+
+static void __fastcall hkStartBreakAtPoint(void* self, void* edx, const vector3& point)
 {
-	if (!processAnalyzer)
-		return;
-
-	EnterCriticalSection(&webWallsCriticalSection);
-
-	// Use the per-level cached address list; re-scanning the obj stack every frame
-	// was a major source of jitter. Cached addresses are validated against the type
-	// tag below, so destroyed/deactivated web walls are skipped harmlessly.
-	for (uint32_t addr : g_allWebWallsAddrs)
+	uint64_t guid = *reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(self) + 0x08);
+	if (guid != 0)
 	{
-		// Validate the cached address is still a live web wall.
-		if (processAnalyzer->readData<uint8_t>(addr + 0x7C) != 0x2B)
-			continue;
-
-		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x8);
-		if (guid == 0)
-			continue;
-
-		uint8_t currentState = processAnalyzer->readData<uint8_t>(addr + 0x1C8);
-
-		// Проверяем, изменилось ли состояние
-		auto it = webWallStatesCache.find(guid);
-		if (it == webWallStatesCache.end() || it->second != currentState)
+		EnterCriticalSection(&webWallBreak_CS);
+		if (!g_sentWebWallBreaks.count(guid))
 		{
-			webWallStates[guid] = currentState;
-			webWallStatesCache[guid] = currentState;
-			webWallStatesDirty = true;
+			g_sentWebWallBreaks.insert(guid);
+			g_lastWebWallGuid = guid;
+			g_lastWebWallBreakPoint = { point.X, point.Y, point.Z };
+			g_haveWebWallBreak = true;
 
-			printf("WebWall GUID %llu state changed to %d\n", guid, currentState);
+			printf("Local web wall cut: GUID %llu at (%.1f, %.1f, %.1f)\n",
+				guid, point.X, point.Y, point.Z);
 		}
+		LeaveCriticalSection(&webWallBreak_CS);
 	}
 
-	LeaveCriticalSection(&webWallsCriticalSection);
+	oStartBreakAtPoint(self, edx, point);
 }
 
-static void sendWebWallUpdates(Client& client)
+static void sendWebWallBreak(Client& client)
 {
 	if (!client.IsConnected() || myGuid == 0)
 		return;
 
-	if (!webWallStatesDirty)
-		return;
-
-	EnterCriticalSection(&webWallsCriticalSection);
-
-	for (const auto& pair : webWallStates)
+	EnterCriticalSection(&webWallBreak_CS);
+	if (!g_haveWebWallBreak)
 	{
-		auto* msg = static_cast<WebWallUpdateMessage*>(client.CreateMessage(WEB_WALL_UPDATE));
-		if (!msg)
-			continue;
-
-		msg->wallGuid = pair.first;
-		msg->state = pair.second;
-		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
-
-		client.SendMessage(channels::Gameplay, msg);
+		LeaveCriticalSection(&webWallBreak_CS);
+		return;
 	}
 
-	webWallStatesDirty = false;
-	webWallStates.clear();
-	LeaveCriticalSection(&webWallsCriticalSection);
+	uint64_t guid = g_lastWebWallGuid;
+	Vector3 point = g_lastWebWallBreakPoint;
+	g_haveWebWallBreak = false;
+	LeaveCriticalSection(&webWallBreak_CS);
+
+	auto* msg = static_cast<WebWallBreakMessage*>(client.CreateMessage(WEB_WALL_BREAK));
+	if (!msg)
+		return;
+
+	msg->wallGuid = guid;
+	msg->breakX = point.x;
+	msg->breakY = point.y;
+	msg->breakZ = point.z;
+	msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+	client.SendMessage(channels::Gameplay, msg);
+}
+
+void InstallWebWallHook()
+{
+	MH_Initialize();
+	void* target = reinterpret_cast<void*>(0x004EF370);
+	MH_CreateHook(target, &hkStartBreakAtPoint,
+		reinterpret_cast<void**>(&oStartBreakAtPoint));
+	MH_EnableHook(target);
 }
 
 // ===========================================================================
@@ -2258,18 +2255,14 @@ static void processPushBlockUpdate(HoistableStateMessage* msg, double /*currentT
 	LeaveCriticalSection(&hoistablesCriticalSection);
 }
 
-static void processWebWallUpdate(WebWallUpdateMessage* msg)
+static void processWebWallBreakIncoming(WebWallBreakMessage* msg)
 {
-	if (msg->nowLevel != nowLevel)
+	if (msg->nowLevel != nowLevel || msg->wallGuid == 0)
 		return;
 
-	if (msg->state) {
-		EnterCriticalSection(&webWallUpdates_CS);
-		if (!webWallsTornDone.count(msg->wallGuid)) {
-			webWallsTornList.push_back(msg->wallGuid);
-		}
-		LeaveCriticalSection(&webWallUpdates_CS);
-	}
+	EnterCriticalSection(&webWallBreakIncoming_CS);
+	g_incomingWebWallBreaks.push_back({ msg->wallGuid, { msg->breakX, msg->breakY, msg->breakZ } });
+	LeaveCriticalSection(&webWallBreakIncoming_CS);
 }
 
 static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*/)
@@ -2466,8 +2459,8 @@ static void processMessage(Client& client, Message* message, double time)
 		if (gameManager.isOnLevel()) processPushBlockUpdate(static_cast<HoistableStateMessage*>(message), time);
 		break;
 
-	case WEB_WALL_UPDATE:
-		if (gameManager.isOnLevel()) processWebWallUpdate(static_cast<WebWallUpdateMessage*>(message));
+	case WEB_WALL_BREAK:
+		if (gameManager.isOnLevel()) processWebWallBreakIncoming(static_cast<WebWallBreakMessage*>(message));
 		break;
 
 	case GUID_ASSIGN:
@@ -2683,8 +2676,8 @@ static int clientMain()
 	InitializeCriticalSection(&hoistablesCriticalSection);
 	InitializeCriticalSection(&enemiesCriticalSection);
 	InitializeCriticalSection(&throwCriticalSection);
-	InitializeCriticalSection(&webWallsCriticalSection);
-	InitializeCriticalSection(&webWallUpdates_CS);
+	InitializeCriticalSection(&webWallBreak_CS);
+	InitializeCriticalSection(&webWallBreakIncoming_CS);
 	InitializeCriticalSection(&chestCriticalSection);
 	InitializeCriticalSection(&pickupCriticalSection);
 	InitializeCriticalSection(&triggerCriticalSection);
@@ -2787,17 +2780,17 @@ static int clientMain()
 				g_incomingSwitchToggles.clear();
 				LeaveCriticalSection(&switchCriticalSection);
 
-				EnterCriticalSection(&webWallsCriticalSection);
-				webWallStates.clear();
-				webWallStatesCache.clear();
-				webWallStatesDirty = false;
-				g_allWebWallsAddrs.clear();
-				LeaveCriticalSection(&webWallsCriticalSection);
+				EnterCriticalSection(&webWallBreak_CS);
+				g_haveWebWallBreak = false;
+				g_lastWebWallGuid = 0;
+				g_lastWebWallBreakPoint = {};
+				g_sentWebWallBreaks.clear();
+				LeaveCriticalSection(&webWallBreak_CS);
 
-				EnterCriticalSection(&webWallUpdates_CS);
-				webWallsTornList.clear();
-				webWallsTornDone.clear();
-				LeaveCriticalSection(&webWallUpdates_CS);
+				EnterCriticalSection(&webWallBreakIncoming_CS);
+				g_incomingWebWallBreaks.clear();
+				g_appliedWebWallBreaks.clear();
+				LeaveCriticalSection(&webWallBreakIncoming_CS);
 			}
 
 			// Process incoming messages on all channels
@@ -2906,14 +2899,11 @@ static int clientMain()
 					lastSend = g_time;
 				}
 
-				// ====== ЧИТАЕМ И ОТПРАВЛЯЕМ СОСТОЯНИЕ ПАУТИН ======
-				// Читаем состояние паутин каждый кадр
+				// Send web wall break events
 				if (gameManager.isOnLevel())
 				{
-					readWebWallStates();
-					sendWebWallUpdates(client);
+					sendWebWallBreak(client);
 				}
-				// ====== КОНЕЦ ======
 			}
 
 			// update hoistable
