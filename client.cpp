@@ -20,6 +20,7 @@
 #include <fstream>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <algorithm>
 #include <atomic>
@@ -173,8 +174,15 @@ static std::vector<uint64_t> g_incomingPickupCollects;
 // --- Trigger sync state ---
 CRITICAL_SECTION triggerCriticalSection;
 static std::unordered_map<uint64_t, uint32_t> triggerStatesCache;
+static std::unordered_map<uint64_t, int32_t> triggerSuppliedItemCountCache;
 static std::vector<uint64_t> g_outgoingTriggerPressB;
 static std::vector<uint64_t> g_incomingTriggerPressB;
+
+struct PendingTriggerOnUse { uint64_t triggerGuid; int32_t itemCount; int32_t itemIds[4]; };
+static std::vector<PendingTriggerOnUse> g_outgoingTriggerOnUse;
+static std::vector<PendingTriggerOnUse> g_incomingTriggerOnUse;
+// Triggers we applied remotely this frame — suppress re-detection to avoid feedback loops
+static std::unordered_set<uint64_t> g_suppressTriggerDetection;
 
 // --- Switch sync state ---
 CRITICAL_SECTION switchCriticalSection;
@@ -186,6 +194,7 @@ static std::vector<std::pair<uint64_t, bool>> g_incomingSwitchToggles;
 static void applyQueuedChestOpens();
 static void applyQueuedPickupCollects();
 static void applyQueuedTriggerPressB();
+static void applyQueuedTriggerOnUse();
 static void applyQueuedSwitchToggles();
 
 // Projectile::CreateProjectile(eProjectileType, owner, vector3 from, vector3 to) @ 0x004B53A0
@@ -270,6 +279,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	applyQueuedChestOpens();
 	applyQueuedPickupCollects();
 	applyQueuedTriggerPressB();
+	applyQueuedTriggerOnUse();
 	applyQueuedSwitchToggles();
 
 	// update hoistables and pushblock position
@@ -774,8 +784,12 @@ static void resetClientSessionState()
 
 	EnterCriticalSection(&triggerCriticalSection);
 	triggerStatesCache.clear();
+	triggerSuppliedItemCountCache.clear();
 	g_outgoingTriggerPressB.clear();
 	g_incomingTriggerPressB.clear();
+	g_outgoingTriggerOnUse.clear();
+	g_incomingTriggerOnUse.clear();
+	g_suppressTriggerDetection.clear();
 	LeaveCriticalSection(&triggerCriticalSection);
 
 	EnterCriticalSection(&switchCriticalSection);
@@ -1311,14 +1325,29 @@ static void applyQueuedPickupCollects()
 //   +0x008  GUID (uint64_t)
 //   +0x07C  object type tag (uint8_t, 0x35 = trigger)
 //   +0x120  flags (uint32_t, TRIGGER_WAS_TRIGGERED = 0x10, TRIGGER_ENABLED = 0x08)
-//   trigger::OnPressB @ 0x004DD2D0 (game address, no ASLR)
+//   +0x138  requiredItemCount (int32)
+//   +0x13c  requiredItemList (int32*)
+//   +0x160  suppliedItemCount (int32) — items placed by player
+//   +0x164  suppliedItemList (int32*) — player-supplied item ids
+//   trigger::OnPressB   @ 0x004DD2D0 (game address, no ASLR)
+//   trigger::OnUse(item) @ 0x004DCEF0 (game address, no ASLR)
 static constexpr uint8_t   TRIGGER_CLASS_TAG = 0x35;
 static constexpr uint32_t  TRIGGER_WAS_TRIGGERED_FLAG = 0x00000010;
 static constexpr uint32_t  TRIGGER_ENABLED_FLAG = 0x00000008;
 static constexpr uint32_t  TRIGGER_ONPRESSB_ADDR = 0x004DD2D0;
+static constexpr uint32_t  TRIGGER_ONUSE_ADDR = 0x004DCEF0;
+static constexpr uint32_t  TRIGGER_USEITEMS_ADDR = 0x004DD060;
+static constexpr uint32_t  TRIGGER_SUPPLIEDITEMCOUNT_OFFSET = 0x160;
+static constexpr uint32_t  TRIGGER_SUPPLIEDITEMLIST_OFFSET = 0x164;
 
 typedef void(__thiscall* TriggerOnPressB_t)(void* self);
 static const TriggerOnPressB_t game_TriggerOnPressB = reinterpret_cast<TriggerOnPressB_t>(TRIGGER_ONPRESSB_ADDR);
+
+typedef void(__thiscall* TriggerOnUse_t)(void* self, int item);
+static const TriggerOnUse_t game_TriggerOnUse = reinterpret_cast<TriggerOnUse_t>(TRIGGER_ONUSE_ADDR);
+
+typedef void(__thiscall* TriggerUseItems_t)(void* self);
+static const TriggerUseItems_t game_TriggerUseItems = reinterpret_cast<TriggerUseItems_t>(TRIGGER_USEITEMS_ADDR);
 
 static bool isTriggerObject(uint32_t objAddr)
 {
@@ -1336,7 +1365,26 @@ static bool isTriggerFired(uint32_t objAddr)
 	return (getTriggerFlags(objAddr) & TRIGGER_WAS_TRIGGERED_FLAG) != 0;
 }
 
-// Scan all triggers for state changes (newly fired).
+// Read supplied item IDs from a trigger and push an OnUse outgoing message.
+static void readAndPushTriggerItems(uint32_t addr, uint64_t guid, int32_t itemCount)
+{
+	if (itemCount <= 0) return;
+	if (itemCount > 4) itemCount = 4;
+
+	uint32_t listAddr = processAnalyzer->readData<uint32_t>(addr + TRIGGER_SUPPLIEDITEMLIST_OFFSET);
+	if (listAddr == 0) return;
+
+	PendingTriggerOnUse pending{};
+	pending.triggerGuid = guid;
+	pending.itemCount = itemCount;
+	for (int i = 0; i < itemCount; i++)
+		pending.itemIds[i] = processAnalyzer->readData<int32_t>(listAddr + i * 4);
+
+	g_outgoingTriggerOnUse.push_back(pending);
+	printf("Trigger OnUse detected: GUID %llu, %d items\n", guid, itemCount);
+}
+
+// Scan all triggers for state changes (newly fired or items placed).
 static void detectTriggerChanges()
 {
 	if (!processAnalyzer)
@@ -1353,22 +1401,59 @@ static void detectTriggerChanges()
 		if (guid == 0)
 			continue;
 
+		// Skip triggers that were applied remotely this cycle
+		if (g_suppressTriggerDetection.count(guid))
+			continue;
+
 		uint32_t currentFlags = getTriggerFlags(addr);
+		int32_t currentItemCount = processAnalyzer->readData<int32_t>(addr + TRIGGER_SUPPLIEDITEMCOUNT_OFFSET);
 
 		auto it = triggerStatesCache.find(guid);
-		if (it == triggerStatesCache.end())
+		bool isNewTrigger = (it == triggerStatesCache.end());
+		bool flagChanged = !isNewTrigger && (it->second != currentFlags);
+		bool justFired = flagChanged
+			&& (currentFlags & TRIGGER_WAS_TRIGGERED_FLAG)
+			&& !(it->second & TRIGGER_WAS_TRIGGERED_FLAG);
+
+		// --- When trigger just fired with items: this is an OnUse activation ---
+		if (justFired && currentItemCount > 0)
 		{
+			readAndPushTriggerItems(addr, guid, currentItemCount);
+			// Update both caches so we don't double-detect
 			triggerStatesCache[guid] = currentFlags;
+			triggerSuppliedItemCountCache[guid] = currentItemCount;
+			continue;
 		}
-		else if (it->second != currentFlags)
+
+		// --- When trigger just fired without items: OnPressB ---
+		if (justFired && currentItemCount == 0)
 		{
-			// Check if TRIGGER_WAS_TRIGGERED just became set
-			if ((currentFlags & TRIGGER_WAS_TRIGGERED_FLAG) && !(it->second & TRIGGER_WAS_TRIGGERED_FLAG))
-			{
-				g_outgoingTriggerPressB.push_back(guid);
-				printf("Trigger fired locally: GUID %llu\n", guid);
-			}
+			g_outgoingTriggerPressB.push_back(guid);
+			printf("Trigger fired locally (OnPressB): GUID %llu\n", guid);
 			triggerStatesCache[guid] = currentFlags;
+			continue;
+		}
+
+		// --- Detect item placement without trigger fire (multi-item triggers) ---
+		auto icIt = triggerSuppliedItemCountCache.find(guid);
+		if (icIt == triggerSuppliedItemCountCache.end())
+		{
+			// First time seeing this trigger — just initialize caches
+			triggerStatesCache[guid] = currentFlags;
+			triggerSuppliedItemCountCache[guid] = currentItemCount;
+		}
+		else if (currentItemCount > icIt->second)
+		{
+			// Items placed but trigger hasn't fired yet (multi-item trigger)
+			readAndPushTriggerItems(addr, guid, currentItemCount - icIt->second);
+			triggerStatesCache[guid] = currentFlags;
+			triggerSuppliedItemCountCache[guid] = currentItemCount;
+		}
+		else
+		{
+			// No change or items ejected — just update caches
+			triggerStatesCache[guid] = currentFlags;
+			triggerSuppliedItemCountCache[guid] = currentItemCount;
 		}
 	}
 
@@ -1436,6 +1521,96 @@ static void applyQueuedTriggerPressB()
 
 		game_TriggerOnPressB(reinterpret_cast<void*>(addr));
 		printf("Applied remote trigger OnPressB: GUID %llu\n", triggerGuid);
+	}
+}
+
+// Send outgoing trigger OnUse messages (items placed into triggers)
+static void sendTriggerOnUse(Client& client)
+{
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	std::vector<PendingTriggerOnUse> pending = g_outgoingTriggerOnUse;
+	g_outgoingTriggerOnUse.clear();
+	LeaveCriticalSection(&triggerCriticalSection);
+
+	for (const PendingTriggerOnUse& use : pending)
+	{
+		auto* msg = static_cast<TriggerOnUseMessage*>(client.CreateMessage(TRIGGER_ONUSE));
+		if (!msg)
+			continue;
+
+		msg->triggerGuid = use.triggerGuid;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		msg->itemCount = use.itemCount;
+		for (int i = 0; i < 4; i++)
+			msg->itemIds[i] = use.itemIds[i];
+
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Process incoming trigger OnUse message
+static void processTriggerOnUse(TriggerOnUseMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->triggerGuid == 0)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	g_incomingTriggerOnUse.push_back({ msg->triggerGuid, msg->itemCount, { msg->itemIds[0], msg->itemIds[1], msg->itemIds[2], msg->itemIds[3] } });
+	LeaveCriticalSection(&triggerCriticalSection);
+}
+
+// Apply queued incoming trigger OnUse on the game thread
+// Directly places items into the trigger's supplied list, then calls UseItems
+// to check the set-match and fire OnActivate if all required items are present.
+static void applyQueuedTriggerOnUse()
+{
+	if (!processAnalyzer)
+		return;
+
+	EnterCriticalSection(&triggerCriticalSection);
+	std::vector<PendingTriggerOnUse> pending = g_incomingTriggerOnUse;
+	g_incomingTriggerOnUse.clear();
+	LeaveCriticalSection(&triggerCriticalSection);
+
+	for (const PendingTriggerOnUse& use : pending)
+	{
+		uint32_t addr = processAnalyzer->findGameObjByGUID(use.triggerGuid);
+		if (addr == 0 || !isTriggerObject(addr))
+			continue;
+
+		// Suppress detection for this trigger so we don't echo it back
+		EnterCriticalSection(&triggerCriticalSection);
+		g_suppressTriggerDetection.insert(use.triggerGuid);
+		LeaveCriticalSection(&triggerCriticalSection);
+
+		// Enable the trigger if not already enabled
+		uint32_t flags = getTriggerFlags(addr);
+		if (!(flags & TRIGGER_ENABLED_FLAG))
+		{
+			flags |= TRIGGER_ENABLED_FLAG;
+			processAnalyzer->writeData<uint32_t>(addr + 0x120, flags);
+		}
+
+		// Call Trigger_OnUse for each item — this runs the engine's full
+		// item-placement code path including script callbacks and visuals
+		for (int i = 0; i < use.itemCount; i++)
+		{
+			if (use.itemIds[i] < 0)
+				continue;
+			game_TriggerOnUse(reinterpret_cast<void*>(addr), use.itemIds[i]);
+		}
+
+		// Snapshot post-apply state so detection won't echo this back
+		int32_t newCount = processAnalyzer->readData<int32_t>(addr + TRIGGER_SUPPLIEDITEMCOUNT_OFFSET);
+		EnterCriticalSection(&triggerCriticalSection);
+		triggerStatesCache[use.triggerGuid] = getTriggerFlags(addr);
+		triggerSuppliedItemCountCache[use.triggerGuid] = newCount;
+		LeaveCriticalSection(&triggerCriticalSection);
+
+		printf("Applied remote trigger OnUse: GUID %llu, %d items (total %d)\n", use.triggerGuid, use.itemCount, newCount);
 	}
 }
 
@@ -2331,6 +2506,9 @@ static void processMessage(Client& client, Message* message, double time)
 	case TRIGGER_ONPRESSB:
 		if (gameManager.isOnLevel()) processTriggerOnPressB(static_cast<TriggerOnPressBMessage*>(message));
 		break;
+	case TRIGGER_ONUSE:
+		if (gameManager.isOnLevel()) processTriggerOnUse(static_cast<TriggerOnUseMessage*>(message));
+		break;
 	case SWITCH_TOGGLE:
 		if (gameManager.isOnLevel()) processSwitchToggle(static_cast<SwitchToggleMessage*>(message));
 		break;
@@ -2589,8 +2767,12 @@ static int clientMain()
 
 				EnterCriticalSection(&triggerCriticalSection);
 				triggerStatesCache.clear();
+				triggerSuppliedItemCountCache.clear();
 				g_outgoingTriggerPressB.clear();
 				g_incomingTriggerPressB.clear();
+				g_outgoingTriggerOnUse.clear();
+				g_incomingTriggerOnUse.clear();
+				g_suppressTriggerDetection.clear();
 				LeaveCriticalSection(&triggerCriticalSection);
 
 				EnterCriticalSection(&switchCriticalSection);
@@ -2675,6 +2857,7 @@ static int clientMain()
 					// Detect and send trigger activation events
 					detectTriggerChanges();
 					sendTriggerPressB(client);
+					sendTriggerOnUse(client);
 
 					// Detect and send switch toggle events
 					detectSwitchChanges();

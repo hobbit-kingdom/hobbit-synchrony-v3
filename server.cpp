@@ -723,6 +723,26 @@ static void broadcastTriggerOnPressB(Server& server, int senderIndex, TriggerOnP
 	}
 }
 
+static void broadcastTriggerOnUse(Server& server, int senderIndex, TriggerOnUseMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<TriggerOnUseMessage*>(
+			server.CreateMessage(i, TRIGGER_ONUSE));
+
+		broadcast->triggerGuid = msg->triggerGuid;
+		broadcast->nowLevel = msg->nowLevel;
+		broadcast->itemCount = msg->itemCount;
+		for (int j = 0; j < 4; j++)
+			broadcast->itemIds[j] = msg->itemIds[j];
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void broadcastSwitchToggle(Server& server, int senderIndex, SwitchToggleMessage* msg)
 {
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
@@ -850,6 +870,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case TRIGGER_ONPRESSB:
 		broadcastTriggerOnPressB(server, clientIndex, static_cast<TriggerOnPressBMessage*>(message));
+		break;
+	case TRIGGER_ONUSE:
+		broadcastTriggerOnUse(server, clientIndex, static_cast<TriggerOnUseMessage*>(message));
 		break;
 	case SWITCH_TOGGLE:
 		broadcastSwitchToggle(server, clientIndex, static_cast<SwitchToggleMessage*>(message));

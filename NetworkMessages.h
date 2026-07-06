@@ -45,6 +45,7 @@ enum GameMessageType
 	CHEST_OPEN,
 	PICKUP_COLLECT,
 	TRIGGER_ONPRESSB,
+	TRIGGER_ONUSE,
 	SWITCH_TOGGLE,
 	NUM_GAME_MESSAGE_TYPES
 };
@@ -493,6 +494,36 @@ struct TriggerOnPressBMessage : public Message
 	{
 		serialize_GUID(stream, triggerGuid);
 		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+struct TriggerOnUseMessage : public Message
+{
+	uint64_t triggerGuid = 0;
+	uint32_t nowLevel = 0;
+	int32_t  itemCount = 0;
+	int32_t  itemIds[4] = { -1, -1, -1, -1 };
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, triggerGuid);
+		serialize_bits(stream, nowLevel, 32);
+		serialize_int(stream, itemCount, 0, 4);
+
+		for (int i = 0; i < 4; i++)
+		{
+			serialize_int(stream, itemIds[i], -1, 1023);
+		}
 
 		if (!stream.IsWriting)
 		{
