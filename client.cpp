@@ -2308,18 +2308,25 @@ static void SpawnFxSynced(const char* name, float x, float y, float z,
 }
 
 // ---------------------------------------------------------------------------
-// Chest lockpick-failure FX sync
+// Synced one-shot FX
 // ---------------------------------------------------------------------------
-// When the lockpick minigame fails, dlg_pickLock::OnUpdate plays an explosion on
-// the failing player's screen only. dlg_pickLock::OnUpdate is the ONLY function in
-// the game that spawns "ExplosionSmall" / "PoisonSpitImpact" (verified across all
-// 14,860 functions), so those effect names are a precise signal for "the local
-// player just failed a chest lockpick" — no false positives elsewhere.
+// Some effects are spawned only on the screen of the player who caused them. We
+// hook the engine's FX spawner and rebroadcast a whitelist of them, so every peer
+// sees the same effect at the same spot with the exact position/rotation/scale the
+// game itself computed.
 //
-// We hook the engine's FX spawner and, when one of those effects plays locally,
-// broadcast it so every peer sees the same explosion at the same spot with the
-// exact position/rotation/scale the game itself computed.
-static const char* const kSyncedFxNames[] = { "ExplosionSmall", "PoisonSpitImpact" };
+// Each name below was verified (across all 14,860 recovered functions) to be
+// spawned by exactly ONE function, so the name alone is a false-positive-free
+// trigger for that event:
+//   ExplosionSmall / PoisonSpitImpact -> dlg_pickLock::OnUpdate  (lockpick FAILED)
+//   Bilbo_LevelUp                     -> bilboInventory::Update  (player LEVELED UP)
+//
+// To sync another effect later, just add its name here.
+static const char* const kSyncedFxNames[] = {
+	"ExplosionSmall",
+	"PoisonSpitImpact",
+	"Bilbo_LevelUp",
+};
 
 static bool isSyncedFxName(const char* n)
 {
@@ -2331,20 +2338,36 @@ static bool isSyncedFxName(const char* n)
 	return false;
 }
 
+// Height lift applied to the BROADCAST copy of an effect, per effect name.
+//
+// The level-up effect spawns at Bilbo's object origin (ground level) and the game
+// then re-anchors ITS OWN copy to the "Bilbo_Dummy_Root" bone — peers only get the
+// raw spawn position, so their copy renders low. Lift it to roughly body height.
+//
+// The lockpick explosion needs no lift: dlg_pickLock::OnUpdate already builds a
+// +85 Y offset into the position it passes in.
+static constexpr float FX_LEVELUP_Y_OFFSET = 50.0f;
+
+static float fxBroadcastYOffset(const char* name)
+{
+	if (strcmp(name, "Bilbo_LevelUp") == 0)
+		return FX_LEVELUP_Y_OFFSET;
+	return 0.0f;
+}
+
 static uint64_t __cdecl hkFxFireAndForget(const char* name, const vector3* pos,
 	const radian3* rot, const vector3* scale)
 {
 	uint64_t result = oFxFireAndForget(name, pos, rot, scale);
 
-	// Only broadcast the pickLock failure effects, and only ones WE triggered.
-	// (Remote FX are replayed through the trampoline below, so they never re-enter
-	// this hook — no echo storm.)
+	// Only broadcast whitelisted effects, and only ones WE triggered. (Remote FX are
+	// replayed through the trampoline, so they never re-enter this hook — no echo.)
 	if (pos && isSyncedFxName(name))
 	{
-		BroadcastFxOnly(name, pos->X, pos->Y, pos->Z,
+		BroadcastFxOnly(name, pos->X, pos->Y + fxBroadcastYOffset(name), pos->Z,
 			rot ? rot->X : 0.0f, rot ? rot->Y : 0.0f, rot ? rot->Z : 0.0f,
 			scale ? scale->X : 1.0f, scale ? scale->Y : 1.0f, scale ? scale->Z : 1.0f);
-		printf("Chest lockpick failed - broadcasting '%s'\n", name);
+		printf("Broadcasting FX '%s'\n", name);
 	}
 
 	return result;
