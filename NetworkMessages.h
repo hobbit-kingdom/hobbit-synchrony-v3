@@ -47,6 +47,10 @@ enum GameMessageType
 	TRIGGER_ONPRESSB,
 	TRIGGER_ONUSE,
 	SWITCH_TOGGLE,
+	ANIM_SYNC,
+	RING_SYNC,
+	SPAWN_OBJECT,
+	SPAWN_FX,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -556,6 +560,191 @@ struct SwitchToggleMessage : public Message
 
 		if (!stream.IsWriting)
 		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
+// AnimSyncMessage — one-shot snapshot of the current animation frame of every
+// animated rigid_instance on the level, keyed by object GUID. Sent once by a
+// peer; each receiver snaps its matching objects to those frames. Because the
+// engine's rigid_instance animations loop at a fixed rate, a single alignment
+// keeps them in sync from that point on. (Same variable-length map shape as
+// EnemiesStateMessage.)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RingSyncMessage — a player toggled the One Ring on/off. Receivers apply the
+// ring's stealth effect to that player's fake-bilbo NPC, tiered by the NPC's
+// team: team 2 => invisible, otherwise => half-transparent (matching bilbo's
+// own ring look). Only the equipped state travels; the target's team is read
+// from the NPC locally.
+// ---------------------------------------------------------------------------
+
+struct RingSyncMessage : public Message
+{
+	uint64_t playerGuid = 0;    // whose ring toggled (== their fake-bilbo NPC GUID)
+	uint8_t  ringEquipped = 0;  // 1 = ring on, 0 = ring off
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, playerGuid);
+		serialize_bits(stream, ringEquipped, 8);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
+// SpawnObjectMessage — a player spawned a RigidInstance. Receivers create the
+// same object with the SAME GUID (so it stays cross-referenceable) at the same
+// world position, optionally configured from a shared template file. Mirrors
+// Kingjoyer's spawn recipe: obj_mgr::CreateObject("RigidInstance", guid) ->
+// object::OnImport(template) -> object::Move(pos).
+// ---------------------------------------------------------------------------
+
+struct SpawnObjectMessage : public Message
+{
+	uint64_t objectGuid = 0;      // shared GUID (assigned by the spawner's engine)
+	float    x = 0.0f;
+	float    y = 0.0f;
+	float    z = 0.0f;
+	char     templateName[64] = {}; // *.export in ./Templates/ (empty = bare object)
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, objectGuid);
+		serialize_float(stream, x);
+		serialize_float(stream, y);
+		serialize_float(stream, z);
+		serialize_string(stream, templateName, sizeof(templateName));
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			x = NetworkClamp::sanitizePosition(x);
+			y = NetworkClamp::sanitizePosition(y);
+			z = NetworkClamp::sanitizePosition(z);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
+// SpawnFxMessage — play a one-shot FX effect at a world position on every peer.
+// Maps to fx_object::FireAndForget(name, pos, rot, scale): the effect plays then
+// auto-destroys, so no GUID/lifetime sync is needed — each client just plays it.
+// ---------------------------------------------------------------------------
+
+struct SpawnFxMessage : public Message
+{
+	char     fxName[64] = {};    // e.g. "fx_fire"
+	float    x = 0.0f, y = 0.0f, z = 0.0f;          // world position
+	float    pitch = 0.0f, yaw = 0.0f, roll = 0.0f; // rotation (radians)
+	float    scaleX = 1.0f, scaleY = 1.0f, scaleZ = 1.0f;
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_string(stream, fxName, sizeof(fxName));
+		serialize_float(stream, x);
+		serialize_float(stream, y);
+		serialize_float(stream, z);
+		serialize_float(stream, pitch);
+		serialize_float(stream, yaw);
+		serialize_float(stream, roll);
+		serialize_float(stream, scaleX);
+		serialize_float(stream, scaleY);
+		serialize_float(stream, scaleZ);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			x = NetworkClamp::sanitizePosition(x);
+			y = NetworkClamp::sanitizePosition(y);
+			z = NetworkClamp::sanitizePosition(z);
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// Cap objects per message so a crowded level can't blow the packet budget.
+static const size_t MaxAnimSyncPerMessage = 512;
+
+struct AnimSyncMessage : public Message
+{
+	std::unordered_map<uint64_t, float> frames; // rigid_instance GUID -> anim frame
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		if (stream.IsWriting)
+		{
+			uint32_t numObjs = static_cast<uint32_t>(std::min(frames.size(), MaxAnimSyncPerMessage));
+			serialize_bits(stream, numObjs, 16);
+
+			size_t count = 0;
+			for (const auto& pair : frames)
+			{
+				if (count >= MaxAnimSyncPerMessage)
+					break;
+
+				uint64_t guid = pair.first;
+				float    frame = NetworkClamp::sanitizeAnimationFrame(pair.second);
+				serialize_GUID(stream, guid);
+				serialize_float(stream, frame);
+				++count;
+			}
+
+			serialize_bits(stream, nowLevel, 32);
+		}
+		else // reading
+		{
+			uint32_t numObjs = 0;
+			serialize_bits(stream, numObjs, 16);
+			if (numObjs > MaxAnimSyncPerMessage)
+				return false;
+
+			frames.clear();
+			for (uint32_t i = 0; i < numObjs; ++i)
+			{
+				uint64_t guid = 0;
+				float    frame = 0.0f;
+				serialize_GUID(stream, guid);
+				serialize_float(stream, frame);
+
+				if (guid != 0)
+					frames[guid] = NetworkClamp::sanitizeAnimationFrame(frame);
+			}
+
+			serialize_bits(stream, nowLevel, 32);
 			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 		}
 

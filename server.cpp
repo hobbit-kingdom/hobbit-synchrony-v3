@@ -762,6 +762,84 @@ static void broadcastSwitchToggle(Server& server, int senderIndex, SwitchToggleM
 	}
 }
 
+static void broadcastAnimSync(Server& server, int senderIndex, AnimSyncMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<AnimSyncMessage*>(
+			server.CreateMessage(i, ANIM_SYNC));
+
+		broadcast->frames = msg->frames;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastRingSync(Server& server, int senderIndex, RingSyncMessage* msg)
+{
+	uint64_t senderGuid = guidManager.getGuid(senderIndex);
+
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<RingSyncMessage*>(
+			server.CreateMessage(i, RING_SYNC));
+
+		broadcast->playerGuid = senderGuid;   // authoritative sender identity
+		broadcast->ringEquipped = msg->ringEquipped ? 1 : 0;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastSpawnObject(Server& server, int senderIndex, SpawnObjectMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<SpawnObjectMessage*>(
+			server.CreateMessage(i, SPAWN_OBJECT));
+
+		broadcast->objectGuid = msg->objectGuid;
+		broadcast->x = msg->x;
+		broadcast->y = msg->y;
+		broadcast->z = msg->z;
+		strlcpy(broadcast->templateName, msg->templateName);
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
+static void broadcastSpawnFx(Server& server, int senderIndex, SpawnFxMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<SpawnFxMessage*>(
+			server.CreateMessage(i, SPAWN_FX));
+
+		strlcpy(broadcast->fxName, msg->fxName);
+		broadcast->x = msg->x; broadcast->y = msg->y; broadcast->z = msg->z;
+		broadcast->pitch = msg->pitch; broadcast->yaw = msg->yaw; broadcast->roll = msg->roll;
+		broadcast->scaleX = msg->scaleX; broadcast->scaleY = msg->scaleY; broadcast->scaleZ = msg->scaleZ;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void processSkinAnnouncement(Server& server, int clientIndex, SkinAnnouncementMessage* msg)
 {
 	(void)msg;
@@ -875,6 +953,18 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case SWITCH_TOGGLE:
 		broadcastSwitchToggle(server, clientIndex, static_cast<SwitchToggleMessage*>(message));
+		break;
+	case ANIM_SYNC:
+		broadcastAnimSync(server, clientIndex, static_cast<AnimSyncMessage*>(message));
+		break;
+	case RING_SYNC:
+		broadcastRingSync(server, clientIndex, static_cast<RingSyncMessage*>(message));
+		break;
+	case SPAWN_OBJECT:
+		broadcastSpawnObject(server, clientIndex, static_cast<SpawnObjectMessage*>(message));
+		break;
+	case SPAWN_FX:
+		broadcastSpawnFx(server, clientIndex, static_cast<SpawnFxMessage*>(message));
 		break;
 	default:
 		break;

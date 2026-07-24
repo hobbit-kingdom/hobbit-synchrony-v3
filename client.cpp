@@ -198,6 +198,12 @@ static void applyQueuedPickupCollects();
 static void applyQueuedTriggerPressB();
 static void applyQueuedTriggerOnUse();
 static void applyQueuedSwitchToggles();
+static void applyQueuedAnimSync();
+static void detectLocalRingChange(void* bilboThis);
+static void applyPlayerRingVisuals();
+static void processLocalSpawnRequest();
+static void applyQueuedSpawns();
+static void applyQueuedFx();
 
 // Projectile::CreateProjectile(eProjectileType, owner, vector3 from, vector3 to) @ 0x004B53A0
 // type 0x19 = "Normal Rock" (Bilbo's native stone). Spawning from code avoids the
@@ -235,6 +241,28 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	applyQueuedTriggerPressB();
 	applyQueuedTriggerOnUse();
 	applyQueuedSwitchToggles();
+	applyQueuedAnimSync();
+
+	// IMPORTANT: this is a vtable hook, so OnAdvanceLogic also fires for remote
+	// players' fake-bilbo instances every frame. Run our per-frame sync logic ONLY
+	// for the LOCAL player's bilbo — otherwise detectLocalRingChange would read a
+	// different fake-bilbo's ring flag each call, thrash the state, and flood the
+	// reliable channel with RING_SYNC (which desyncs it and disconnects clients).
+	bilbo* localBilbo = *((bilbo**)X_POSITION_PTR);
+	if (pBilbo == localBilbo)
+	{
+		// Ring stealth: detect our own ring toggle to broadcast, then re-apply the
+		// stealth look to every remote player's fake-bilbo NPC.
+		detectLocalRingChange(pBilbo);
+		applyPlayerRingVisuals();
+
+		// Object spawning: run our own /spawn request, then apply remote spawns.
+		processLocalSpawnRequest();
+		applyQueuedSpawns();
+
+		// FX: play any queued local/remote fire-and-forget effects.
+		applyQueuedFx();
+	}
 
 	// update hoistables and pushblock position
 	EnterCriticalSection(&hoistablesCriticalSection);
@@ -1747,6 +1775,569 @@ static void applyQueuedSwitchToggles()
 }
 
 // ===========================================================================
+//  Animation Frame Synchronization (rigid_instance)
+// ===========================================================================
+//
+// Snaps every animated rigid_instance on the level to a common animation frame
+// once. The engine loops rigid_instance animations at a fixed rate, so a single
+// alignment keeps them in phase from that point on. Field offsets recovered from
+// the Reverse SDK (rigid_instance::SetAnimFrame @0x004C7580, GetAnimPlayer
+// @0x004C74B0, AnimDataAvailable @0x004C71A0):
+//   object        +0x008  GUID (uint64_t)
+//   object        +0x07C  type tag (uint8_t, 0x05 = rigid_instance)
+//   rigid_instance+0x140  simple_anim_player*   (0 when the object has no anim)
+//   anim_player   +0x010  current frame (float) <- the value we sync
+//   anim_player   +0x088  anim-data-valid flag  (0 => not animated)
+static constexpr uint8_t  RIGID_INSTANCE_CLASS_TAG = 0x05;
+static constexpr uint32_t RI_ANIMPLAYER_OFF = 0x140;
+static constexpr uint32_t AP_FRAME_OFF = 0x10;
+static constexpr uint32_t AP_VALID_OFF = 0x88;
+static constexpr uint32_t RI_SETANIMFRAME_ADDR = 0x004C7580;
+
+// public: void __thiscall rigid_instance::SetAnimFrame(float)
+// Sets the current frame and resets the sub-frame + event accumulators. Internally
+// guards on AnimDataAvailable(), so it is safe to call on any rigid_instance.
+typedef void(__thiscall* SetAnimFrame_t)(void* self, float frame);
+static const SetAnimFrame_t game_SetAnimFrame = reinterpret_cast<SetAnimFrame_t>(RI_SETANIMFRAME_ADDR);
+
+CRITICAL_SECTION animSyncCriticalSection;
+static std::atomic<bool> g_animSyncRequested{ false };
+static std::unordered_map<uint64_t, float> g_incomingAnimFrames;
+
+// Return the simple_anim_player pointer for an animated rigid_instance, or 0 if
+// the object is not a rigid_instance, has no anim player, or has no anim data.
+static uint32_t getRigidAnimPlayer(uint32_t objAddr)
+{
+	if (objAddr == 0 || !processAnalyzer)
+		return 0;
+	if (processAnalyzer->readData<uint8_t>(objAddr + 0x7C) != RIGID_INSTANCE_CLASS_TAG)
+		return 0;
+	uint32_t player = processAnalyzer->readData<uint32_t>(objAddr + RI_ANIMPLAYER_OFF);
+	if (player == 0)
+		return 0;
+	if (processAnalyzer->readData<uint32_t>(player + AP_VALID_OFF) == 0)
+		return 0; // AnimDataAvailable == false
+	return player;
+}
+
+// Capture the current anim frame of every animated rigid_instance and broadcast
+// it once. Runs on the network thread (like the other send* helpers); reading the
+// game's memory from here is safe (it is our own process). Triggered by /syncanim.
+static void sendAnimSync(Client& client)
+{
+	if (!g_animSyncRequested.exchange(false))
+		return;
+	if (!client.IsConnected() || !processAnalyzer || !gameManager.isOnLevel())
+		return;
+
+	std::vector<uint32_t> rigids =
+		processAnalyzer->findAllGameObjByPattern<uint8_t>(RIGID_INSTANCE_CLASS_TAG, 0x7C);
+
+	std::unordered_map<uint64_t, float> snapshot;
+	for (uint32_t addr : rigids)
+	{
+		if (snapshot.size() >= MaxAnimSyncPerMessage)
+			break;
+		uint32_t player = getRigidAnimPlayer(addr);
+		if (player == 0)
+			continue;
+		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x8);
+		if (guid == 0)
+			continue;
+		snapshot[guid] = processAnalyzer->readData<float>(player + AP_FRAME_OFF);
+	}
+
+	if (snapshot.empty())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] No animated objects found to sync.");
+		return;
+	}
+
+	auto* msg = static_cast<AnimSyncMessage*>(client.CreateMessage(ANIM_SYNC));
+	if (!msg)
+		return;
+	msg->frames = std::move(snapshot);
+	msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+	size_t sent = msg->frames.size();
+	client.SendMessage(channels::Gameplay, msg);
+
+	g_ChatOverlay.AddSystemMessage("[System] Synced animation frame of " +
+		std::to_string(sent) + " object(s) to all players.");
+	printf("Broadcast anim sync for %zu rigid_instances\n", sent);
+}
+
+// Queue an incoming anim-sync snapshot (network thread).
+static void processAnimSync(AnimSyncMessage* msg)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	EnterCriticalSection(&animSyncCriticalSection);
+	for (const auto& kv : msg->frames)
+		g_incomingAnimFrames[kv.first] = kv.second; // latest snapshot wins
+	LeaveCriticalSection(&animSyncCriticalSection);
+}
+
+// Apply queued anim-sync frames on the game thread (called from OnAdvanceLogic).
+static void applyQueuedAnimSync()
+{
+	if (!processAnalyzer)
+		return;
+
+	std::unordered_map<uint64_t, float> pending;
+	EnterCriticalSection(&animSyncCriticalSection);
+	pending.swap(g_incomingAnimFrames);
+	LeaveCriticalSection(&animSyncCriticalSection);
+
+	if (pending.empty())
+		return;
+
+	for (const auto& kv : pending)
+	{
+		uint32_t addr = processAnalyzer->findGameObjByGUID(kv.first);
+		if (addr == 0 || getRigidAnimPlayer(addr) == 0)
+			continue; // object gone, or no longer an animated rigid_instance
+		game_SetAnimFrame(reinterpret_cast<void*>(addr), kv.second);
+	}
+}
+
+// ===========================================================================
+//  Ring (One Ring) Stealth Synchronization
+// ===========================================================================
+//
+// When a player equips the One Ring, the base game turns their own bilbo mesh
+// half-transparent. We broadcast that equipped state so every peer applies the
+// same stealth look to that player's fake-bilbo NPC, tiered by the NPC's team:
+//   team 2         -> invisible / barely visible
+//   any other team -> half-transparent (matches bilbo's own ring)
+//
+// Field offsets (from the Reverse SDK):
+//   bilbo::SetRingEquipped @0x00423C90 writes bilbo+0x420 (1 = ring equipped)
+//   NPC::setTeam writes the team byte at NPCObject+0x1a4
+//   NPCObject::MakeTransparent @0x004A99A0 toggles bit 0x40 of the render-flags
+//     dword at (NPCObject+0x310)+0xe0 (verified: NPCObject::RenderGeometry gates
+//     the translucent pass on that same bit).
+static constexpr uint32_t BILBO_RING_EQUIPPED_OFF = 0x420; // bilbo+0x420: 1 = ring on
+static constexpr uint32_t NPC_TEAM_OFF = 0x1A4;            // NPCObject+0x1a4: team id (byte)
+static constexpr uint32_t NPC_RENDER_COMPONENT_OFF = 0x310; // NPCObject+0x310: render instance
+static constexpr uint32_t RENDER_FLAGS_OFF = 0xE0;        // component+0xe0: render flags dword
+static constexpr uint32_t RENDER_TRANSPARENT_BIT = 0x40;   // bit 0x40: half-transparent pass
+static constexpr uint32_t NPC_MAKETRANSPARENT_ADDR = 0x004A99A0;
+static constexpr uint8_t  RING_TEAM_INVISIBLE = 2;         // this team goes (near-)invisible
+
+// Extra render-flag bit OR'd on top of the half-transparent bit for team 2 to push
+// it toward invisible. 0x40 alone = 50%. Adjust this once confirmed in-game if a
+// stronger engine hide bit is identified; writing a render-flag bit is side-effect
+// -free (it can't crash), so experimenting here is safe.
+static constexpr uint32_t RING_TEAM2_EXTRA_HIDE_BITS = 0x40;
+
+// public: void __thiscall NPCObject::MakeTransparent(int on)
+typedef void(__thiscall* NPCMakeTransparent_t)(void* self, int on);
+static const NPCMakeTransparent_t game_NPCMakeTransparent =
+	reinterpret_cast<NPCMakeTransparent_t>(NPC_MAKETRANSPARENT_ADDR);
+
+CRITICAL_SECTION ringCriticalSection;
+static std::unordered_map<uint64_t, uint8_t> g_playerRingState; // npcGuid -> ring equipped (0/1)
+static std::atomic<int>     g_lastLocalRing{ -1 };  // last broadcast local ring state (-1 = unknown)
+static std::atomic<bool>    g_localRingDirty{ false };
+static std::atomic<uint8_t> g_localRingValue{ 0 };
+
+static void applyPlayerRingVisuals();
+
+// Read this=local bilbo's ring-equipped flag (game thread) and flag a broadcast on change.
+static void detectLocalRingChange(void* bilboThis)
+{
+	if (!bilboThis)
+		return;
+	int cur = (*reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(bilboThis) + BILBO_RING_EQUIPPED_OFF)) ? 1 : 0;
+	if (cur != g_lastLocalRing.load())
+	{
+		g_lastLocalRing.store(cur);
+		g_localRingValue.store(static_cast<uint8_t>(cur));
+		g_localRingDirty.store(true);
+	}
+}
+
+// Send the local ring state if it changed (network thread, from the client loop).
+static void sendRingSync(Client& client)
+{
+	if (!g_localRingDirty.exchange(false))
+		return;
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	auto* msg = static_cast<RingSyncMessage*>(client.CreateMessage(RING_SYNC));
+	if (!msg)
+		return;
+	msg->playerGuid = myGuid;
+	msg->ringEquipped = g_localRingValue.load();
+	msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+	client.SendMessage(channels::Gameplay, msg);
+
+	printf("Broadcast ring state: %s\n", msg->ringEquipped ? "ON" : "OFF");
+}
+
+// Store an incoming ring state (network thread). Persistent per player, so not
+// level-gated — the stealth look is a player attribute, re-applied every frame.
+static void processRingSync(RingSyncMessage* msg)
+{
+	if (msg->playerGuid == 0)
+		return;
+	EnterCriticalSection(&ringCriticalSection);
+	g_playerRingState[msg->playerGuid] = msg->ringEquipped ? 1 : 0;
+	LeaveCriticalSection(&ringCriticalSection);
+}
+
+// What same-team players look like while the ring is on. bit 0x40 (via
+// MakeTransparent) is a BINARY hide, not a 50% alpha, so a true "half" needs the
+// character material alpha (not yet pinned). Pick the reliable behaviour here:
+//   0 = fully visible (ring has no visible effect on same-team players)
+//   1 = invisible     (same as the enemy-team look)
+static constexpr int RING_SAMETEAM_MODE = 0;
+
+// Apply the ring stealth look to one NPC (game thread). Idempotent.
+// NOTE (verified in-game): NPCObject::MakeTransparent toggles bit 0x40 of the
+// CharacterObject render field at (npc+0x310)+0xe0, and that bit fully HIDES the
+// character — it is a visible/invisible switch, not a translucency level.
+static void applyRingVisual(uint32_t npcAddr, bool ringOn)
+{
+	if (!processAnalyzer || npcAddr == 0)
+		return;
+
+	if (!ringOn)
+	{
+		game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), 0); // fully visible
+		return;
+	}
+
+	uint8_t team = processAnalyzer->readData<uint8_t>(npcAddr + NPC_TEAM_OFF);
+	bool hide = (team == RING_TEAM_INVISIBLE) || (RING_SAMETEAM_MODE == 1);
+	game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), hide ? 1 : 0);
+}
+
+// Re-apply the ring stealth look to every remote player each frame (game thread).
+// Idempotent + snapshot-based, so respawns and late joiners self-correct.
+static void applyPlayerRingVisuals()
+{
+	if (!processAnalyzer)
+		return;
+
+	std::unordered_map<uint64_t, uint8_t> ringSnapshot;
+	EnterCriticalSection(&ringCriticalSection);
+	ringSnapshot = g_playerRingState;
+	LeaveCriticalSection(&ringCriticalSection);
+
+	EnterCriticalSection(&playersCriticalSection);
+	for (auto& p : activePlayers)
+	{
+		if (!p.npc)
+			continue;
+		uint32_t addr = p.npc->getObjectPtr();
+		if (addr == 0)
+			continue;
+		auto it = ringSnapshot.find(p.npcGuid);
+		bool ringOn = (it != ringSnapshot.end()) && it->second != 0;
+		applyRingVisual(addr, ringOn);
+	}
+	LeaveCriticalSection(&playersCriticalSection);
+}
+
+// ===========================================================================
+//  Rigid-Instance Spawning (synced)
+// ===========================================================================
+//
+// Recipe (from the Kingjoyer project): obj_mgr::CreateObject("RigidInstance", guid)
+// creates the object with the given GUID (pass GUID 0 to let the engine assign one
+// and read it back from the return value). Then object::OnImport(bin_in) configures
+// it from a ./Templates/<name>.export file (defines mesh/props), and object::Move
+// positions it. To sync, the spawner creates with an engine-assigned GUID and
+// broadcasts { GUID, world position, template }; every peer re-creates the object
+// with that SAME GUID and template so it stays cross-referenceable and identical.
+//
+// NOTE: the template file must exist in ./Templates/ on each client (like skins).
+// Without a template the object still spawns (bare) but has no mesh to render.
+static const char* RIGID_INSTANCE_TYPE = "RigidInstance";
+
+struct PendingSpawn
+{
+	uint64_t guid = 0;
+	float    x = 0.0f, y = 0.0f, z = 0.0f;
+	char     tmpl[64] = {};
+};
+
+CRITICAL_SECTION spawnCriticalSection;
+static std::vector<PendingSpawn> g_incomingSpawns;
+static std::vector<PendingSpawn> g_outgoingSpawns;
+static std::atomic<bool> g_localSpawnRequested{ false };
+static char g_localSpawnTemplate[64] = {};
+
+static void applyQueuedSpawns();
+static void processLocalSpawnRequest();
+
+// Configure a freshly created object: import the template (mesh/props) if present,
+// then move it to the target world position. Game thread only.
+static void configureSpawnedObject(uint64_t objectGuid, const char* tmpl, float x, float y, float z)
+{
+	object* pObj = reinterpret_cast<object*>(
+		static_cast<uintptr_t>(processAnalyzer->findGameObjByGUID(objectGuid)));
+	if (!pObj)
+		return;
+
+	// Load the template only if the name is a plain file name — reject path
+	// separators / traversal so a peer's spawn can't make us read arbitrary files.
+	if (tmpl && tmpl[0]
+		&& !strchr(tmpl, '/') && !strchr(tmpl, '\\') && !strchr(tmpl, ':')
+		&& !strstr(tmpl, ".."))
+	{
+		char path[300];
+		sprintf_s(path, sizeof(path), "./Templates/%s", tmpl);
+		bin_in BinIn{};
+		if (BinIn.OpenFile(path) && BinIn.ReadHeader() && BinIn.ReadFields())
+			pObj->OnImport(BinIn);
+	}
+
+	vector3 P{ x, y, z };
+	pObj->Move(P, 1);
+}
+
+// Create a RigidInstance with an explicit (shared) GUID for an incoming spawn.
+// Idempotent: skips if an object with that GUID already exists locally.
+static void spawnRemoteRigidInstance(uint64_t objectGuid, const char* tmpl, float x, float y, float z)
+{
+	if (!processAnalyzer || objectGuid == 0)
+		return;
+	if (processAnalyzer->findGameObjByGUID(objectGuid) != 0)
+		return; // already spawned
+
+	guid gid;
+	gid.Guid = objectGuid;
+	g_ObjMgr.CreateObject(RIGID_INSTANCE_TYPE, gid); // force the shared GUID
+	configureSpawnedObject(objectGuid, tmpl, x, y, z);
+}
+
+// Handle the local /spawn request on the game thread: create locally (engine
+// assigns a GUID), configure it, then queue a broadcast so peers spawn the same.
+static void processLocalSpawnRequest()
+{
+	if (!g_localSpawnRequested.exchange(false))
+		return;
+	if (!processAnalyzer || !gameManager.isOnLevel() || myGuid == 0)
+		return;
+
+	char tmpl[64];
+	EnterCriticalSection(&spawnCriticalSection);
+	memcpy(tmpl, g_localSpawnTemplate, sizeof(tmpl));
+	LeaveCriticalSection(&spawnCriticalSection);
+	tmpl[sizeof(tmpl) - 1] = 0;
+
+	guid zero;
+	zero.Guid = 0;
+	guid created = g_ObjMgr.CreateObject(RIGID_INSTANCE_TYPE, zero); // engine assigns GUID
+	if (created.Guid == 0)
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Spawn failed (CreateObject returned 0).");
+		return;
+	}
+
+	// Spawn just in front of / beside the player (matches Kingjoyer's offset).
+	Vector3 bp = getBilboPos();
+	float x = bp.x + 50.0f;
+	float y = bp.y;
+	float z = bp.z + 50.0f;
+
+	configureSpawnedObject(created.Guid, tmpl, x, y, z);
+
+	PendingSpawn ps;
+	ps.guid = created.Guid;
+	ps.x = x; ps.y = y; ps.z = z;
+	memcpy(ps.tmpl, tmpl, sizeof(ps.tmpl));
+
+	EnterCriticalSection(&spawnCriticalSection);
+	g_outgoingSpawns.push_back(ps);
+	LeaveCriticalSection(&spawnCriticalSection);
+
+	g_ChatOverlay.AddSystemMessage("[System] Spawned rigid instance (synced to all players).");
+	printf("Spawned RigidInstance GUID %llu, broadcasting\n", created.Guid);
+}
+
+// Send any queued local spawns to peers (network thread, from the client loop).
+static void sendSpawns(Client& client)
+{
+	std::vector<PendingSpawn> out;
+	EnterCriticalSection(&spawnCriticalSection);
+	out.swap(g_outgoingSpawns);
+	LeaveCriticalSection(&spawnCriticalSection);
+
+	for (const auto& s : out)
+	{
+		if (!client.IsConnected())
+			break;
+		auto* msg = static_cast<SpawnObjectMessage*>(client.CreateMessage(SPAWN_OBJECT));
+		if (!msg)
+			continue;
+		msg->objectGuid = s.guid;
+		msg->x = s.x; msg->y = s.y; msg->z = s.z;
+		strlcpy(msg->templateName, s.tmpl);
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Queue an incoming spawn (network thread).
+static void processSpawnObject(SpawnObjectMessage* msg)
+{
+	if (msg->nowLevel != nowLevel || msg->objectGuid == 0)
+		return;
+
+	PendingSpawn ps;
+	ps.guid = msg->objectGuid;
+	ps.x = msg->x; ps.y = msg->y; ps.z = msg->z;
+	strncpy(ps.tmpl, msg->templateName, sizeof(ps.tmpl));
+	ps.tmpl[sizeof(ps.tmpl) - 1] = 0;
+
+	EnterCriticalSection(&spawnCriticalSection);
+	g_incomingSpawns.push_back(ps);
+	LeaveCriticalSection(&spawnCriticalSection);
+}
+
+// Apply queued remote spawns on the game thread.
+static void applyQueuedSpawns()
+{
+	if (!processAnalyzer)
+		return;
+
+	std::vector<PendingSpawn> pending;
+	EnterCriticalSection(&spawnCriticalSection);
+	pending.swap(g_incomingSpawns);
+	LeaveCriticalSection(&spawnCriticalSection);
+
+	for (const auto& s : pending)
+		spawnRemoteRigidInstance(s.guid, s.tmpl, s.x, s.y, s.z);
+}
+
+// ===========================================================================
+//  FX Spawning (fire-and-forget, synced)
+// ===========================================================================
+//
+// fx_object::FireAndForget(name, pos, rot, scale) @ 0x00488D30 plays a one-shot
+// effect that auto-destroys — so no GUID/lifetime sync is needed, each client
+// simply plays it. SpawnFxSynced() plays the effect locally AND broadcasts it so
+// every peer plays the same effect; call it from a future trigger.
+static constexpr uint32_t FX_FIREANDFORGET_ADDR = 0x00488D30;
+
+// static u64 __cdecl fx_object::FireAndForget(const char*, vector3&, radian3&, vector3&)
+// References are passed as pointers by the ABI.
+typedef uint64_t(__cdecl* FxFireAndForget_t)(const char* name, const vector3* pos,
+	const radian3* rot, const vector3* scale);
+static const FxFireAndForget_t game_fxFireAndForget =
+	reinterpret_cast<FxFireAndForget_t>(FX_FIREANDFORGET_ADDR);
+
+struct PendingFx
+{
+	char  name[64] = {};
+	float x = 0.0f, y = 0.0f, z = 0.0f;
+	float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
+	float scaleX = 1.0f, scaleY = 1.0f, scaleZ = 1.0f;
+};
+
+CRITICAL_SECTION fxCriticalSection;
+static std::vector<PendingFx> g_incomingFx;   // to play locally (remote + own)
+static std::vector<PendingFx> g_outgoingFx;   // to broadcast to peers
+
+static void applyQueuedFx();
+
+// Play one FX now (game thread only — calls the engine directly).
+static void playFxLocal(const PendingFx& fx)
+{
+	if (fx.name[0] == 0)
+		return;
+	vector3 pos{ fx.x, fx.y, fx.z };
+	radian3 rot{ fx.pitch, fx.yaw, fx.roll };
+	vector3 scale{ fx.scaleX, fx.scaleY, fx.scaleZ };
+	game_fxFireAndForget(fx.name, &pos, &rot, &scale);
+}
+
+// PUBLIC: play an FX locally and broadcast it to all peers. Safe to call from any
+// thread — the local play is deferred to the game thread. This is the entry point
+// a future trigger should call.
+static void SpawnFxSynced(const char* name, float x, float y, float z,
+	float pitch = 0.0f, float yaw = 0.0f, float roll = 0.0f,
+	float scaleX = 1.0f, float scaleY = 1.0f, float scaleZ = 1.0f)
+{
+	if (!name || name[0] == 0)
+		return;
+
+	PendingFx fx;
+	strncpy(fx.name, name, sizeof(fx.name));
+	fx.name[sizeof(fx.name) - 1] = 0;
+	fx.x = x; fx.y = y; fx.z = z;
+	fx.pitch = pitch; fx.yaw = yaw; fx.roll = roll;
+	fx.scaleX = scaleX; fx.scaleY = scaleY; fx.scaleZ = scaleZ;
+
+	EnterCriticalSection(&fxCriticalSection);
+	g_incomingFx.push_back(fx);   // play on our own screen
+	g_outgoingFx.push_back(fx);   // and send to everyone else
+	LeaveCriticalSection(&fxCriticalSection);
+}
+
+// Send any queued FX spawns to peers (network thread, from the client loop).
+static void sendFxSpawns(Client& client)
+{
+	std::vector<PendingFx> out;
+	EnterCriticalSection(&fxCriticalSection);
+	out.swap(g_outgoingFx);
+	LeaveCriticalSection(&fxCriticalSection);
+
+	for (const auto& fx : out)
+	{
+		if (!client.IsConnected())
+			break;
+		auto* msg = static_cast<SpawnFxMessage*>(client.CreateMessage(SPAWN_FX));
+		if (!msg)
+			continue;
+		strlcpy(msg->fxName, fx.name);
+		msg->x = fx.x; msg->y = fx.y; msg->z = fx.z;
+		msg->pitch = fx.pitch; msg->yaw = fx.yaw; msg->roll = fx.roll;
+		msg->scaleX = fx.scaleX; msg->scaleY = fx.scaleY; msg->scaleZ = fx.scaleZ;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Queue an incoming FX spawn (network thread).
+static void processSpawnFx(SpawnFxMessage* msg)
+{
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	PendingFx fx;
+	strncpy(fx.name, msg->fxName, sizeof(fx.name));
+	fx.name[sizeof(fx.name) - 1] = 0;
+	fx.x = msg->x; fx.y = msg->y; fx.z = msg->z;
+	fx.pitch = msg->pitch; fx.yaw = msg->yaw; fx.roll = msg->roll;
+	fx.scaleX = msg->scaleX; fx.scaleY = msg->scaleY; fx.scaleZ = msg->scaleZ;
+
+	EnterCriticalSection(&fxCriticalSection);
+	g_incomingFx.push_back(fx);
+	LeaveCriticalSection(&fxCriticalSection);
+}
+
+// Play all queued FX on the game thread.
+static void applyQueuedFx()
+{
+	std::vector<PendingFx> pending;
+	EnterCriticalSection(&fxCriticalSection);
+	pending.swap(g_incomingFx);
+	LeaveCriticalSection(&fxCriticalSection);
+
+	if (pending.empty() || !gameManager.isOnLevel())
+		return;
+
+	for (const auto& fx : pending)
+		playFxLocal(fx);
+}
+
+// ===========================================================================
 //  Server IP Config
 // ===========================================================================
 
@@ -2507,6 +3098,18 @@ static void processMessage(Client& client, Message* message, double time)
 	case SWITCH_TOGGLE:
 		if (gameManager.isOnLevel()) processSwitchToggle(static_cast<SwitchToggleMessage*>(message));
 		break;
+	case ANIM_SYNC:
+		if (gameManager.isOnLevel()) processAnimSync(static_cast<AnimSyncMessage*>(message));
+		break;
+	case RING_SYNC:
+		processRingSync(static_cast<RingSyncMessage*>(message));
+		break;
+	case SPAWN_OBJECT:
+		if (gameManager.isOnLevel()) processSpawnObject(static_cast<SpawnObjectMessage*>(message));
+		break;
+	case SPAWN_FX:
+		if (gameManager.isOnLevel()) processSpawnFx(static_cast<SpawnFxMessage*>(message));
+		break;
 
 	default:
 		break;
@@ -2639,6 +3242,73 @@ static void ChatCommandSetTeam(const std::string& team)
 	g_ChatOverlay.AddSystemMessage("[System] Team set to " + std::to_string(teamId) + ".");
 }
 
+// Broadcast this peer's current animation frames for every animated object on the
+// level. Everyone else snaps to them once; looping keeps them in sync afterward.
+static void ChatCommandSyncAnim(const std::string&)
+{
+	if (!g_Client || myGuid == 0)
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Not connected.");
+		return;
+	}
+	if (!gameManager.isOnLevel())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Not on a level.");
+		return;
+	}
+
+	// The actual capture + send runs on the network thread in the client loop.
+	g_animSyncRequested.store(true);
+	g_ChatOverlay.AddSystemMessage("[System] Syncing animation frames...");
+}
+
+// Spawn a RigidInstance (synced to all players). Optional arg = template file name
+// in ./Templates/ (e.g. "/spawn barrel.export"); with no arg a bare object spawns.
+static void ChatCommandSpawn(const std::string& templateArg)
+{
+	if (!g_Client || myGuid == 0)
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Not connected.");
+		return;
+	}
+	if (!gameManager.isOnLevel())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Not on a level.");
+		return;
+	}
+
+	std::string t = sanitizeIdentityValue(templateArg, sizeof(g_localSpawnTemplate));
+
+	EnterCriticalSection(&spawnCriticalSection);
+	strlcpy(g_localSpawnTemplate, t.c_str());
+	LeaveCriticalSection(&spawnCriticalSection);
+
+	// The actual spawn + broadcast runs on the game thread (calls engine functions).
+	g_localSpawnRequested.store(true);
+	g_ChatOverlay.AddSystemMessage(t.empty()
+		? "[System] Spawning rigid instance..."
+		: ("[System] Spawning rigid instance from " + t + "..."));
+}
+
+// Test trigger for the FX packet: play an FX (default "fx_fire") near the player
+// and broadcast it to everyone. The "real" trigger will call SpawnFxSynced directly.
+static void ChatCommandSpawnFx(const std::string& fxArg)
+{
+	if (!g_Client || myGuid == 0 || !gameManager.isOnLevel())
+	{
+		g_ChatOverlay.AddSystemMessage("[System] Not connected / not on a level.");
+		return;
+	}
+
+	std::string name = sanitizeIdentityValue(fxArg, sizeof(SpawnFxMessage::fxName));
+	if (name.empty())
+		name = "fx_fire";
+
+	Vector3 bp = getBilboPos();
+	SpawnFxSynced(name.c_str(), bp.x + 100.0f, bp.y, bp.z);
+	g_ChatOverlay.AddSystemMessage("[System] Spawned FX '" + name + "' (synced).");
+}
+
 // ===========================================================================
 //  Client Main Loop
 // ===========================================================================
@@ -2666,6 +3336,9 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
+	g_ChatOverlay.AddCommand("/syncanim", "- Sync animation frame of all animated objects on the level", ChatCommandSyncAnim);
+	g_ChatOverlay.AddCommand("/spawn", "[template] - Spawn a rigid instance (synced to all players)", ChatCommandSpawn);
+	g_ChatOverlay.AddCommand("/spawnfx", "[fxName] - Play an FX effect (synced to all players)", ChatCommandSpawnFx);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
@@ -2678,6 +3351,10 @@ static int clientMain()
 	InitializeCriticalSection(&pickupCriticalSection);
 	InitializeCriticalSection(&triggerCriticalSection);
 	InitializeCriticalSection(&switchCriticalSection);
+	InitializeCriticalSection(&animSyncCriticalSection);
+	InitializeCriticalSection(&ringCriticalSection);
+	InitializeCriticalSection(&spawnCriticalSection);
+	InitializeCriticalSection(&fxCriticalSection);
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
@@ -2860,6 +3537,18 @@ static int clientMain()
 					// Detect and send switch toggle events
 					detectSwitchChanges();
 					sendSwitchToggles(client);
+
+					// Send a one-shot animation-frame sync if /syncanim was used
+					sendAnimSync(client);
+
+					// Broadcast our ring state when it changes
+					sendRingSync(client);
+
+					// Broadcast any objects we spawned via /spawn
+					sendSpawns(client);
+
+					// Broadcast any FX effects triggered locally
+					sendFxSpawns(client);
 				}
 
 				if (g_time - lastSend > NetDefaults::SEND_INTERVAL && gameManager.isOnLevel())
