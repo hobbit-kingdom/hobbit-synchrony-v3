@@ -412,6 +412,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 void InstallStoneHook();   // forward decl (defined further below)
 void InstallChestHook();   // forward decl (defined further below)
+void InstallFxHook();      // forward decl (defined further below)
 void InstallWebWallHook(); // forward decl (defined further below)
 
 void SetupBilboHook(void)
@@ -432,6 +433,7 @@ void SetupBilboHook(void)
 
 	InstallStoneHook();   // detour bilbo::CreateStoneProjectile to capture throw destination
 	InstallChestHook();   // detour treasure_chest::Open to replicate opened chests
+	InstallFxHook();      // detour fx_object::FireAndForget to sync lockpick-failure explosions
 	InstallWebWallHook(); // detour web_wall::StartBreakAtPoint to capture web cuts
 }
 
@@ -2246,7 +2248,11 @@ static std::vector<PendingFx> g_outgoingFx;   // to broadcast to peers
 
 static void applyQueuedFx();
 
+static FxFireAndForget_t oFxFireAndForget = nullptr;   // set by InstallFxHook (trampoline)
+
 // Play one FX now (game thread only — calls the engine directly).
+// NOTE: goes through the hook TRAMPOLINE when the FX hook is installed, so replaying
+// a remote effect never re-enters our hook and gets re-broadcast (no echo storm).
 static void playFxLocal(const PendingFx& fx)
 {
 	if (fx.name[0] == 0)
@@ -2254,7 +2260,28 @@ static void playFxLocal(const PendingFx& fx)
 	vector3 pos{ fx.x, fx.y, fx.z };
 	radian3 rot{ fx.pitch, fx.yaw, fx.roll };
 	vector3 scale{ fx.scaleX, fx.scaleY, fx.scaleZ };
-	game_fxFireAndForget(fx.name, &pos, &rot, &scale);
+	FxFireAndForget_t fn = oFxFireAndForget ? oFxFireAndForget : game_fxFireAndForget;
+	fn(fx.name, &pos, &rot, &scale);
+}
+
+// Queue an FX for the network only (our own screen already shows it).
+static void BroadcastFxOnly(const char* name, float x, float y, float z,
+	float pitch, float yaw, float roll,
+	float scaleX, float scaleY, float scaleZ)
+{
+	if (!name || name[0] == 0)
+		return;
+
+	PendingFx fx;
+	strncpy(fx.name, name, sizeof(fx.name));
+	fx.name[sizeof(fx.name) - 1] = 0;
+	fx.x = x; fx.y = y; fx.z = z;
+	fx.pitch = pitch; fx.yaw = yaw; fx.roll = roll;
+	fx.scaleX = scaleX; fx.scaleY = scaleY; fx.scaleZ = scaleZ;
+
+	EnterCriticalSection(&fxCriticalSection);
+	g_outgoingFx.push_back(fx);
+	LeaveCriticalSection(&fxCriticalSection);
 }
 
 // PUBLIC: play an FX locally and broadcast it to all peers. Safe to call from any
@@ -2279,6 +2306,59 @@ static void SpawnFxSynced(const char* name, float x, float y, float z,
 	g_outgoingFx.push_back(fx);   // and send to everyone else
 	LeaveCriticalSection(&fxCriticalSection);
 }
+
+// ---------------------------------------------------------------------------
+// Chest lockpick-failure FX sync
+// ---------------------------------------------------------------------------
+// When the lockpick minigame fails, dlg_pickLock::OnUpdate plays an explosion on
+// the failing player's screen only. dlg_pickLock::OnUpdate is the ONLY function in
+// the game that spawns "ExplosionSmall" / "PoisonSpitImpact" (verified across all
+// 14,860 functions), so those effect names are a precise signal for "the local
+// player just failed a chest lockpick" — no false positives elsewhere.
+//
+// We hook the engine's FX spawner and, when one of those effects plays locally,
+// broadcast it so every peer sees the same explosion at the same spot with the
+// exact position/rotation/scale the game itself computed.
+static const char* const kSyncedFxNames[] = { "ExplosionSmall", "PoisonSpitImpact" };
+
+static bool isSyncedFxName(const char* n)
+{
+	if (!n)
+		return false;
+	for (const char* s : kSyncedFxNames)
+		if (strcmp(n, s) == 0)
+			return true;
+	return false;
+}
+
+static uint64_t __cdecl hkFxFireAndForget(const char* name, const vector3* pos,
+	const radian3* rot, const vector3* scale)
+{
+	uint64_t result = oFxFireAndForget(name, pos, rot, scale);
+
+	// Only broadcast the pickLock failure effects, and only ones WE triggered.
+	// (Remote FX are replayed through the trampoline below, so they never re-enter
+	// this hook — no echo storm.)
+	if (pos && isSyncedFxName(name))
+	{
+		BroadcastFxOnly(name, pos->X, pos->Y, pos->Z,
+			rot ? rot->X : 0.0f, rot ? rot->Y : 0.0f, rot ? rot->Z : 0.0f,
+			scale ? scale->X : 1.0f, scale ? scale->Y : 1.0f, scale ? scale->Z : 1.0f);
+		printf("Chest lockpick failed - broadcasting '%s'\n", name);
+	}
+
+	return result;
+}
+
+void InstallFxHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+	void* target = reinterpret_cast<void*>(FX_FIREANDFORGET_ADDR); // fx_object::FireAndForget
+	MH_CreateHook(target, &hkFxFireAndForget,
+		reinterpret_cast<void**>(&oFxFireAndForget));
+	MH_EnableHook(target);
+}
+
 
 // Send any queued FX spawns to peers (network thread, from the client loop).
 static void sendFxSpawns(Client& client)
