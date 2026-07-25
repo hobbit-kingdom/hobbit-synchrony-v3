@@ -1964,28 +1964,19 @@ static void applyQueuedAnimSync()
 // When a player equips the One Ring, the base game turns their own bilbo mesh
 // half-transparent. We broadcast that equipped state so every peer applies the
 // same stealth look to that player's fake-bilbo NPC, tiered by the NPC's team:
-//   team 2         -> invisible / barely visible
-//   any other team -> half-transparent (matches bilbo's own ring)
+//   any team -> character mesh is UNRENDERED
+//   team 2   -> also loses its floating nickname + status labels
 //
 // Field offsets (from the Reverse SDK):
 //   bilbo::SetRingEquipped @0x00423C90 writes bilbo+0x420 (1 = ring equipped)
 //   NPC::setTeam writes the team byte at NPCObject+0x1a4
-//   NPCObject::MakeTransparent @0x004A99A0 toggles bit 0x40 of the render-flags
-//     dword at (NPCObject+0x310)+0xe0 (verified: NPCObject::RenderGeometry gates
-//     the translucent pass on that same bit).
+//   NPCObject::MakeTransparent @0x004A99A0 toggles bit 0x40 of the render field at
+//     (NPCObject+0x310)+0xe0. That component is a CharacterObject, and the bit is a
+//     BINARY visible/invisible switch — confirmed in-game, it is not an alpha level.
 static constexpr uint32_t BILBO_RING_EQUIPPED_OFF = 0x420; // bilbo+0x420: 1 = ring on
 static constexpr uint32_t NPC_TEAM_OFF = 0x1A4;            // NPCObject+0x1a4: team id (byte)
-static constexpr uint32_t NPC_RENDER_COMPONENT_OFF = 0x310; // NPCObject+0x310: render instance
-static constexpr uint32_t RENDER_FLAGS_OFF = 0xE0;        // component+0xe0: render flags dword
-static constexpr uint32_t RENDER_TRANSPARENT_BIT = 0x40;   // bit 0x40: half-transparent pass
 static constexpr uint32_t NPC_MAKETRANSPARENT_ADDR = 0x004A99A0;
-static constexpr uint8_t  RING_TEAM_INVISIBLE = 2;         // this team goes (near-)invisible
-
-// Extra render-flag bit OR'd on top of the half-transparent bit for team 2 to push
-// it toward invisible. 0x40 alone = 50%. Adjust this once confirmed in-game if a
-// stronger engine hide bit is identified; writing a render-flag bit is side-effect
-// -free (it can't crash), so experimenting here is safe.
-static constexpr uint32_t RING_TEAM2_EXTRA_HIDE_BITS = 0x40;
+static constexpr uint8_t  RING_TEAM_HIDE_LABELS = 2;       // this team also loses its labels
 
 // public: void __thiscall NPCObject::MakeTransparent(int on)
 typedef void(__thiscall* NPCMakeTransparent_t)(void* self, int on);
@@ -2044,31 +2035,37 @@ static void processRingSync(RingSyncMessage* msg)
 	LeaveCriticalSection(&ringCriticalSection);
 }
 
-// What same-team players look like while the ring is on. bit 0x40 (via
-// MakeTransparent) is a BINARY hide, not a 50% alpha, so a true "half" needs the
-// character material alpha (not yet pinned). Pick the reliable behaviour here:
-//   0 = fully visible (ring has no visible effect on same-team players)
-//   1 = invisible     (same as the enemy-team look)
-static constexpr int RING_SAMETEAM_MODE = 0;
-
-// Apply the ring stealth look to one NPC (game thread). Idempotent.
-// NOTE (verified in-game): NPCObject::MakeTransparent toggles bit 0x40 of the
-// CharacterObject render field at (npc+0x310)+0xe0, and that bit fully HIDES the
-// character — it is a visible/invisible switch, not a translucency level.
-static void applyRingVisual(uint32_t npcAddr, bool ringOn)
+// Ring stealth look, per team:
+//   any team -> character is UNRENDERED (NPCObject::MakeTransparent bit 0x40 is a
+//               binary visible/invisible switch, verified in-game — not an alpha)
+//   team 2   -> additionally hide the floating nickname + status labels, so the
+//               player leaves no trace at all
+//
+// Applied every frame and fully idempotent, so it self-corrects after respawns,
+// late joins, or a nickname/status update writing the labels back.
+static void applyRingVisual(Player& p, bool ringOn)
 {
-	if (!processAnalyzer || npcAddr == 0)
+	if (!processAnalyzer || !p.npc)
+		return;
+	uint32_t npcAddr = p.npc->getObjectPtr();
+	if (npcAddr == 0)
 		return;
 
-	if (!ringOn)
+	// Character mesh: hidden whenever the ring is on, for every team.
+	game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), ringOn ? 1 : 0);
+
+	// Labels: only team 2 loses them, and only while the ring is on.
+	bool hideLabels = false;
+	if (ringOn)
 	{
-		game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), 0); // fully visible
-		return;
+		uint8_t team = processAnalyzer->readData<uint8_t>(npcAddr + NPC_TEAM_OFF);
+		hideLabels = (team == RING_TEAM_HIDE_LABELS);
 	}
 
-	uint8_t team = processAnalyzer->readData<uint8_t>(npcAddr + NPC_TEAM_OFF);
-	bool hide = (team == RING_TEAM_INVISIBLE) || (RING_SAMETEAM_MODE == 1);
-	game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), hide ? 1 : 0);
+	if (p.nickname_marker)
+		p.nickname_marker->setText(hideLabels ? "" : p.nickname.c_str());
+	if (p.status_marker)
+		p.status_marker->setText(hideLabels ? "" : p.status.c_str());
 }
 
 // Re-apply the ring stealth look to every remote player each frame (game thread).
@@ -2086,14 +2083,9 @@ static void applyPlayerRingVisuals()
 	EnterCriticalSection(&playersCriticalSection);
 	for (auto& p : activePlayers)
 	{
-		if (!p.npc)
-			continue;
-		uint32_t addr = p.npc->getObjectPtr();
-		if (addr == 0)
-			continue;
 		auto it = ringSnapshot.find(p.npcGuid);
 		bool ringOn = (it != ringSnapshot.end()) && it->second != 0;
-		applyRingVisual(addr, ringOn);
+		applyRingVisual(p, ringOn);
 	}
 	LeaveCriticalSection(&playersCriticalSection);
 }
