@@ -1806,20 +1806,64 @@ CRITICAL_SECTION animSyncCriticalSection;
 static std::atomic<bool> g_animSyncRequested{ false };
 static std::unordered_map<uint64_t, float> g_incomingAnimFrames;
 
-// Return the simple_anim_player pointer for an animated rigid_instance, or 0 if
-// the object is not a rigid_instance, has no anim player, or has no anim data.
-static uint32_t getRigidAnimPlayer(uint32_t objAddr)
+// Engine object list (same globals HobbitProcessAnalyzer uses).
+static constexpr uint32_t OBJ_LIST_PTR_ADDR   = 0x0076F648; // -> object records
+static constexpr uint32_t OBJ_LIST_COUNT_ADDR = 0x0076F660; // record count
+static constexpr uint32_t OBJ_RECORD_SIZE     = 0x14;       // stride per record
+static constexpr uint32_t MAX_SCAN_OBJECTS    = 65536;      // sanity bound
+static constexpr uint32_t MAX_ANIM_ENTRIES    = 4096;       // scratch capacity
+
+struct AnimObjEntry
 {
-	if (objAddr == 0 || !processAnalyzer)
-		return 0;
-	if (processAnalyzer->readData<uint8_t>(objAddr + 0x7C) != RIGID_INSTANCE_CLASS_TAG)
-		return 0;
-	uint32_t player = processAnalyzer->readData<uint32_t>(objAddr + RI_ANIMPLAYER_OFF);
-	if (player == 0)
-		return 0;
-	if (processAnalyzer->readData<uint32_t>(player + AP_VALID_OFF) == 0)
-		return 0; // AnimDataAvailable == false
-	return player;
+	uint32_t addr;   // rigid_instance*
+	uint64_t guid;   // object GUID
+	float    frame;  // current anim frame
+};
+
+// One direct pass over the engine's object list collecting every ANIMATED
+// rigid_instance. Used by both the sender (needs guid+frame) and the receiver
+// (needs addr+guid), so the whole feature costs a single O(N) walk per side.
+//
+// Reads are plain pointer dereferences: this DLL is injected INTO the game, so
+// ReadProcessMemory would be a kernel transition for memory we already own — it was
+// costing two syscalls per object, per lookup.
+//
+// POD-only and SEH-guarded on purpose: every game-memory dereference lives in here,
+// and __try cannot be used in a function that requires C++ object unwinding.
+static uint32_t snapshotAnimatedRigids(AnimObjEntry* out, uint32_t maxOut)
+{
+	uint32_t n = 0;
+	__try
+	{
+		uint32_t listAddr = *reinterpret_cast<uint32_t*>(OBJ_LIST_PTR_ADDR);
+		uint32_t count    = *reinterpret_cast<uint32_t*>(OBJ_LIST_COUNT_ADDR);
+		if (listAddr == 0 || count == 0 || count > MAX_SCAN_OBJECTS)
+			return 0;
+
+		for (uint32_t i = 0; i < count && n < maxOut; ++i)
+		{
+			uint32_t objAddr = *reinterpret_cast<uint32_t*>(listAddr + i * OBJ_RECORD_SIZE);
+			if (objAddr < 0x400000)                                    // unset / bogus slot
+				continue;
+			if (*reinterpret_cast<uint8_t*>(objAddr + 0x7C) != RIGID_INSTANCE_CLASS_TAG)
+				continue;                                              // not a rigid_instance
+			uint32_t player = *reinterpret_cast<uint32_t*>(objAddr + RI_ANIMPLAYER_OFF);
+			if (player == 0)
+				continue;                                              // no anim player
+			if (*reinterpret_cast<uint32_t*>(player + AP_VALID_OFF) == 0)
+				continue;                                              // AnimDataAvailable == false
+
+			out[n].addr  = objAddr;
+			out[n].guid  = *reinterpret_cast<uint64_t*>(objAddr + 0x8);
+			out[n].frame = *reinterpret_cast<float*>(player + AP_FRAME_OFF);
+			++n;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf("anim scan raised an exception - suppressed (%u collected)\n", n);
+	}
+	return n;
 }
 
 // Capture the current anim frame of every animated rigid_instance and broadcast
@@ -1832,21 +1876,22 @@ static void sendAnimSync(Client& client)
 	if (!client.IsConnected() || !processAnalyzer || !gameManager.isOnLevel())
 		return;
 
-	std::vector<uint32_t> rigids =
-		processAnalyzer->findAllGameObjByPattern<uint8_t>(RIGID_INSTANCE_CLASS_TAG, 0x7C);
+	static std::vector<AnimObjEntry> scan(MAX_ANIM_ENTRIES);
+	uint32_t found = snapshotAnimatedRigids(scan.data(), MAX_ANIM_ENTRIES);
 
 	std::unordered_map<uint64_t, float> snapshot;
-	for (uint32_t addr : rigids)
+	for (uint32_t i = 0; i < found; ++i)
 	{
 		if (snapshot.size() >= MaxAnimSyncPerMessage)
 			break;
-		uint32_t player = getRigidAnimPlayer(addr);
-		if (player == 0)
+		if (scan[i].guid == 0)
 			continue;
-		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x8);
-		if (guid == 0)
-			continue;
-		snapshot[guid] = processAnalyzer->readData<float>(player + AP_FRAME_OFF);
+		snapshot[scan[i].guid] = scan[i].frame;
+	}
+	if (found > MaxAnimSyncPerMessage)
+	{
+		printf("anim sync: %u animated objects found, capped at %zu\n",
+			found, MaxAnimSyncPerMessage);
 	}
 
 	if (snapshot.empty())
@@ -1881,11 +1926,13 @@ static void processAnimSync(AnimSyncMessage* msg)
 }
 
 // Apply queued anim-sync frames on the game thread (called from OnAdvanceLogic).
+//
+// Walks the object list ONCE and looks each object's GUID up in the received map
+// (O(1) per object). The previous version searched the entire object list for every
+// synced object — O(M*N) with two syscalls per step, which stalled the frame for
+// ~half a second on a busy level. This is O(N) with no syscalls at all.
 static void applyQueuedAnimSync()
 {
-	if (!processAnalyzer)
-		return;
-
 	std::unordered_map<uint64_t, float> pending;
 	EnterCriticalSection(&animSyncCriticalSection);
 	pending.swap(g_incomingAnimFrames);
@@ -1894,13 +1941,20 @@ static void applyQueuedAnimSync()
 	if (pending.empty())
 		return;
 
-	for (const auto& kv : pending)
+	static std::vector<AnimObjEntry> scan(MAX_ANIM_ENTRIES);
+	uint32_t found = snapshotAnimatedRigids(scan.data(), MAX_ANIM_ENTRIES);
+
+	uint32_t applied = 0;
+	for (uint32_t i = 0; i < found; ++i)
 	{
-		uint32_t addr = processAnalyzer->findGameObjByGUID(kv.first);
-		if (addr == 0 || getRigidAnimPlayer(addr) == 0)
-			continue; // object gone, or no longer an animated rigid_instance
-		game_SetAnimFrame(reinterpret_cast<void*>(addr), kv.second);
+		auto it = pending.find(scan[i].guid);
+		if (it == pending.end())
+			continue;   // not part of this snapshot
+		game_SetAnimFrame(reinterpret_cast<void*>(scan[i].addr), it->second);
+		++applied;
 	}
+
+	printf("anim sync applied to %u/%zu object(s)\n", applied, pending.size());
 }
 
 // ===========================================================================
