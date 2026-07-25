@@ -433,6 +433,14 @@ void NPC::setAIMode(int mode)
 	}
 }
 
+void NPC::restoreAIState()
+{
+	if (!isAnalyzerReady() || !isValid())
+		return;
+
+	*((uint8_t*)getObjectPtr() + 0x268) = initialAIState;
+}
+
 void NPC::setTeam(int teamId)
 {
 	if (!isAnalyzerReady() || !isValid())
@@ -444,6 +452,22 @@ void NPC::setTeam(int teamId)
 
 	*pointerTeamId = teamId;
 
+}
+
+int NPC::getTeam() const
+{
+	if (!analyzer_ || objectAddress_ == 0)
+		return 0;
+
+	return (int)analyzer_->readData<uint32_t>(objectAddress_ + OBJ_TEAM_OFFSET);
+}
+
+bool NPC::isNpcType() const
+{
+	if (!analyzer_ || objectAddress_ == 0)
+		return false;
+
+	return analyzer_->readData<uint8_t>(objectAddress_ + OBJ_TYPE_OFFSET) == OBJ_TYPE_NPC;
 }
 
 bool NPC::isActivated() const

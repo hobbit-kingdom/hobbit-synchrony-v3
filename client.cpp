@@ -108,10 +108,21 @@ CRITICAL_SECTION enemiesCriticalSection;
 std::unordered_map<uint64_t, Enemy> enemy_updates;
 bool enemies_updated = false;
 
+// Every NPC on the level, keyed by GUID — including neutral ones. Which of them are
+// actually synced is decided per tick from their current team, not at discovery time.
 std::unordered_map<uint64_t, NPC*> enemies;
 const uint32_t X_POSITION_PTR = 0x0075BA3C; // address of bilbo *g_pBilbo variable
 
+// Class signature the engine stamps into object+0x10 for NPC objects (from the
+// obj_mgr class registry entry for type tag 0x1C).
+static constexpr uint32_t NPC_CLASS_SIGNATURE = 0x04004232;
+
 static int g_enemies_ai_mode = 0;
+
+// NPCs whose local AI we switched off because they were on a synced team. Kept so
+// that if a scripted event drops one back to neutral we can hand it back to its own
+// AI, and so we never re-enable AI on an NPC we never touched.
+static std::unordered_set<uint64_t> g_aiSuppressed;
 
 struct HoistableUpdateStruct
 {
@@ -756,6 +767,7 @@ static void clearEnemies()
 		}
 	}
 	enemies.clear();
+	g_aiSuppressed.clear();
 	LeaveCriticalSection(&enemiesCriticalSection);
 }
 
@@ -852,8 +864,12 @@ static void readGamePointers()
 	//
 	hoistables.clear();
 
-	std::vector<uint32_t> allFriendAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000100000001, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
-	std::vector<uint32_t> allEnemieAddrs = processAnalyzer->findAllGameObjByPattern<uint64_t>(0x0000000200000002, 0x184 + 0x8 * 0x4); //put the values that indicate that thing
+	// Every NPC on the level, found by object type tag the same way the other object
+	// kinds are found — NOT by team. Teams are not fixed: level scripts flip NPCs
+	// between neutral and a fighting side while the level runs, and a team-based scan
+	// would permanently miss anyone who was neutral at load time. We take the whole
+	// population once, then decide per frame who is worth syncing (see readEnemiesState).
+	std::vector<uint32_t> allNpcAddrs = processAnalyzer->findAllGameObjByPattern<uint8_t>(OBJ_TYPE_NPC, OBJ_TYPE_OFFSET);
 	std::vector<uint32_t> allRigidInstances = processAnalyzer->findAllGameObjByPattern<uint8_t>(0x05, 0x7c); //put the values that indicate that thing
 	size_t chestCount = 0;
 	EnterCriticalSection(&chestCriticalSection);
@@ -877,16 +893,17 @@ static void readGamePointers()
 
 	std::cout << "CHESTS AMOUNT: " << chestCount << "\n";
 
-	for (uint32_t fr : allFriendAddrs) allEnemieAddrs.push_back(fr);
-
-	for (uint32_t e : allEnemieAddrs)
+	for (uint32_t e : allNpcAddrs)
 	{
-		uint32_t value = processAnalyzer->readData<uint32_t>(e + 0x10);
-		if (0x04004232 != value && 0x004A14C0 != value)
+		// Per-instance class signature written by the NPC descriptor. Cheap double
+		// check that the type tag wasn't a coincidence on a recycled object slot.
+		if (processAnalyzer->readData<uint32_t>(e + 0x10) != NPC_CLASS_SIGNATURE)
 			continue;
 
 		uint64_t eGuid = processAnalyzer->readData<uint64_t>(e + 0x8);
 
+		// Remote players' fake bilbos are NPC objects too, so they land in this scan.
+		// They are driven by the player sync path and must never be treated as AI.
 		bool skip = false;
 		for (uint64_t pGuid : playerGuids) if (pGuid == eGuid) skip = true;
 
@@ -900,16 +917,20 @@ static void readGamePointers()
 		}
 
 		//hex
-		std::cout << eGuid << " Address: " << e << " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
+		std::cout << eGuid << " Address: " << e
+			<< " Team: " << processAnalyzer->readData<uint32_t>(e + OBJ_TEAM_OFFSET)
+			<< " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
 
 		NPC* enemy = new NPC(processAnalyzer);
 		enemy->initializeByAddress(e);
-		if (isHost == 0) enemy->setAIMode(0);
+		// AI is deliberately NOT touched here. Whether this NPC is host-driven depends
+		// on its team right now, which can change later, so that call lives in the
+		// per-tick changeEnemiesAIMode() instead.
 
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
 
-	printf("Enemies Found: %d", enemies.size());
+	printf("NPCs tracked: %d", enemies.size());
 	applyFakeBilboDamage();
 }
 
@@ -1088,6 +1109,14 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 
 	for (auto enemy : enemies)
 	{
+		// `enemies` holds every NPC on the level. Only the ones currently on a
+		// fighting side are host-driven; neutral NPCs run their own AI on each
+		// client and are left out of the packet entirely. Re-read every tick so an
+		// NPC that a script just turned hostile starts being sent immediately.
+		if (!enemy.second->isNpcType())
+			continue;
+		if (!isSyncedTeam(enemy.second->getTeam()))
+			continue;
 
 		Vector3 ePos = enemy.second->getPosition();
 		float eRot = enemy.second->getRotationY();
@@ -1100,11 +1129,28 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 	return temp;
 }
 
+// Clients run this every send tick, which is also what makes team changes take
+// effect: an NPC only has its AI suppressed while it sits on a synced team, and gets
+// its own AI back the moment a script returns it to neutral.
 static void changeEnemiesAIMode(int mode)
 {
 	for (auto enemy : enemies)
 	{
-		enemy.second->setAIMode(mode);
+		NPC* npc = enemy.second;
+		if (npc == nullptr || !npc->isValid() || !npc->isNpcType())
+			continue;
+
+		if (isSyncedTeam(npc->getTeam()))
+		{
+			npc->setAIMode(mode);
+			g_aiSuppressed.insert(enemy.first);
+		}
+		else if (g_aiSuppressed.erase(enemy.first) != 0)
+		{
+			// Was host-driven, now neutral — give it back the AI flags it had when
+			// we found it. NPCs we never suppressed are left completely alone.
+			npc->restoreAIState();
+		}
 	}
 }
 

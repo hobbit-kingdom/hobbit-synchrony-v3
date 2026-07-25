@@ -23,6 +23,20 @@
 // Maps animation ID → animation data pointer value.
 extern std::unordered_map<uint32_t, uint32_t> animDataMap;
 
+// Engine object layout, taken from the obj_mgr class registry (the descriptor
+// constructor at 0x0054B5E0 indexes a table by these tags).
+//   object + 0x7C : type tag  -> 0x1C = NPC, 0x12 = Bilbo, 0x05 = RigidInstance, ...
+//   object + 0x1A4: team      -> 0 = neutral, 1 / 2 = the two fighting sides
+// NPCObject's constructor defaults the team to 2; level scripts move NPCs between
+// teams while the level is running.
+static constexpr uint8_t  OBJ_TYPE_NPC = 0x1C;
+static constexpr uint32_t OBJ_TYPE_OFFSET = 0x7C;
+static constexpr uint32_t OBJ_TEAM_OFFSET = 0x1A4;
+
+/// The two teams whose members are driven by the host. Everything else (team 0)
+/// keeps running its own local AI on every client.
+inline bool isSyncedTeam(int team) { return team == 1 || team == 2; }
+
 class NPC
 {
 public:
@@ -81,7 +95,18 @@ public:
 
 	void setGUID(uint32_t newGUID);
 	void setAIMode(int mode);
+	/// Put the AI flag byte back to whatever it was when this NPC was discovered.
+	void restoreAIState();
 	void setTeam(int teamId);
+
+	/// Current team: 0 = neutral, 1 / 2 = the two fighting sides.
+	/// Scripted level events can change this at any time, so never cache it.
+	int  getTeam() const;
+
+	/// Whether the object still carries the NPC type tag. Objects can be destroyed
+	/// mid-level and their slot reused, so cached addresses are re-checked here
+	/// before being trusted (same convention as the pickup/switch/trigger caches).
+	bool isNpcType() const;
 
 	bool isActivated() const;
 
