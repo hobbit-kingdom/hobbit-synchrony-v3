@@ -212,6 +212,7 @@ static void applyQueuedSwitchToggles();
 static void applyQueuedAnimSync();
 static void detectLocalRingChange(void* bilboThis);
 static void applyPlayerRingVisuals();
+static void refreshRemoteSenseSnapshot();
 static void processLocalSpawnRequest();
 static void applyQueuedSpawns();
 static void applyQueuedFx();
@@ -266,6 +267,9 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 		// stealth look to every remote player's fake-bilbo NPC.
 		detectLocalRingChange(pBilbo);
 		applyPlayerRingVisuals();
+
+		// NPC sight: refresh what the sense hooks are allowed to see this frame.
+		refreshRemoteSenseSnapshot();
 
 		// Object spawning: run our own /spawn request, then apply remote spawns.
 		processLocalSpawnRequest();
@@ -425,6 +429,7 @@ void InstallStoneHook();   // forward decl (defined further below)
 void InstallChestHook();   // forward decl (defined further below)
 void InstallFxHook();      // forward decl (defined further below)
 void InstallWebWallHook(); // forward decl (defined further below)
+void InstallSenseHooks();  // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -446,6 +451,8 @@ void SetupBilboHook(void)
 	InstallChestHook();   // detour treasure_chest::Open to replicate opened chests
 	InstallFxHook();      // detour fx_object::FireAndForget to sync lockpick-failure explosions
 	InstallWebWallHook(); // detour web_wall::StartBreakAtPoint to capture web cuts
+	InstallSenseHooks();  // detour SenseController::CanSee + UpdateSensedArray so that
+	                      // enemies need line of sight (and lose the ring) on remote players
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -2134,6 +2141,250 @@ static void applyPlayerRingVisuals()
 		applyRingVisual(p, ringOn);
 	}
 	LeaveCriticalSection(&playersCriticalSection);
+}
+
+// ===========================================================================
+//  NPC Sight — honest detection of remote players
+// ===========================================================================
+//
+// Remote players are NPC objects, and the engine's sight code takes two shortcuts
+// that only ever made sense for NPC-vs-NPC awareness. Both make enemies spot a
+// fake bilbo through walls, floors and from behind:
+//
+//   1. SenseController::CanSee @0x005AB800 loads the target's class signature from
+//      object+0x10 and, right after the range test, does
+//          005AB9BF  test bl, 0x10      ; signature bit 0x10 == "is an NPC"
+//          005AB9C2  jne  0x005ABC90    ; -> return 1 (SEEN)
+//      which jumps over the FOV cone, the LOS raycast AND the stealth gate. Bit
+//      0x10 is set on exactly one of the 48 registered classes, NPC, so any NPC
+//      target degrades to a plain "is it inside SightRange" sphere test.
+//
+//   2. SenseController::UpdateSensedArray @0x005AAAD0 is what actually acquires
+//      targets. Its Bilbo half calls CanSee (full FOV + LOS + stealth), but when
+//      Bilbo is further than 500 units it falls through to a scan over every NPC
+//      object that tests only range/enemy/alive - it never calls CanSee at all,
+//      so there is no raycast in it to switch on.
+//
+// On top of that, stealth is not a character property: the grant at the end of
+// CanSee is guarded by `GetBilboGuid() == targetGuid`, so a remote player can
+// never receive it no matter what state we put the object in.
+//
+// The fix for (1) is to stop lying about what the target is for the duration of a
+// single call: swap signature bit 0x10 (NPC) for bit 0x40 (Bilbo). CanSee reads
+// the signature once and uses it for the fast path plus two `& 0x50` "is this a
+// character" gates, so the swap skips the shortcut while keeping the IsEnemy and
+// IsAlive checks intact - and the engine then runs its own FOV cone and its own
+// raycast, with the correct bbox-centre endpoints and self-ignore GUIDs. The
+// value is restored immediately, so nothing else (projectile hits, hearing,
+// targeting) ever observes it. The fix for (2) is to let the scan run and then
+// re-validate whatever it latched through the same path.
+static constexpr uint32_t SENSE_CANSEE_ADDR = 0x005AB800;
+static constexpr uint32_t SENSE_UPDATESENSEDARRAY_ADDR = 0x005AAAD0;
+static constexpr uint32_t SENSE_GETOWNER_ADDR = 0x005AA750;
+static constexpr uint32_t SENSE_CANSMELL_ADDR = 0x005AB3F0;
+
+static constexpr uint32_t OBJ_SIGNATURE_OFF = 0x10;   // object+0x10: class signature
+static constexpr uint32_t OBJ_SIG_NPC_BIT = 0x10;     //   bit 0x10: "is an NPC"
+static constexpr uint32_t OBJ_SIG_BILBO_BIT = 0x40;   //   bit 0x40: "is bilbo"
+
+static constexpr uint32_t SENSE_FLAGS_OFF = 0x18;     // SenseController+0x18: flags
+static constexpr uint32_t SENSE_FLAG_SENSING_OTHER = 0x02; //   bit 2: sensing a non-Bilbo
+static constexpr uint32_t SENSE_FLAG_DOLOS = 0x04;    //   bit 4: run the LOS raycast
+static constexpr uint32_t SENSE_TARGET_GUID_OFF = 0x38; // SenseController+0x38: sensed GUID
+static constexpr uint32_t NPC_IGNORES_STEALTH_OFF = 0x23C; // NPCObject+0x23c: sees through hiding
+
+// public: int  __thiscall SenseController::CanSee(unsigned __int64, int, int)   [ret 0x10]
+// public: void __thiscall SenseController::UpdateSensedArray(int, float)        [ret 8]
+// public: int  __thiscall SenseController::CanSmell(unsigned __int64, int)      [ret 0xC]
+// The SDK labels 0x005AA750 SetBlind; it is really the owner accessor - it resolves
+// the owning NPCObject from the GUID at +0x40 and caches it at +0x48.
+typedef int(__fastcall* SenseCanSee_t)(void* self, void* edx, uint64_t targetGuid, int checkEnemy, int doLOS);
+typedef void(__fastcall* SenseUpdateSensedArray_t)(void* self, void* edx, int arg, float scanOthers);
+typedef void* (__fastcall* SenseGetOwner_t)(void* self, void* edx);
+typedef int(__fastcall* SenseCanSmell_t)(void* self, void* edx, uint64_t targetGuid, int checkEnemy);
+
+static SenseCanSee_t            oSenseCanSee = nullptr;
+static SenseUpdateSensedArray_t oSenseUpdateSensedArray = nullptr;
+static const SenseGetOwner_t    game_SenseGetOwner =
+	reinterpret_cast<SenseGetOwner_t>(SENSE_GETOWNER_ADDR);
+// Not hooked - CanSmell has no NPC fast path and no stealth gate, so it already
+// treats a remote player exactly like it treats Bilbo. We only need to call it.
+static const SenseCanSmell_t    game_SenseCanSmell =
+	reinterpret_cast<SenseCanSmell_t>(SENSE_CANSMELL_ADDR);
+
+// Per-frame snapshot of the remote players an NPC could sense. Built on the game
+// thread from activePlayers + the ring state, and read on the game thread by the
+// hooks below, so it needs no locking of its own. FAKE_BILBO_GUID.txt caps the
+// session at 8 players; the headroom is free.
+struct RemotePlayerSense
+{
+	uint64_t guid = 0;
+	uint32_t npcAddr = 0;
+	bool     hidden = false;
+};
+
+static constexpr int MAX_SENSE_PLAYERS = 16;
+static RemotePlayerSense g_senseSnapshot[MAX_SENSE_PLAYERS];
+static int               g_senseSnapshotCount = 0;
+
+// Rebuild the snapshot (game thread, once per frame alongside the ring visuals).
+static void refreshRemoteSenseSnapshot()
+{
+	int count = 0;
+
+	if (processAnalyzer)
+	{
+		std::unordered_map<uint64_t, uint8_t> ringSnapshot;
+		EnterCriticalSection(&ringCriticalSection);
+		ringSnapshot = g_playerRingState;
+		LeaveCriticalSection(&ringCriticalSection);
+
+		EnterCriticalSection(&playersCriticalSection);
+		for (auto& p : activePlayers)
+		{
+			if (count >= MAX_SENSE_PLAYERS)
+				break;
+			if (p.npcGuid == 0 || !p.npc)
+				continue;
+
+			const uint32_t npcAddr = p.npc->getObjectPtr();
+			if (npcAddr == 0)
+				continue;
+
+			auto it = ringSnapshot.find(p.npcGuid);
+			g_senseSnapshot[count].guid = p.npcGuid;
+			g_senseSnapshot[count].npcAddr = npcAddr;
+			g_senseSnapshot[count].hidden = (it != ringSnapshot.end()) && it->second != 0;
+			++count;
+		}
+		LeaveCriticalSection(&playersCriticalSection);
+	}
+
+	g_senseSnapshotCount = count;
+}
+
+static const RemotePlayerSense* findRemoteSense(uint64_t guid)
+{
+	if (guid == 0)
+		return nullptr;
+	for (int i = 0; i < g_senseSnapshotCount; ++i)
+	{
+		if (g_senseSnapshot[i].guid == guid)
+			return &g_senseSnapshot[i];
+	}
+	return nullptr;
+}
+
+// Can this observer legitimately SEE this remote player right now?
+// Applies the stealth grant the engine reserves for the local Bilbo, then runs the
+// engine's own FOV + LOS check via the signature swap described above.
+// Sight only - smell is deliberately not part of this, see remotePlayerSensedBy.
+static bool remotePlayerVisibleTo(void* sense, const RemotePlayerSense& player, int checkEnemy)
+{
+	// Stealth, mirroring what CanSee does for Bilbo: hidden, and this NPC is not
+	// one of the ones flagged to see through hiding.
+	if (player.hidden)
+	{
+		uint8_t* observer = static_cast<uint8_t*>(game_SenseGetOwner(sense, nullptr));
+		if (observer && *reinterpret_cast<int*>(observer + NPC_IGNORES_STEALTH_OFF) == 0)
+			return false;
+	}
+
+	const uint32_t npcAddr = player.npcAddr;
+
+	// Objects can be destroyed mid-level and their slot reused, so re-check the type
+	// tag before writing to the address. If it no longer looks like an NPC, fall back
+	// to asking the engine unmodified rather than corrupting whatever lives there.
+	if (npcAddr == 0 ||
+		*reinterpret_cast<uint8_t*>(npcAddr + OBJ_TYPE_OFFSET) != OBJ_TYPE_NPC)
+	{
+		return oSenseCanSee(sense, nullptr, player.guid, checkEnemy, 1) != 0;
+	}
+
+	uint32_t* signature = reinterpret_cast<uint32_t*>(npcAddr + OBJ_SIGNATURE_OFF);
+	uint32_t* flags = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(sense) + SENSE_FLAGS_OFF);
+
+	const uint32_t savedSignature = *signature;
+	const uint32_t savedFlags = *flags;
+
+	// Not an NPC for the length of this call, but still a character.
+	*signature = (savedSignature & ~OBJ_SIG_NPC_BIT) | OBJ_SIG_BILBO_BIT;
+	// Force the raycast on: whether it runs is gated by each observer's own DoLOS
+	// property, and we do not want a guard authored with DoLOS 0 to keep wallhacking.
+	*flags = savedFlags | SENSE_FLAG_DOLOS;
+
+	const int seen = oSenseCanSee(sense, nullptr, player.guid, checkEnemy, 1);
+
+	*signature = savedSignature;
+	*flags = savedFlags;
+
+	return seen != 0;
+}
+
+// Can this observer sense this remote player at all - by sight OR by smell?
+//
+// Smell is the engine's point-blank catch and it is deliberately NOT stealthed:
+// SenseController::CanSmell @0x005AB3F0 tests a vertical band plus a horizontal
+// (XZ-only) distance against SmellRange, with no FOV, no LOS, and no hiding check
+// anywhere in it. That is why the base game still busts a ring-wearing Bilbo who
+// walks into a goblin - UpdateSensedArray's Bilbo half is `CanSee || CanSmell`.
+// We mirror that here so a remote player with the ring on is invisible at range
+// but still gets caught on contact, instead of being strictly stealthier than the
+// real Bilbo.
+static bool remotePlayerSensedBy(void* sense, const RemotePlayerSense& player, int checkEnemy)
+{
+	if (remotePlayerVisibleTo(sense, player, checkEnemy))
+		return true;
+	return game_SenseCanSmell(sense, nullptr, player.guid, checkEnemy) != 0;
+}
+
+static int __fastcall hkSenseCanSee(void* self, void* edx, uint64_t targetGuid, int checkEnemy, int doLOS)
+{
+	const RemotePlayerSense* player = findRemoteSense(targetGuid);
+	if (!player)
+		return oSenseCanSee(self, edx, targetGuid, checkEnemy, doLOS);
+
+	return remotePlayerVisibleTo(self, *player, checkEnemy) ? 1 : 0;
+}
+
+static void __fastcall hkSenseUpdateSensedArray(void* self, void* edx, int arg, float scanOthers)
+{
+	oSenseUpdateSensedArray(self, edx, arg, scanOthers);
+
+	// The scan over other NPCs has no FOV and no raycast, so audit what it picked.
+	// The sensed GUID is written at the very end of the function and is not read
+	// again until the StateController updates, which happens after the whole sense
+	// pass, so clearing it here is in time.
+	//
+	// Audit with sight OR smell: the scan has a smell branch of its own alongside
+	// the sight one, so validating with sight alone would throw away legitimate
+	// contact-range detections and make the ring far stronger than it is for Bilbo.
+	uint8_t* sense = static_cast<uint8_t*>(self);
+	const uint64_t target = *reinterpret_cast<uint64_t*>(sense + SENSE_TARGET_GUID_OFF);
+
+	const RemotePlayerSense* player = findRemoteSense(target);
+	if (!player)
+		return;
+	if (remotePlayerSensedBy(self, *player, 1))
+		return;
+
+	*reinterpret_cast<uint64_t*>(sense + SENSE_TARGET_GUID_OFF) = 0;
+	*reinterpret_cast<uint32_t*>(sense + SENSE_FLAGS_OFF) &= ~SENSE_FLAG_SENSING_OTHER;
+}
+
+void InstallSenseHooks()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* canSee = reinterpret_cast<void*>(SENSE_CANSEE_ADDR);
+	MH_CreateHook(canSee, &hkSenseCanSee,
+		reinterpret_cast<void**>(&oSenseCanSee));
+	MH_EnableHook(canSee);
+
+	void* updateSensedArray = reinterpret_cast<void*>(SENSE_UPDATESENSEDARRAY_ADDR);
+	MH_CreateHook(updateSensedArray, &hkSenseUpdateSensedArray,
+		reinterpret_cast<void**>(&oSenseUpdateSensedArray));
+	MH_EnableHook(updateSensedArray);
 }
 
 // ===========================================================================
