@@ -255,6 +255,29 @@ void NPC::setAnimFrames(float frame, float lastFrame)
 	lastAnimFrame_ = frame;
 }
 
+// animationAddr_ + 0x8  = current playback frame
+// animationAddr_ + 0x14 = final frame / length of the animation
+float NPC::getAnimFrame() const
+{
+	if (!analyzer_ || animationAddr_ == 0)
+		return 0.0f;
+	return analyzer_->readData<float>(animationAddr_ + 0x8);
+}
+
+float NPC::getAnimEndFrame() const
+{
+	if (!analyzer_ || animationAddr_ == 0)
+		return 0.0f;
+	return analyzer_->readData<float>(animationAddr_ + 0x14);
+}
+
+void NPC::setAnimFrame(float frame)
+{
+	if (!analyzer_ || animationAddr_ == 0)
+		return;
+	analyzer_->writeData(animationAddr_ + 0x8, frame);
+}
+
 // ---------------------------------------------------------------------------
 // Weapon
 // ---------------------------------------------------------------------------

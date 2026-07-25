@@ -68,6 +68,13 @@ public:
 	void setAnimation(uint32_t animId);
 	void setAnimFrames(float frame, float lastFrame);
 
+	/// Current playback frame of the active animation.
+	float getAnimFrame() const;
+	/// Final frame (length) of the active animation; 0 if unknown.
+	float getAnimEndFrame() const;
+	/// Overwrite just the playback frame, leaving the animation itself alone.
+	void  setAnimFrame(float frame);
+
 	// --- Weapon ---
 
 	void setWeapon(uint32_t weaponId);

@@ -57,6 +57,14 @@ public:
 	// --- Interpolation: timing ---
 	double lerpStartTime = 0.0;
 
+	// --- One-shot animation hold (death) ---
+	// The engine loops animations, so a death anim would replay forever. We track
+	// the highest playback frame actually observed; when the frame jumps backwards
+	// the animation has completed a pass, and we pin it to that peak until a
+	// different animation starts.
+	bool  animHoldActive = false;
+	float animHoldPeakFrame = 0.0f;
+
 	// ----- Methods -----
 
 	void setPosition(float px, float py, float pz);
