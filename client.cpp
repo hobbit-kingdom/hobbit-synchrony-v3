@@ -210,6 +210,7 @@ static void applyQueuedTriggerPressB();
 static void applyQueuedTriggerOnUse();
 static void applyQueuedSwitchToggles();
 static void applyQueuedAnimSync();
+static void applyQueuedCinemaStarts();
 static void detectLocalRingChange(void* bilboThis);
 static void applyPlayerRingVisuals();
 static void refreshRemoteSenseSnapshot();
@@ -254,6 +255,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 	applyQueuedTriggerOnUse();
 	applyQueuedSwitchToggles();
 	applyQueuedAnimSync();
+	applyQueuedCinemaStarts();
 
 	// IMPORTANT: this is a vtable hook, so OnAdvanceLogic also fires for remote
 	// players' fake-bilbo instances every frame. Run our per-frame sync logic ONLY
@@ -430,6 +432,7 @@ void InstallChestHook();   // forward decl (defined further below)
 void InstallFxHook();      // forward decl (defined further below)
 void InstallWebWallHook(); // forward decl (defined further below)
 void InstallSenseHooks();  // forward decl (defined further below)
+void InstallCinemaHook();  // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -453,6 +456,7 @@ void SetupBilboHook(void)
 	InstallWebWallHook(); // detour web_wall::StartBreakAtPoint to capture web cuts
 	InstallSenseHooks();  // detour SenseController::CanSee + UpdateSensedArray so that
 	                      // enemies need line of sight (and lose the ring) on remote players
+	InstallCinemaHook();  // detour cinema::Start to share whitelisted cutscenes
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -2388,6 +2392,207 @@ void InstallSenseHooks()
 }
 
 // ===========================================================================
+//  Cinema (cutscene) Synchronization
+// ===========================================================================
+//
+// Stealth levels punish a blown sneak with a cutscene. In multiplayer only the
+// player who tripped it sees it, so the group falls out of step. This shares a
+// whitelist of cinemas: when one fires on any client, every client plays it.
+//
+// Detection is a detour on cinema::Start @0x0046A550 (void __thiscall, so the
+// only argument is the cinema object itself). Cinema objects are authored into
+// the level, so the object GUID at +0x8 is the same on every machine and is all
+// that needs to travel.
+//
+// Replaying is safe by construction - cinema::Start refuses up front when the
+// cinema is already running or already finished and non-repeatable:
+//   cinema+0x194 flags: bit 0x1 = repeatable, bit 0x2 = finished (cinema::IsFinished
+//   returns (flags >> 1) & 1), bit 0x4 = currently active
+// We still check those before calling so we do not spam its warning log.
+//
+// Echo guard: applying a remote cinema calls the MinHook TRAMPOLINE, not the raw
+// address, so a replayed cinema never re-enters the hook and re-broadcasts. Same
+// trick as playFxLocal.
+static constexpr uint32_t CINEMA_START_ADDR = 0x0046A550;
+static constexpr uint32_t CINEMA_GUID_OFF = 0x08;    // object+0x8: GUID
+static constexpr uint32_t CINEMA_FLAGS_OFF = 0x194;  // cinema+0x194: state flags
+static constexpr uint32_t CINEMA_FLAG_REPEATABLE = 0x1;
+static constexpr uint32_t CINEMA_FLAG_FINISHED = 0x2;
+static constexpr uint32_t CINEMA_FLAG_ACTIVE = 0x4;
+
+// The GUIDs to share, one per line in "XXXXXXXX_XXXXXXXX" form - same format as
+// FAKE_BILBO_GUID.txt. Missing file simply means the feature is off.
+static constexpr const char* SYNCED_CINEMA_FILE = "SYNCED_CINEMAS.txt";
+
+// public: void __thiscall cinema::Start(void)
+typedef void(__fastcall* CinemaStart_t)(void* self, void* edx);
+static CinemaStart_t oCinemaStart = nullptr;
+
+CRITICAL_SECTION cinemaCriticalSection;
+static std::unordered_set<uint64_t> g_syncedCinemaGuids;   // read-only after load
+static std::vector<uint64_t> g_outgoingCinemaStarts;
+static std::vector<uint64_t> g_incomingCinemaStarts;
+
+// Load the whitelist. Deliberately does NOT use loadGuidsFromFile() from shared.h:
+// that one prompts on stdin when the file is missing, which would hang the game.
+static void loadSyncedCinemaGuids()
+{
+	std::vector<std::string> candidates;
+	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SYNCED_CINEMA_FILE));
+
+	const std::string exeDirectory = getModuleDirectory(nullptr);
+	if (!exeDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / SYNCED_CINEMA_FILE);
+
+	const std::string dllDirectory = getModuleDirectory(moduleInstance);
+	if (!dllDirectory.empty())
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / SYNCED_CINEMA_FILE);
+
+	for (const std::string& candidate : candidates)
+	{
+		std::ifstream file(candidate);
+		if (!file.is_open())
+			continue;
+
+		std::string line;
+		while (std::getline(file, line))
+		{
+			if (line.find('_') == std::string::npos)
+				continue;   // blank line or a comment - the format always has one
+
+			uint64_t guid = guidFromString(line);
+			if (guid != 0)
+				g_syncedCinemaGuids.insert(guid);
+		}
+
+		printf("Synced cinemas: %zu GUID(s) loaded from %s\n",
+			g_syncedCinemaGuids.size(), candidate.c_str());
+		return;
+	}
+
+	printf("Synced cinemas: no %s found, cutscene sync disabled\n", SYNCED_CINEMA_FILE);
+}
+
+static bool isSyncedCinema(uint64_t cinemaGuid)
+{
+	return cinemaGuid != 0 && g_syncedCinemaGuids.count(cinemaGuid) != 0;
+}
+
+static void __fastcall hkCinemaStart(void* self, void* edx)
+{
+	(void)edx;
+
+	uint64_t cinemaGuid = 0;
+	if (self && processAnalyzer)
+	{
+		cinemaGuid = processAnalyzer->readData<uint64_t>(
+			reinterpret_cast<uint32_t>(self) + CINEMA_GUID_OFF);
+	}
+
+	oCinemaStart(self, nullptr);
+
+	// Log every cinema, whitelisted or not - this is how you harvest the GUIDs to
+	// put in SYNCED_CINEMAS.txt: play the level, trip the cutscene, copy the line.
+	// Printed high-dword-first so it can be pasted into the file verbatim, which
+	// is the form guidFromString() parses.
+	const bool synced = isSyncedCinema(cinemaGuid);
+	printf("[cinema] start %08X_%08X %s\n",
+		static_cast<uint32_t>(cinemaGuid >> 32),
+		static_cast<uint32_t>(cinemaGuid),
+		synced ? "(SYNCED)" : "(local only)");
+
+	// Queue AFTER the original: if the engine rejected the start (already active,
+	// already finished, Bilbo dead) we would rather not have told anyone. It sets
+	// the active bit itself, so a rejected start leaves the flags untouched.
+	if (!synced)
+		return;
+
+	EnterCriticalSection(&cinemaCriticalSection);
+	g_outgoingCinemaStarts.push_back(cinemaGuid);
+	LeaveCriticalSection(&cinemaCriticalSection);
+}
+
+void InstallCinemaHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+	void* target = reinterpret_cast<void*>(CINEMA_START_ADDR);
+	MH_CreateHook(target, &hkCinemaStart,
+		reinterpret_cast<void**>(&oCinemaStart));
+	MH_EnableHook(target);
+}
+
+// Send any locally-triggered synced cinemas (network thread, from the client loop).
+static void sendCinemaSync(Client& client)
+{
+	EnterCriticalSection(&cinemaCriticalSection);
+	std::vector<uint64_t> pending;
+	pending.swap(g_outgoingCinemaStarts);
+	LeaveCriticalSection(&cinemaCriticalSection);
+
+	if (pending.empty())
+		return;
+	if (!client.IsConnected() || myGuid == 0)
+		return;
+
+	for (uint64_t cinemaGuid : pending)
+	{
+		auto* msg = static_cast<CinemaSyncMessage*>(client.CreateMessage(CINEMA_SYNC));
+		if (!msg)
+			return;
+		msg->cinemaGuid = cinemaGuid;
+		msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		client.SendMessage(channels::Gameplay, msg);
+	}
+}
+
+// Store an incoming cinema start (network thread).
+static void processCinemaSync(CinemaSyncMessage* msg)
+{
+	if (msg->cinemaGuid == 0)
+		return;
+
+	EnterCriticalSection(&cinemaCriticalSection);
+	g_incomingCinemaStarts.push_back(msg->cinemaGuid);
+	LeaveCriticalSection(&cinemaCriticalSection);
+}
+
+// Play any remote-triggered cinemas (game thread - cinema::Start drives cameras,
+// the state machine and the cinema queue, none of which is thread safe).
+static void applyQueuedCinemaStarts()
+{
+	if (!oCinemaStart || !processAnalyzer)
+		return;
+
+	EnterCriticalSection(&cinemaCriticalSection);
+	std::vector<uint64_t> pending;
+	pending.swap(g_incomingCinemaStarts);
+	LeaveCriticalSection(&cinemaCriticalSection);
+
+	if (pending.empty() || !gameManager.isOnLevel())
+		return;
+
+	for (uint64_t cinemaGuid : pending)
+	{
+		uint32_t cinemaAddress = processAnalyzer->findGameObjByGUID(cinemaGuid);
+		if (cinemaAddress == 0)
+			continue;   // not in this level - nothing to play
+
+		const uint32_t flags = processAnalyzer->readData<uint32_t>(cinemaAddress + CINEMA_FLAGS_OFF);
+		if (flags & CINEMA_FLAG_ACTIVE)
+			continue;   // already playing here
+		if ((flags & CINEMA_FLAG_FINISHED) && !(flags & CINEMA_FLAG_REPEATABLE))
+			continue;   // already played here and cannot repeat
+
+		// Trampoline, not the hook - otherwise this would re-broadcast.
+		oCinemaStart(reinterpret_cast<void*>(cinemaAddress), nullptr);
+
+		printf("[cinema] applied remote %08X_%08X\n",
+			static_cast<uint32_t>(cinemaGuid >> 32),
+			static_cast<uint32_t>(cinemaGuid));
+	}
+}
+
+// ===========================================================================
 //  Rigid-Instance Spawning (synced)
 // ===========================================================================
 //
@@ -3550,6 +3755,9 @@ static void processMessage(Client& client, Message* message, double time)
 	case RING_SYNC:
 		processRingSync(static_cast<RingSyncMessage*>(message));
 		break;
+	case CINEMA_SYNC:
+		if (gameManager.isOnLevel()) processCinemaSync(static_cast<CinemaSyncMessage*>(message));
+		break;
 	case SPAWN_OBJECT:
 		if (gameManager.isOnLevel()) processSpawnObject(static_cast<SpawnObjectMessage*>(message));
 		break;
@@ -3801,6 +4009,8 @@ static int clientMain()
 	InitializeCriticalSection(&ringCriticalSection);
 	InitializeCriticalSection(&spawnCriticalSection);
 	InitializeCriticalSection(&fxCriticalSection);
+	InitializeCriticalSection(&cinemaCriticalSection);
+	loadSyncedCinemaGuids();
 	SetupBilboHook();
 
 	signal(SIGINT, interruptHandler);
@@ -3989,6 +4199,9 @@ static int clientMain()
 
 					// Broadcast our ring state when it changes
 					sendRingSync(client);
+
+					// Broadcast any whitelisted cutscene that fired on us
+					sendCinemaSync(client);
 
 					// Broadcast any objects we spawned via /spawn
 					sendSpawns(client);

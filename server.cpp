@@ -799,6 +799,25 @@ static void broadcastRingSync(Server& server, int senderIndex, RingSyncMessage* 
 	}
 }
 
+// A synced cinema fired on one client - relay it so everyone plays it. The GUID
+// identifies a level-authored cinema object, so it is meaningful on every peer.
+static void broadcastCinemaSync(Server& server, int senderIndex, CinemaSyncMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<CinemaSyncMessage*>(
+			server.CreateMessage(i, CINEMA_SYNC));
+
+		broadcast->cinemaGuid = msg->cinemaGuid;
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void broadcastSpawnObject(Server& server, int senderIndex, SpawnObjectMessage* msg)
 {
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
@@ -957,6 +976,10 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 	case ANIM_SYNC:
 		broadcastAnimSync(server, clientIndex, static_cast<AnimSyncMessage*>(message));
 		break;
+	case CINEMA_SYNC:
+		broadcastCinemaSync(server, clientIndex, static_cast<CinemaSyncMessage*>(message));
+		break;
+
 	case RING_SYNC:
 		broadcastRingSync(server, clientIndex, static_cast<RingSyncMessage*>(message));
 		break;

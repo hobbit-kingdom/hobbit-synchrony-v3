@@ -51,6 +51,7 @@ enum GameMessageType
 	RING_SYNC,
 	SPAWN_OBJECT,
 	SPAWN_FX,
+	CINEMA_SYNC,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -597,6 +598,39 @@ struct RingSyncMessage : public Message
 	{
 		serialize_GUID(stream, playerGuid);
 		serialize_bits(stream, ringEquipped, 8);
+		serialize_bits(stream, nowLevel, 32);
+
+		if (!stream.IsWriting)
+		{
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		}
+
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
+// CinemaSyncMessage — a cinema (cutscene) started on one player's machine and
+// it is one of the GUIDs listed in SYNCED_CINEMAS.txt, so everyone else plays
+// it too. Typically the "you were spotted" cutscene on stealth levels, but the
+// list is arbitrary, so any cinema can be shared this way.
+//
+// Only the GUID travels. Cinema objects are authored into the level, so every
+// client already has the same object under the same GUID; receivers just call
+// cinema::Start on their own copy.
+// ---------------------------------------------------------------------------
+
+struct CinemaSyncMessage : public Message
+{
+	uint64_t cinemaGuid = 0;   // the cinema object's GUID
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_GUID(stream, cinemaGuid);
 		serialize_bits(stream, nowLevel, 32);
 
 		if (!stream.IsWriting)
