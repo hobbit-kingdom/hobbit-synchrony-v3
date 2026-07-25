@@ -433,6 +433,7 @@ void InstallFxHook();      // forward decl (defined further below)
 void InstallWebWallHook(); // forward decl (defined further below)
 void InstallSenseHooks();  // forward decl (defined further below)
 void InstallCinemaHook();  // forward decl (defined further below)
+void InstallLayerHooks();  // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -457,6 +458,8 @@ void SetupBilboHook(void)
 	InstallSenseHooks();  // detour SenseController::CanSee + UpdateSensedArray so that
 	                      // enemies need line of sight (and lose the ring) on remote players
 	InstallCinemaHook();  // detour cinema::Start to share whitelisted cutscenes
+	InstallLayerHooks();  // detour load_trigger::Execute so the host re-broadcasts
+	                      // anim frames when a layer streams in
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -2590,6 +2593,67 @@ static void applyQueuedCinemaStarts()
 			static_cast<uint32_t>(cinemaGuid >> 32),
 			static_cast<uint32_t>(cinemaGuid));
 	}
+}
+
+// ===========================================================================
+//  Layer load -> automatic animation resync (host only)
+// ===========================================================================
+//
+// Level geometry is streamed in "layers". A LoadTrigger brings a set of them in,
+// and the objects in those layers start animating on whichever machine activated
+// them, so they drift apart - the same problem /syncanim exists to fix, just
+// triggered by streaming instead of by a late join.
+//
+// So: when the host fires a load trigger, request the same one-shot anim
+// broadcast /syncanim does. Host only, because every client runs the same level
+// scripts and would otherwise all broadcast the same snapshot at once.
+//
+// No waiting is needed before snapshotting. Objects are instantiated ONCE per
+// level: layer_mgr::LoadObjects @0x0055A400 is called from exactly one place,
+// layer_mgr::LoadLevel @0x0055ABC0. Runtime layer traffic only flips objects
+// active/inactive - layer_mgr::Flush calls ActivateObjects/DeactivateObjects,
+// which set or clear bit 0x01 of the layer record at layerEntry+0x42, and
+// object::GetIsLayerActive @0x004AC5D0 just reads that bit back. So every object
+// is already in the object list from level load and the scan finds it either way.
+static constexpr uint32_t LOAD_TRIGGER_EXECUTE_ADDR = 0x00497D60;
+
+// void __thiscall load_trigger::Execute(void) - the only argument is the trigger.
+// Declared __fastcall so ECX/EDX reach the trampoline untouched.
+typedef void(__fastcall* LoadTriggerExecute_t)(void* self, void* edx);
+static LoadTriggerExecute_t oLoadTriggerExecute = nullptr;
+
+static void __fastcall hkLoadTriggerExecute(void* self, void* edx)
+{
+	oLoadTriggerExecute(self, edx);
+
+	if (isHost != 1)
+		return;
+
+	// Same one-shot request /syncanim raises; the capture + broadcast happens on
+	// the network thread in sendAnimSync(), which is also a natural short delay
+	// after the layer flush that this trigger queued.
+	g_animSyncRequested.store(true);
+
+	uint64_t triggerGuid = 0;
+	if (self && processAnalyzer)
+	{
+		triggerGuid = processAnalyzer->readData<uint64_t>(
+			reinterpret_cast<uint32_t>(self) + CINEMA_GUID_OFF);   // object+0x8, same for every object
+	}
+
+	printf("[layer] load trigger %08X_%08X fired - broadcasting anim frames\n",
+		static_cast<uint32_t>(triggerGuid >> 32),
+		static_cast<uint32_t>(triggerGuid));
+}
+
+void InstallLayerHooks()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* execute = reinterpret_cast<void*>(LOAD_TRIGGER_EXECUTE_ADDR);
+	MH_CreateHook(execute, &hkLoadTriggerExecute,
+		reinterpret_cast<void**>(&oLoadTriggerExecute));
+	MH_EnableHook(execute);
 }
 
 // ===========================================================================
