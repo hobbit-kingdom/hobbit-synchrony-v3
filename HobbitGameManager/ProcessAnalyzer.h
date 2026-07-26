@@ -10,6 +10,53 @@
 #include <vector>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+
+// ---------------------------------------------------------------------------
+// In-process memory access
+// ---------------------------------------------------------------------------
+// This code runs as a DLL injected INTO the game, so "the target process" is our
+// own address space. ReadProcessMemory/WriteProcessMemory each cost a kernel
+// transition, and the VirtualProtectEx bracketing around them cost two more - so
+// reading a single field used to be three syscalls plus a heap allocation. These
+// helpers do it directly.
+//
+// They are SEH-guarded to preserve the old behaviour exactly: a stale or bogus
+// address used to make ReadProcessMemory fail and leave the destination zeroed
+// rather than crash, and callers do rely on getting 0 back from a dead object
+// (isChestOpened, isNpcType, the object-stack scans...). __try cannot live in a
+// function that needs C++ object unwinding, so these are standalone and POD-only.
+inline bool ProcAnalyzerSafeCopy(void* dst, const void* src, size_t size) noexcept
+{
+	__try
+	{
+		memcpy(dst, src, size);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+// Write variant. The common case is a plain writable data page and costs nothing
+// extra; only if that faults do we fall back to the old make-it-writable dance,
+// so read-only targets still behave the way VirtualProtectEx used to allow.
+inline bool ProcAnalyzerSafeWrite(void* dst, const void* src, size_t size) noexcept
+{
+	if (ProcAnalyzerSafeCopy(dst, src, size))
+		return true;
+
+	DWORD oldProtect = 0;
+	if (!VirtualProtect(dst, size, PAGE_READWRITE, &oldProtect))
+		return false;
+
+	const bool ok = ProcAnalyzerSafeCopy(dst, src, size);
+
+	DWORD restored = 0;
+	VirtualProtect(dst, size, oldProtect, &restored);
+	return ok;
+}
 
 class ProcessAnalyzer
 {
@@ -62,60 +109,27 @@ public:
 		return processHandle;
 	}
 
+	// Direct writes - see ProcAnalyzerSafeWrite above. `process` is kept only so the
+	// existing call sites and overloads compile unchanged; we are always our own
+	// process. No error spam on failure: a stale address is an expected outcome
+	// here, and this runs on the game thread.
 	void writeData(HANDLE process, LPVOID address, std::vector<uint8_t> data)
 	{
-		if (process == NULL)
-		{
-			printf("Error: Process Not Specified\n");
+		(void)process;
+		if (address == nullptr || data.empty())
 			return;
-		}
 
-		SIZE_T dwSize = data.size();
-		DWORD oldProtect;
-
-		//change protection for the slelcted memory to read and write
-		if (!VirtualProtectEx(process, address, dwSize, PAGE_EXECUTE_READWRITE, &oldProtect))
-		{
-			printf("Error: %lu\n", GetLastError());
-			return;
-		}
-
-		//write the data
-		if (!WriteProcessMemory(process, address, data.data(), dwSize, NULL))
-		{
-			printf("Error: %lu\n", GetLastError());
-		}
-
-		//change protection to the previous state
-		VirtualProtectEx(process, address, dwSize, oldProtect, NULL);
+		ProcAnalyzerSafeWrite(address, data.data(), data.size());
 	}
 
+	// Direct reads. The vector is value-initialised, so a faulting address still
+	// yields zeroes exactly as the old ReadProcessMemory failure path did.
 	std::vector<uint8_t> readData(HANDLE process, LPVOID address, size_t bytesSize)
 	{
+		(void)process;
 		std::vector<uint8_t> data(bytesSize);
-		if (process == NULL)
-		{
-			printf("Error: Process Not Specified\n");
-			return data;
-		}
-
-		// Change memory protection to PAGE_READWRITE
-		DWORD oldProtect;
-		if (!VirtualProtectEx(process, address, bytesSize, PAGE_READWRITE, &oldProtect))
-		{
-			printf("Error: Could not change memory protection: %lu\n", GetLastError());
-			return data;
-		}
-
-		// Read the memory
-		if (!ReadProcessMemory(process, address, data.data(), bytesSize, NULL))
-		{
-			printf("Error: Could not read memory: %lu\n", GetLastError());
-			return data;
-		}
-
-		// Restore the old protection
-		VirtualProtectEx(process, address, bytesSize, oldProtect, &oldProtect);
+		if (address != nullptr && bytesSize != 0)
+			ProcAnalyzerSafeCopy(data.data(), address, bytesSize);
 
 		return data;
 	}

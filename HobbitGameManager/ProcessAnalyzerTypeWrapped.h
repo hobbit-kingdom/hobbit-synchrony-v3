@@ -42,11 +42,21 @@ public:
 		getProcess(processName.c_str());
 	}
 	
+	// Scalar fast paths: copy straight to/from the address, no temporary vector and
+	// no syscall. This is what the object-stack scans (findGameObjByGUID and
+	// friends) hammer, so the allocation mattered as much as the syscall did.
+	// Behaviour is unchanged on x86: convertToType only byte-swapped when the
+	// system endianness differed from little-endian, which it never does here.
 	template <typename T>
 	void writeData(HANDLE process, LPVOID address, T data)
 	{
-		ProcessAnalyzer::writeData(process, address, convertToUint8Vector(data));
+		(void)process;
+		if (address != nullptr)
+			ProcAnalyzerSafeWrite(address, &data, sizeof(T));
 	}
+	// NOTE: the vector overload keeps routing through convertToUint8Vector because
+	// that one byte-swaps by default (inputBigEndian = true). Do not "simplify" it
+	// into a straight copy.
 	template <typename T>
 	void writeData(HANDLE process, LPVOID address, std::vector<T> data)
 	{
@@ -56,7 +66,12 @@ public:
 	template <typename T>
 	T readData(HANDLE process, LPVOID address)
 	{
-		return convertToType<T>(ProcessAnalyzer::readData(process, address, sizeof(T)));
+		(void)process;
+		T value{};
+		if (address != nullptr)
+			ProcAnalyzerSafeCopy(&value, address, sizeof(T));
+
+		return value;
 	}
 	template <typename T>
 	std::vector<T> readData(HANDLE process, LPVOID address, size_t size)

@@ -57,11 +57,19 @@ public:
 		return ProcessAnalyzerTypeWrapped::searchProcessMemory(hobbitProcess, convertToUint8Vector(pattern));
 	}
 
+	// The address-based accessors every call site in the mod goes through. Direct
+	// reads/writes into our own address space - see ProcAnalyzerSafeCopy in
+	// ProcessAnalyzer.h for why, and for the SEH guard that keeps the old
+	// "bad address yields 0 instead of a crash" behaviour.
 	template <typename T>
 	T readData(uint32_t address)
 	{
-		if (!isProcessSet()) return 0;
-		return convertToType<T>(ProcessAnalyzer::readData(hobbitProcess, (LPVOID)address, sizeof(T)));
+		if (!isProcessSet()) return T{};
+		T value{};
+		if (address != 0)
+			ProcAnalyzerSafeCopy(&value, reinterpret_cast<const void*>(address), sizeof(T));
+
+		return value;
 	}
 	template <typename T>
 	std::vector<T> readData(uint32_t address, size_t byesSize)
@@ -75,7 +83,8 @@ public:
 	void writeData(uint32_t address, T data)
 	{
 		if (!isProcessSet()) return;
-		ProcessAnalyzerTypeWrapped::writeData(hobbitProcess, (LPVOID)address, data);
+		if (address != 0)
+			ProcAnalyzerSafeWrite(reinterpret_cast<void*>(address), &data, sizeof(T));
 	}
 	template <typename T>
 	void writeData(uint32_t address, std::vector<T> data)
