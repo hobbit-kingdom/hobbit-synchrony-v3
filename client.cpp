@@ -1156,8 +1156,9 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 // its own AI back the moment a script returns it to neutral.
 static void changeEnemiesAIMode(int mode)
 {
-	if (nowLevel == 9)
-		return;   // level 9: leave every NPC's AI completely alone
+	// Levels that must keep their own AI untouched: 1, and 9 (Smaug).
+	if (nowLevel == 1 || nowLevel == 9)
+		return;
 
 	for (auto enemy : enemies)
 	{
@@ -1454,6 +1455,20 @@ static bool isTriggerObject(uint32_t objAddr)
 		&& processAnalyzer->readData<uint8_t>(objAddr + 0x7C) == TRIGGER_CLASS_TAG;
 }
 
+// Triggers that must stay purely local. Each client fires these on its own; syncing
+// them causes a double activation.
+static bool isSyncExcludedTrigger(uint64_t guid)
+{
+	switch (guid)
+	{
+	case 0xCA3DDF12B1857C01ULL:   // CA3DDF12_B1857C01
+	case 0xCA3DDC4FE3C7A400ULL:   // CA3DDC4F_E3C7A400
+		return true;
+	default:
+		return false;
+	}
+}
+
 static uint32_t getTriggerFlags(uint32_t objAddr)
 {
 	return processAnalyzer->readData<uint32_t>(objAddr + 0x120);
@@ -1498,6 +1513,10 @@ static void detectTriggerChanges()
 
 		uint64_t guid = processAnalyzer->readData<uint64_t>(addr + 0x08);
 		if (guid == 0)
+			continue;
+
+		// Never broadcast this one - it is local-only on every client
+		if (isSyncExcludedTrigger(guid))
 			continue;
 
 		// Skip triggers that were applied remotely this cycle
@@ -1556,6 +1575,13 @@ static void detectTriggerChanges()
 		}
 	}
 
+	// The suppression is meant to cover exactly one detection pass after a remote
+	// apply, and this is the end of that pass. It used to be inserted and never
+	// erased (only cleared on level change), which silently made a trigger
+	// one-directional forever: once a peer's activation had been applied here, our
+	// own later activations of it were skipped and never broadcast.
+	g_suppressTriggerDetection.clear();
+
 	LeaveCriticalSection(&triggerCriticalSection);
 }
 
@@ -1606,9 +1632,23 @@ static void applyQueuedTriggerPressB()
 
 	for (uint64_t triggerGuid : pending)
 	{
+		if (isSyncExcludedTrigger(triggerGuid))
+			continue;   // local-only: ignore it even if a peer sends it
+
 		uint32_t addr = processAnalyzer->findGameObjByGUID(triggerGuid);
 		if (addr == 0 || !isTriggerObject(addr))
 			continue;
+
+		// Suppress detection for this trigger so we don't echo it back. Without
+		// this, applying a remote press leaves triggerStatesCache holding the
+		// pre-fire flags, so the next detectTriggerChanges() sees a fresh rising
+		// edge on WAS_TRIGGERED and broadcasts it straight back at the sender.
+		// One-shot triggers latch and the ping-pong dies out; a RE-TRIGGERABLE one
+		// re-arms after every fire, so each bounce produces another edge and the
+		// two clients bat it back and forth forever. (Same guard OnUse already had.)
+		EnterCriticalSection(&triggerCriticalSection);
+		g_suppressTriggerDetection.insert(triggerGuid);
+		LeaveCriticalSection(&triggerCriticalSection);
 
 		// Enable the trigger and fire OnPressB
 		uint32_t flags = getTriggerFlags(addr);
@@ -1619,6 +1659,12 @@ static void applyQueuedTriggerPressB()
 		}
 
 		game_TriggerOnPressB(reinterpret_cast<void*>(addr));
+
+		// Snapshot post-apply state so detection won't echo this back
+		EnterCriticalSection(&triggerCriticalSection);
+		triggerStatesCache[triggerGuid] = getTriggerFlags(addr);
+		LeaveCriticalSection(&triggerCriticalSection);
+
 		printf("Applied remote trigger OnPressB: GUID %llu\n", triggerGuid);
 	}
 }
@@ -1676,6 +1722,9 @@ static void applyQueuedTriggerOnUse()
 
 	for (const PendingTriggerOnUse& use : pending)
 	{
+		if (isSyncExcludedTrigger(use.triggerGuid))
+			continue;   // local-only: ignore it even if a peer sends it
+
 		uint32_t addr = processAnalyzer->findGameObjByGUID(use.triggerGuid);
 		if (addr == 0 || !isTriggerObject(addr))
 			continue;
