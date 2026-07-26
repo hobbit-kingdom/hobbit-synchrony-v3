@@ -1148,6 +1148,9 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 // its own AI back the moment a script returns it to neutral.
 static void changeEnemiesAIMode(int mode)
 {
+	if (nowLevel == 9)
+		return;   // level 9: leave every NPC's AI completely alone
+
 	for (auto enemy : enemies)
 	{
 		NPC* npc = enemy.second;
@@ -2432,13 +2435,20 @@ typedef void(__fastcall* CinemaStart_t)(void* self, void* edx);
 static CinemaStart_t oCinemaStart = nullptr;
 
 CRITICAL_SECTION cinemaCriticalSection;
-static std::unordered_set<uint64_t> g_syncedCinemaGuids;   // read-only after load
+// Guarded by cinemaCriticalSection: /reloadcinemas can replace it at any time while
+// the game thread is reading it from the cinema::Start hook.
+static std::unordered_set<uint64_t> g_syncedCinemaGuids;
 static std::vector<uint64_t> g_outgoingCinemaStarts;
 static std::vector<uint64_t> g_incomingCinemaStarts;
 
-// Load the whitelist. Deliberately does NOT use loadGuidsFromFile() from shared.h:
-// that one prompts on stdin when the file is missing, which would hang the game.
-static void loadSyncedCinemaGuids()
+// Load (or re-load) the whitelist, returning how many GUIDs are now active and
+// writing the file it came from to loadedPath. Deliberately does NOT use
+// loadGuidsFromFile() from shared.h: that one prompts on stdin when the file is
+// missing, which would hang the game.
+//
+// Parses into a local set and swaps it in at the end, so the file I/O happens
+// outside the lock and a failed/missing read leaves the previous list untouched.
+static size_t loadSyncedCinemaGuids(std::string* loadedPath = nullptr)
 {
 	std::vector<std::string> candidates;
 	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SYNCED_CINEMA_FILE));
@@ -2457,6 +2467,7 @@ static void loadSyncedCinemaGuids()
 		if (!file.is_open())
 			continue;
 
+		std::unordered_set<uint64_t> parsed;
 		std::string line;
 		while (std::getline(file, line))
 		{
@@ -2465,20 +2476,36 @@ static void loadSyncedCinemaGuids()
 
 			uint64_t guid = guidFromString(line);
 			if (guid != 0)
-				g_syncedCinemaGuids.insert(guid);
+				parsed.insert(guid);
 		}
 
-		printf("Synced cinemas: %zu GUID(s) loaded from %s\n",
-			g_syncedCinemaGuids.size(), candidate.c_str());
-		return;
+		const size_t count = parsed.size();
+
+		EnterCriticalSection(&cinemaCriticalSection);
+		g_syncedCinemaGuids.swap(parsed);
+		LeaveCriticalSection(&cinemaCriticalSection);
+
+		if (loadedPath)
+			*loadedPath = candidate;
+
+		printf("Synced cinemas: %zu GUID(s) loaded from %s\n", count, candidate.c_str());
+		return count;
 	}
 
 	printf("Synced cinemas: no %s found, cutscene sync disabled\n", SYNCED_CINEMA_FILE);
+	return 0;
 }
 
 static bool isSyncedCinema(uint64_t cinemaGuid)
 {
-	return cinemaGuid != 0 && g_syncedCinemaGuids.count(cinemaGuid) != 0;
+	if (cinemaGuid == 0)
+		return false;
+
+	EnterCriticalSection(&cinemaCriticalSection);
+	const bool synced = g_syncedCinemaGuids.count(cinemaGuid) != 0;
+	LeaveCriticalSection(&cinemaCriticalSection);
+
+	return synced;
 }
 
 static void __fastcall hkCinemaStart(void* self, void* edx)
@@ -3980,6 +4007,30 @@ static void ChatCommandSyncAnim(const std::string&)
 	g_ChatOverlay.AddSystemMessage("[System] Syncing animation frames...");
 }
 
+// Re-read SYNCED_CINEMAS.txt so cutscene GUIDs can be added or removed without
+// restarting the game. The list is swapped in under cinemaCriticalSection, so it
+// is safe to do this while the cinema hook is live.
+static void ChatCommandReloadCinemas(const std::string&)
+{
+	std::string loadedPath;
+	const size_t count = loadSyncedCinemaGuids(&loadedPath);
+
+	char message[512];
+	if (loadedPath.empty())
+	{
+		snprintf(message, sizeof(message),
+			"[System] No %s found - cutscene sync is off.", SYNCED_CINEMA_FILE);
+	}
+	else
+	{
+		snprintf(message, sizeof(message),
+			"[System] Reloaded %zu synced cutscene(s) from %s",
+			count, loadedPath.c_str());
+	}
+
+	g_ChatOverlay.AddSystemMessage(message);
+}
+
 // Spawn a RigidInstance (synced to all players). Optional arg = template file name
 // in ./Templates/ (e.g. "/spawn barrel.export"); with no arg a bare object spawns.
 static void ChatCommandSpawn(const std::string& templateArg)
@@ -4055,6 +4106,7 @@ static int clientMain()
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
 	g_ChatOverlay.AddCommand("/syncanim", "- Sync animation frame of all animated objects on the level", ChatCommandSyncAnim);
+	g_ChatOverlay.AddCommand("/reloadcinemas", "- Re-read SYNCED_CINEMAS.txt (synced cutscene list)", ChatCommandReloadCinemas);
 	g_ChatOverlay.AddCommand("/spawn", "[template] - Spawn a rigid instance (synced to all players)", ChatCommandSpawn);
 	g_ChatOverlay.AddCommand("/spawnfx", "[fxName] - Play an FX effect (synced to all players)", ChatCommandSpawnFx);
 
