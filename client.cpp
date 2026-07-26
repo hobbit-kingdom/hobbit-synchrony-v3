@@ -214,6 +214,7 @@ static void applyQueuedCinemaStarts();
 static void detectLocalRingChange(void* bilboThis);
 static void applyPlayerRingVisuals();
 static void refreshRemoteSenseSnapshot();
+static void refreshRemotePainSnapshot();
 static void processLocalSpawnRequest();
 static void applyQueuedSpawns();
 static void applyQueuedFx();
@@ -272,6 +273,10 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 
 		// NPC sight: refresh what the sense hooks are allowed to see this frame.
 		refreshRemoteSenseSnapshot();
+
+		// Damage types: refresh who the fake bilbos are and which melee weapon
+		// their pain events should be attributed to this frame.
+		refreshRemotePainSnapshot();
 
 		// Object spawning: run our own /spawn request, then apply remote spawns.
 		processLocalSpawnRequest();
@@ -432,6 +437,7 @@ void InstallChestHook();   // forward decl (defined further below)
 void InstallFxHook();      // forward decl (defined further below)
 void InstallWebWallHook(); // forward decl (defined further below)
 void InstallSenseHooks();  // forward decl (defined further below)
+void InstallPainHooks();   // forward decl (defined further below)
 void InstallCinemaHook();  // forward decl (defined further below)
 void InstallLayerHooks();  // forward decl (defined further below)
 
@@ -457,6 +463,8 @@ void SetupBilboHook(void)
 	InstallWebWallHook(); // detour web_wall::StartBreakAtPoint to capture web cuts
 	InstallSenseHooks();  // detour SenseController::CanSee + UpdateSensedArray so that
 	                      // enemies need line of sight (and lose the ring) on remote players
+	InstallPainHooks();   // detour event_mgr::ApplyPainFromTable + GeneratePain so remote
+	                      // players' attacks deal their real sting/stick/fire/freeze damage
 	InstallCinemaHook();  // detour cinema::Start to share whitelisted cutscenes
 	InstallLayerHooks();  // detour load_trigger::Execute so the host re-broadcasts
 	                      // anim frames when a layer streams in
@@ -2395,6 +2403,324 @@ void InstallSenseHooks()
 	MH_CreateHook(updateSensedArray, &hkSenseUpdateSensedArray,
 		reinterpret_cast<void**>(&oSenseUpdateSensedArray));
 	MH_EnableHook(updateSensedArray);
+}
+
+// ===========================================================================
+//  Remote-Player Damage Types (pain table)
+// ===========================================================================
+//
+// Every attack gets both its damage AND its damage type from one text table,
+// AI\PAINTABLE.INFO, looked up by a string key:
+//
+//   event_mgr::HandlePainEvent @0x00574C00 composes  "<who>_<AnimEvent>[_<level>]"
+//   event_mgr::ApplyPainFromTable @0x00572CE0 looks that key up and turns the
+//   matched row's flag columns into the PainData::ePainType it hands to
+//   obj_mgr::ApplyPain:
+//       Sting 1  -> type 1          Freeze 1 -> type 18 (frost effect + freeze timer)
+//       Stick 1  -> type 2          Fire   1 -> type 19 ("Burn" effect on the bones)
+//       Webbed 1 -> type 10         BreakShields 1 -> the "charged" variant (4 / 5)
+//
+// "<who>" is the literal "BILBO" only when the attacker's object type tag
+// (object+0x7C) is 0x12, i.e. the real bilbo object. Our fake bilbos are NPC
+// objects, so they take the other branch and the key comes out as
+// "<CharacterTypeName>_Sting_Swing" - and without the "_<level>" suffix, because
+// the swing-level getters only run in the 0x12 branch. Nothing in the table
+// matches that, so ApplyPainFromTable takes its "no row" path: pain type 0
+// (Unknown) plus the hard-coded 5000 damage that applyFakeBilboDamage() patches
+// down to myFakeBilboDamage. That fallback is exactly why remote players' hits do
+// one flat amount and never freeze, burn, web or break shields.
+//
+// Thrown stones have the same problem one level down: FUN_005750E0
+// (event_mgr::GeneratePain) gates on the same 0x12 tag, so a remote fire / freeze
+// / explode stone degrades to "<CharacterTypeName>_Rocks" - one key shared by all
+// four stone types, which is why every remote stone hits identically.
+//
+// The fix here is to rewrite the key so it matches the rows the engine would have
+// used for a real Bilbo. We deliberately do NOT fake the 0x12 type tag instead:
+// that branch reads the LOCAL player's equipped weapon (bilbo+0x3C0 sting /
+// +0x3D0 staff) and will rewrite Sting_Swing into Staff_Swing - or drop the pain
+// event entirely - based on what WE are holding, which is the wrong answer for
+// somebody else's swing. So we compose the key ourselves from the weapon that was
+// networked to us along with the rest of that player's state.
+//
+// Key lookups are case-insensitive: both the table keys (at load) and the query
+// key (in ApplyPainFromTable) are folded through x_strlwr @0x00648080, so the
+// casing used below does not matter.
+//
+// This runs on EVERY peer, not only the host. Enemy health is host-authoritative
+// (EnemiesStateMessage overwrites it ~15x a second), so the host is what decides
+// how much damage ultimately sticks on an enemy - but the freeze / burn / stun /
+// knockback reactions, the impact FX, and any pain dealt to the LOCAL bilbo are
+// produced by each machine's own engine from its own pain type. Each machine
+// therefore needs the correct type, or remote fire stones look and feel inert on
+// everyone else's screen.
+
+static constexpr uint32_t PAIN_APPLYFROMTABLE_ADDR = 0x00572CE0; // event_mgr::ApplyPainFromTable
+static constexpr uint32_t PAIN_GENERATEPAIN_ADDR = 0x005750E0;   // event_mgr::GeneratePain (projectiles)
+static constexpr uint32_t BILBO_INVENTORY_ADDR = 0x0075BBE0;     // bilboInventory singleton
+
+// Weapon ids as they travel in PlayerStateMessage (see NPC::setWeapon).
+static constexpr uint32_t PAIN_WEAPON_STING = 0;
+static constexpr uint32_t PAIN_WEAPON_STAFF = 1;
+
+// Projectile types passed to Projectile::CreateProjectile (see hkCreateStoneProjectile).
+static constexpr int PAIN_PROJ_STONE_NORMAL = 0x19;
+static constexpr int PAIN_PROJ_STONE_FIRE = 0x1A;
+static constexpr int PAIN_PROJ_STONE_EXPLODE = 0x1B;
+static constexpr int PAIN_PROJ_STONE_FREEZE = 0x1C;
+
+// bilboInventory upgrade-tier getters. __thiscall with no arguments (ECX = the
+// inventory singleton, result in ST0), so they are declared __fastcall with a
+// filler EDX exactly like the other detoured __thiscall members in this file.
+// These are the same getters bilbo::GetSwingLevel/GetJumpLevel call, so the tier
+// we append is the one the engine itself would have produced.
+typedef float(__fastcall* InvLevel_t)(void* inv, void* edx);
+static const InvLevel_t game_GetStingSwingLevel = reinterpret_cast<InvLevel_t>(0x004373B0);
+static const InvLevel_t game_GetStingJumpLevel = reinterpret_cast<InvLevel_t>(0x00437420);
+static const InvLevel_t game_GetStaffSwingLevel = reinterpret_cast<InvLevel_t>(0x00437490);
+static const InvLevel_t game_GetStaffJumpLevel = reinterpret_cast<InvLevel_t>(0x00437500);
+static const InvLevel_t game_GetStaffAEJumpLevel = reinterpret_cast<InvLevel_t>(0x00437570);
+static const InvLevel_t game_GetStoneThrowLevel = reinterpret_cast<InvLevel_t>(0x004375E0);
+
+// Upgrade tiers are the one part of a remote swing we cannot know: they live in
+// that player's own inventory, which is not networked. 0 mirrors our own tier for
+// the same move (right in co-op, where progression is shared); 1..3 forces one.
+static int g_remotePainLevelOverride = 0;
+
+// Per-frame snapshot of who the fake bilbos are and what they are holding. Built
+// on the game thread from activePlayers, read on the game thread by the two hooks
+// below, so it needs no locking of its own - same arrangement as g_senseSnapshot.
+struct RemotePlayerPain
+{
+	uint64_t guid = 0;
+	uint32_t meleeWeapon = PAIN_WEAPON_STAFF;
+};
+
+static constexpr int MAX_PAIN_PLAYERS = 16;
+static RemotePlayerPain g_painSnapshot[MAX_PAIN_PLAYERS];
+static int              g_painSnapshotCount = 0;
+
+// The networked weapon is whatever that player currently has selected, which
+// includes stones and "none" - neither of which tells us which melee weapon their
+// swing belongs to. So we remember the last real melee weapon we saw per player
+// and keep using it while they are holding something else. Game thread only.
+static std::unordered_map<uint64_t, uint32_t> g_lastMeleeWeapon;
+
+static void refreshRemotePainSnapshot()
+{
+	int count = 0;
+
+	EnterCriticalSection(&playersCriticalSection);
+	for (auto& p : activePlayers)
+	{
+		if (count >= MAX_PAIN_PLAYERS)
+			break;
+		if (p.npcGuid == 0 || !p.npc)
+			continue;
+
+		if (p.bilboWeapon == PAIN_WEAPON_STING || p.bilboWeapon == PAIN_WEAPON_STAFF)
+			g_lastMeleeWeapon[p.npcGuid] = p.bilboWeapon;
+
+		auto remembered = g_lastMeleeWeapon.find(p.npcGuid);
+
+		g_painSnapshot[count].guid = p.npcGuid;
+		g_painSnapshot[count].meleeWeapon = (remembered != g_lastMeleeWeapon.end())
+			? remembered->second : PAIN_WEAPON_STAFF;   // staff is what Bilbo starts with
+		++count;
+	}
+	LeaveCriticalSection(&playersCriticalSection);
+
+	g_painSnapshotCount = count;
+}
+
+static const RemotePlayerPain* findRemotePain(uint64_t guid)
+{
+	if (guid == 0)
+		return nullptr;
+	for (int i = 0; i < g_painSnapshotCount; ++i)
+	{
+		if (g_painSnapshot[i].guid == guid)
+			return &g_painSnapshot[i];
+	}
+	return nullptr;
+}
+
+// Rows only exist for tiers 1..3.
+static int clampPainLevel(float raw)
+{
+	int level = static_cast<int>(raw);
+	if (level < 1) level = 1;
+	if (level > 3) level = 3;
+	return level;
+}
+
+static int remotePainLevel(InvLevel_t getter)
+{
+	if (g_remotePainLevelOverride >= 1 && g_remotePainLevelOverride <= 3)
+		return g_remotePainLevelOverride;
+	return clampPainLevel(getter(reinterpret_cast<void*>(BILBO_INVENTORY_ADDR), nullptr));
+}
+
+// Does this key end with "_<suffix>"? The key at this point is
+// "<CharacterTypeName>_<AnimEvent>" with every space already turned into an
+// underscore, so anchoring on the trailing event name is safer than splitting on
+// the first underscore (character type names can contain spaces).
+static bool painKeyEndsWith(const char* key, const char* suffix)
+{
+	const size_t keyLen = strlen(key);
+	const size_t sufLen = strlen(suffix);
+	return keyLen > sufLen + 1
+		&& key[keyLen - sufLen - 1] == '_'
+		&& _stricmp(key + keyLen - sufLen, suffix) == 0;
+}
+
+// Map a fake bilbo's pain key onto the move the Bilbo_* rows are written for.
+// Returns the event name to use, or nullptr when this key is not one of the melee
+// events the table covers (Throw, enemy events, anything already rewritten).
+//
+// An explicit "Staff_*" event is trusted as-is; "Sting_*" is the shared/default
+// spelling the engine itself remaps by equipped weapon, so that is where the
+// networked weapon decides.
+static const char* remoteBilboPainEvent(const char* key, uint32_t meleeWeapon, int* levelOut)
+{
+	const bool staff = (meleeWeapon == PAIN_WEAPON_STAFF);
+
+	if (painKeyEndsWith(key, "Staff_AE_Jump"))
+	{
+		*levelOut = remotePainLevel(game_GetStaffAEJumpLevel);
+		return "Staff_AE_Jump";
+	}
+	if (painKeyEndsWith(key, "Staff_Swing"))
+	{
+		*levelOut = remotePainLevel(game_GetStaffSwingLevel);
+		return "Staff_Swing";
+	}
+	if (painKeyEndsWith(key, "Staff_Jump"))
+	{
+		*levelOut = remotePainLevel(game_GetStaffJumpLevel);
+		return "Staff_Jump";
+	}
+	if (painKeyEndsWith(key, "Sting_Swing"))
+	{
+		*levelOut = remotePainLevel(staff ? game_GetStaffSwingLevel : game_GetStingSwingLevel);
+		return staff ? "Staff_Swing" : "Sting_Swing";
+	}
+	if (painKeyEndsWith(key, "Sting_Jump"))
+	{
+		*levelOut = remotePainLevel(staff ? game_GetStaffJumpLevel : game_GetStingJumpLevel);
+		return staff ? "Staff_Jump" : "Sting_Jump";
+	}
+
+	return nullptr;
+}
+
+// public: void __thiscall event_mgr::ApplyPainFromTable(char* key, unsigned lo,
+//         unsigned hi, vector3 pos /*by value*/, float radius, unsigned classMask,
+//         int excludeTypeTag)
+typedef void(__fastcall* ApplyPainFromTable_t)(
+	void* mgr, void* edx, const char* key,
+	uint32_t guidLo, uint32_t guidHi,
+	float x, float y, float z,
+	float radius, uint32_t classMask, int excludeTypeTag);
+static ApplyPainFromTable_t oApplyPainFromTable = nullptr;
+
+// private: void __thiscall event_mgr::GeneratePain(unsigned lo, unsigned hi,
+//          int projectileType, const vector3* pos, float radius,
+//          unsigned classMask, int excludeTypeTag)
+typedef void(__fastcall* GeneratePain_t)(
+	void* mgr, void* edx,
+	uint32_t guidLo, uint32_t guidHi, int projType,
+	const Vector3* pos, float radius, uint32_t classMask, int excludeTypeTag);
+static GeneratePain_t oGeneratePain = nullptr;
+
+static void __fastcall hkApplyPainFromTable(
+	void* mgr, void* edx, const char* key,
+	uint32_t guidLo, uint32_t guidHi,
+	float x, float y, float z,
+	float radius, uint32_t classMask, int excludeTypeTag)
+{
+	char rewritten[64];
+
+	if (key)
+	{
+		const uint64_t owner = (static_cast<uint64_t>(guidHi) << 32) | guidLo;
+		if (const RemotePlayerPain* p = findRemotePain(owner))
+		{
+			int level = 1;
+			if (const char* event = remoteBilboPainEvent(key, p->meleeWeapon, &level))
+			{
+				sprintf_s(rewritten, sizeof(rewritten), "BILBO_%s_%d", event, level);
+				key = rewritten;
+			}
+		}
+	}
+
+	oApplyPainFromTable(mgr, edx, key, guidLo, guidHi, x, y, z,
+		radius, classMask, excludeTypeTag);
+}
+
+static void __fastcall hkGeneratePain(
+	void* mgr, void* edx,
+	uint32_t guidLo, uint32_t guidHi, int projType,
+	const Vector3* pos, float radius, uint32_t classMask, int excludeTypeTag)
+{
+	const uint64_t owner = (static_cast<uint64_t>(guidHi) << 32) | guidLo;
+
+	if (pos && findRemotePain(owner))
+	{
+		char key[64];
+		bool haveKey = true;
+
+		switch (projType)
+		{
+		case PAIN_PROJ_STONE_FIRE:
+			strcpy_s(key, sizeof(key), "BILBO_STONE_THROW_FIRE");
+			break;
+		case PAIN_PROJ_STONE_EXPLODE:
+			strcpy_s(key, sizeof(key), "BILBO_STONE_THROW_EXPLODE");
+			break;
+		case PAIN_PROJ_STONE_FREEZE:
+			strcpy_s(key, sizeof(key), "BILBO_STONE_THROW_FREEZE");
+			break;
+		case PAIN_PROJ_STONE_NORMAL:
+			// Plain stones are tiered like the melee moves. The engine reads this
+			// tier off the LOCAL bilbo even for a projectile it did not throw, so
+			// mirroring our own inventory here is not an approximation - it is
+			// what the original code does.
+			sprintf_s(key, sizeof(key), "BILBO_STONE_THROW_%d",
+				remotePainLevel(game_GetStoneThrowLevel));
+			break;
+		default:
+			haveKey = false;   // staff/sting jump projectiles: no Bilbo_* rows exist
+			break;
+		}
+
+		if (haveKey && oApplyPainFromTable)
+		{
+			// Straight to the table with our key. The trampoline is used so this
+			// does not re-enter hkApplyPainFromTable.
+			oApplyPainFromTable(mgr, edx, key, guidLo, guidHi,
+				pos->x, pos->y, pos->z, radius, classMask, excludeTypeTag);
+			return;
+		}
+	}
+
+	oGeneratePain(mgr, edx, guidLo, guidHi, projType, pos, radius, classMask, excludeTypeTag);
+}
+
+void InstallPainHooks()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* applyFromTable = reinterpret_cast<void*>(PAIN_APPLYFROMTABLE_ADDR);
+	MH_CreateHook(applyFromTable, &hkApplyPainFromTable,
+		reinterpret_cast<void**>(&oApplyPainFromTable));
+	MH_EnableHook(applyFromTable);
+
+	void* generatePain = reinterpret_cast<void*>(PAIN_GENERATEPAIN_ADDR);
+	MH_CreateHook(generatePain, &hkGeneratePain,
+		reinterpret_cast<void**>(&oGeneratePain));
+	MH_EnableHook(generatePain);
 }
 
 // ===========================================================================

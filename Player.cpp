@@ -107,6 +107,9 @@ static std::unordered_map<uint32_t, float> g_learnedAnimPeak = {
 	{ 17, 39.0f },   // death: falls and lies down; measured 39 frames
 };
 
+// Health every remote player's fake bilbo is held at (NPCObject+0x290).
+static constexpr float FAKE_BILBO_HEALTH = 1000.0f;
+
 void Player::tickLerp(float t)
 {
 	if (!npc || !npc->isValid())
@@ -124,6 +127,12 @@ void Player::tickLerp(float t)
 	// --- Rotation (direct) ---
 	rotationY = targetRotationY;
 	npc->setRotationY(rotationY);
+
+	// --- Health ---
+	// Pinned every frame rather than set once: a remote player's real health lives
+	// on their own client, so the local AI chipping this copy down would only ever
+	// desync it - and at 0 the engine would kill the fake bilbo out from under them.
+	npc->setHealth(FAKE_BILBO_HEALTH);
 
 	// --- Animation frames ---
 	//animFrame = MathUtils::lerp(prevAnimFrame, targetAnimFrame, t);
