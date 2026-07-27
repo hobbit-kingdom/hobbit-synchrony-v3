@@ -68,7 +68,8 @@ public:
 	{
 		if (m_publicIp.empty() || m_publicIp == "0.0.0.0")
 		{
-			printf("Secure token server requires a reachable public_ip/server_ip in %s\n", NetDefaults::CONFIG_FILE);
+			printf("Secure token server requires a reachable server_ip (or public_ip) in %s\n",
+				SkinSync::LocalConfigFile);
 			return false;
 		}
 
@@ -1029,6 +1030,9 @@ static int serverMain()
 		SecureConnect::PrivateKeyFile);
 
 	const SecureConnect::NetworkSettings networkSettings = SecureConnect::loadNetworkSettings();
+	printf("Server settings from: %s\n", networkSettings.sourceFile.empty()
+		? "built-in default (no bind_ip / server_ip found)"
+		: networkSettings.sourceFile.c_str());
 	printf("Server bind IP: %s\n", networkSettings.bindIp.c_str());
 	printf("Server public IP for tokens: %s\n", networkSettings.publicIp.c_str());
 

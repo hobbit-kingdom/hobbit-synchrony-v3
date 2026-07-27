@@ -10,6 +10,7 @@
 
 #include "kiero.h"
 #include "minhook/MinHook.h"
+#include "DebugLog.h"
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
@@ -525,11 +526,21 @@ static HWND FindMainWindow()
 //  Init / Shutdown
 // ===========================================================================
 
+// Lists the player-facing commands, plus the development ones when debug=1.
+// Keeps the chat box open so the whole list stays readable at full alpha instead
+// of fading out; Enter on an empty line closes it as usual.
 static void HelpCommand(const std::string&)
 {
+	g_ChatOverlay.m_KeepChatOpen = true;
+
 	g_ChatOverlay.AddSystemMessage("[System] Available commands:");
-	for(size_t i = 0; i < g_ChatOverlay.m_Commands.size(); i++) {
-		g_ChatOverlay.AddSystemMessage("  " + g_ChatOverlay.m_Commands[i].cmd + " " + g_ChatOverlay.m_Commands[i].desc);
+	for (size_t i = 0; i < g_ChatOverlay.m_Commands.size(); i++)
+	{
+		const ChatCommand& command = g_ChatOverlay.m_Commands[i];
+		if (command.listing == ChatCommandListing::DebugOnly && !g_debugLogging)
+			continue;
+
+		g_ChatOverlay.AddSystemMessage("  " + command.cmd + " " + command.desc);
 	}
 }
 
@@ -604,7 +615,7 @@ void ChatOverlay::SendChatMessage(const std::string& msg)
 
 	m_ChatHistory.push_back({clean, GetTickCount()});
 	m_LastMessageTime = GetTickCount();
-	if (m_ChatHistory.size() > 6)
+	if (m_ChatHistory.size() > MaxChatHistory)
 		m_ChatHistory.erase(m_ChatHistory.begin());
 }
 
@@ -612,7 +623,7 @@ void ChatOverlay::AddSystemMessage(const std::string& text)
 {
 	m_ChatHistory.push_back({SanitizeChatText(text, MaxChatDisplayLength), GetTickCount()});
 	m_LastMessageTime = GetTickCount();
-	if (m_ChatHistory.size() > 6)
+	if (m_ChatHistory.size() > MaxChatHistory)
 		m_ChatHistory.erase(m_ChatHistory.begin());
 }
 
@@ -657,6 +668,10 @@ void ChatOverlay::ProcessChatSend()
 		return;
 	}
 
+	// A command may ask to keep the box open (see HelpCommand); default is the
+	// old behaviour of closing as soon as the line is handled.
+	m_KeepChatOpen = false;
+
 	if (input[0] == '/')
 	{
 		std::string command = input;
@@ -686,7 +701,8 @@ void ChatOverlay::ProcessChatSend()
 
 	found:
 	m_ChatBuffer.clear();
-	m_ChatOpen = false;
+	m_ChatOpen = m_KeepChatOpen;
+	m_KeepChatOpen = false;
 }
 
 void ChatOverlay::Render(LPDIRECT3DDEVICE9 pDevice)
@@ -724,8 +740,9 @@ void ChatOverlay::Render(LPDIRECT3DDEVICE9 pDevice)
 		}
 	}
 
+	// Open or closed, never draw more lines than fit above the input box.
 	int histSize = (int)m_ChatHistory.size();
-	int showCount = m_ChatOpen ? histSize : (histSize < 6 ? histSize : 6);
+	int showCount = (histSize < MaxVisibleChatLines) ? histSize : MaxVisibleChatLines;
 	int startIdx = (int)m_ChatHistory.size() - showCount;
 	D3DCOLOR color = D3DCOLOR_ARGB((BYTE)alpha, 255, 255, 255);
 	for (int i = 0; i < showCount; i++)
@@ -771,7 +788,8 @@ void ChatOverlay::SetMsgCallback(ChatMessageCallback_t callback)
 	m_MsgCallback = callback;
 }
 
-void ChatOverlay::AddCommand(const std::string &name, const std::string &desc, ChatCommandCallback_t callback)
+void ChatOverlay::AddCommand(const std::string &name, const std::string &desc, ChatCommandCallback_t callback,
+	ChatCommandListing listing)
 {
-	m_Commands.push_back({name,desc,callback});
+	m_Commands.push_back({name,desc,callback,listing});
 }

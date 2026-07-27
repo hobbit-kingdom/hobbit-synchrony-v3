@@ -8,6 +8,7 @@
 #include <future>
 #include <chrono>
 #include "HobbitProcessAnalyzer.h"
+#include "DebugLog.h"
 class HobbitGameManager
 {
 
@@ -16,8 +17,8 @@ public:
 
 	HobbitGameManager()
 	{
-		printf("Moved log option 'HOBBIT PROC ANALYZ' to 'HOBBIT GAME MANAGER'\n");
-		printf("Displaying log hierarchy\n");
+		dprintf("Moved log option 'HOBBIT PROC ANALYZ' to 'HOBBIT GAME MANAGER'\n");
+		dprintf("Displaying log hierarchy\n");
 	}
 	~HobbitGameManager()
 	{
@@ -29,7 +30,7 @@ public:
 		// Wait Until the game is open
 		while (!isGameRunning())
 		{
-			printf("You must open the game!\n");
+			dprintf("You must open the game!\n");
 			std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep for 2 seconds
 		}
 

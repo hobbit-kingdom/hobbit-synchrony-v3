@@ -37,7 +37,11 @@ namespace SkinSync
 	constexpr int MaxFileNameLength = 128;
 	constexpr int MaxSkinFileBytes = 256 * 1024;
 
-	constexpr const char* LocalSkinConfigFile = "skin_config.txt";
+	// The client's settings file: skin, player profile, server address, logging.
+	// It started out skin-only, hence living in this header; the old name is still
+	// accepted so an existing install does not silently lose its settings.
+	constexpr const char* LocalConfigFile = "synchrony_config.txt";
+	constexpr const char* LegacyLocalConfigFile = "skin_config.txt";
 	constexpr const char* InstalledPropsDirectory = "common/props";
 
 	struct LocalSkinDefinition
@@ -198,16 +202,11 @@ namespace SkinSync
 		return true;
 	}
 
-	inline bool removeInstalledSkinFileByPath(const std::string& path)
-	{
-		if (path.empty())
-			return false;
+	// NOTE: installed skins are never removed from disk. See processSkinClear in
+	// client.cpp for why - the file name is what the level data binds a slot's
+	// geometry to, so deleting it would leave a dangling resource reference.
 
-		std::error_code error;
-		return fs::remove(fs::path(path), error);
-	}
-
-	inline bool loadLocalSkinDefinition(LocalSkinDefinition& outSkin, const std::string& configPath = LocalSkinConfigFile, std::string* errorMessage = nullptr)
+	inline bool loadLocalSkinDefinition(LocalSkinDefinition& outSkin, const std::string& configPath = LocalConfigFile, std::string* errorMessage = nullptr)
 	{
 		outSkin = {};
 

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include "DebugLog.h"
 
 // ---------------------------------------------------------------------------
 // In-process memory access
@@ -74,7 +75,7 @@ public:
 		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 		if (snapshot == INVALID_HANDLE_VALUE)
 		{
-			printf("Error: %lu\n", GetLastError());
+			dprintf("Error: %lu\n", GetLastError());
 			return nullptr;
 		}
 
@@ -100,7 +101,7 @@ public:
 			CloseHandle(snapshot);
 
 		if (pid == 0) {
-			printf("Warning: %s - Process Not Found\n", processName);
+			dprintf("Warning: %s - Process Not Found\n", processName);
 			return nullptr;
 		}
 

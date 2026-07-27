@@ -11,13 +11,14 @@
 #endif
 #include<unordered_map>
 #include <iomanip>
+#include "DebugLog.h"
 #include"ProcessAnalyzerTypeWrapped.h"
 class HobbitProcessAnalyzer : public ProcessAnalyzerTypeWrapped
 {
 public:
 	HobbitProcessAnalyzer()
 	{
-		printf("Moved log option 'PROC ANALYZ WRAP' to 'HOBBIT PROC ANALYZ'\n");
+		dprintf("Moved log option 'PROC ANALYZ WRAP' to 'HOBBIT PROC ANALYZ'\n");
 	}
 	void updatePtrToProcess()
 	{
@@ -35,7 +36,7 @@ public:
 
 	bool isProcessSet() {
 		if (hobbitProcess == nullptr)
-			printf("Error: Hobbit Process is NOT set\n");
+			dprintf("Error: Hobbit Process is NOT set\n");
 
 		return (hobbitProcess != nullptr);
 	}
@@ -106,7 +107,7 @@ public:
 			std::lock_guard<std::mutex> lock(objectStackMutex);
 			objectStackAddress = 0;
 			objectStackSize = 0;
-			printf("Warning: Failed to read Object Stack Address from memory address 0x0076F648. Exception: %s\n", e.what());
+			dprintf("Warning: Failed to read Object Stack Address from memory address 0x0076F648. Exception: %s\n", e.what());
 		}
 	}
 
@@ -133,7 +134,7 @@ public:
 			}
 		}
 		//hex
-		printf("Warning: Couldn't find GUID in the Game Object Stack\n");
+		dprintf("Warning: Couldn't find GUID in the Game Object Stack\n");
 		return 0;
 	}
 	uint32_t findGameObjStackByPtrGUID(uint64_t guid)
@@ -159,7 +160,7 @@ public:
 			}
 		}
 		//hex
-		printf("Warning: Couldn't find GUID in the Game Object Stack\n");
+		dprintf("Warning: Couldn't find GUID in the Game Object Stack\n");
 		return 0;
 	}
 
@@ -192,7 +193,7 @@ public:
 
 		if (gameObjs.size() == 0)
 		{
-			printf("Warning: Couldn't find pattern in the Game Object Stack\n");
+			dprintf("Warning: Couldn't find pattern in the Game Object Stack\n");
 		}
 
 		return gameObjs;

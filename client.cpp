@@ -37,6 +37,7 @@
 #include "ChatOverlay.h"
 #include "meridian.hpp"        // bilbo class + existing hooks (still needed by the rest of this file)
 #include "minhook/MinHook.h"   // CreateStoneProjectile detour (MinHook is compiled into the project)
+#include "DebugLog.h"
 
 using namespace yojimbo;
 
@@ -95,8 +96,8 @@ static std::unordered_map<uint64_t, std::string> playerSkinFilePaths;
 static SkinSync::LocalSkinDefinition localSkinDefinition;
 static bool localSkinLoaded = false;
 static bool localSkinUploadAttempted = false;
-static std::string localSkinConfigPath;
-static std::string localSkinConfigError;
+static std::string localConfigPath;
+static std::string localSkinError;
 static std::unordered_map<uint64_t, std::string> pendingNicknames;
 static std::unordered_map<uint64_t, std::string> pendingStatuses;
 
@@ -294,7 +295,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 		if (upd.updated) {
 			if (upd.pObject->objectClass() == CLASS_PushBox) {
 				upd.pObject->xSetPosition(upd.x, upd.y, upd.z);
-				printf("UPDATE PUHSHBOX %.2f  %.2f  %.2f\n", upd.x, upd.y, upd.z);
+				dprintf("UPDATE PUHSHBOX %.2f  %.2f  %.2f\n", upd.x, upd.y, upd.z);
 			}
 			else
 				upd.pObject->setPosition(upd.x, upd.y, upd.z);
@@ -434,7 +435,7 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 			memcpy(&fn, &addr, 4);
 			(pObj->*fn)(reinterpret_cast<const vector3&>(wb.point));
 
-			printf("Applied remote web wall break: GUID %llu\n", wb.guid);
+			dprintf("Applied remote web wall break: GUID %llu\n", wb.guid);
 		}
 	}
 }
@@ -508,18 +509,33 @@ static void appendUniqueConfigCandidate(std::vector<std::string>& candidates, co
 	candidates.push_back(value);
 }
 
-static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition& outSkin, std::string& loadedPath, std::string& errorMessage)
+// Where the client's settings file may live: current folder, game exe folder,
+// DLL folder - the current name in all three first, then the pre-rename name, so
+// a new config always wins over a leftover skin_config.txt.
+static std::vector<std::string> buildLocalConfigCandidates()
 {
 	std::vector<std::string> candidates;
-	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SkinSync::LocalSkinConfigFile));
 
 	const std::string exeDirectory = getModuleDirectory(nullptr);
-	if (!exeDirectory.empty())
-		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / SkinSync::LocalSkinConfigFile);
-
 	const std::string dllDirectory = getModuleDirectory(moduleInstance);
-	if (!dllDirectory.empty())
-		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / SkinSync::LocalSkinConfigFile);
+
+	for (const char* fileName : { SkinSync::LocalConfigFile, SkinSync::LegacyLocalConfigFile })
+	{
+		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(fileName));
+
+		if (!exeDirectory.empty())
+			appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / fileName);
+
+		if (!dllDirectory.empty())
+			appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / fileName);
+	}
+
+	return candidates;
+}
+
+static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition& outSkin, std::string& loadedPath, std::string& errorMessage)
+{
+	std::vector<std::string> candidates = buildLocalConfigCandidates();
 
 	std::string firstDetailedError;
 
@@ -545,27 +561,22 @@ static bool loadLocalSkinDefinitionFromKnownPaths(SkinSync::LocalSkinDefinition&
 	}
 	else
 	{
-		errorMessage = "skin_config.txt was not found in the current folder, game exe folder, or DLL folder";
+		errorMessage = std::string(SkinSync::LocalConfigFile)
+			+ " was not found in the current folder, game exe folder, or DLL folder";
 	}
 
 	return false;
 }
 
+// The settings file every non-skin reader/writer uses. Prefers the one the skin
+// loader already opened, then the first candidate that exists; if none does, the
+// current name in the current folder, so a first save creates the right file.
 static std::string resolveLocalProfileConfigPath()
 {
-	if (!localSkinConfigPath.empty())
-		return localSkinConfigPath;
+	if (!localConfigPath.empty())
+		return localConfigPath;
 
-	std::vector<std::string> candidates;
-	appendUniqueConfigCandidate(candidates, SkinSync::fs::path(SkinSync::LocalSkinConfigFile));
-
-	const std::string exeDirectory = getModuleDirectory(nullptr);
-	if (!exeDirectory.empty())
-		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(exeDirectory) / SkinSync::LocalSkinConfigFile);
-
-	const std::string dllDirectory = getModuleDirectory(moduleInstance);
-	if (!dllDirectory.empty())
-		appendUniqueConfigCandidate(candidates, SkinSync::fs::path(dllDirectory) / SkinSync::LocalSkinConfigFile);
+	std::vector<std::string> candidates = buildLocalConfigCandidates();
 
 	for (const auto& candidate : candidates)
 	{
@@ -574,7 +585,7 @@ static std::string resolveLocalProfileConfigPath()
 			return candidate;
 	}
 
-	return candidates.empty() ? std::string(SkinSync::LocalSkinConfigFile) : candidates.front();
+	return candidates.empty() ? std::string(SkinSync::LocalConfigFile) : candidates.front();
 }
 
 static std::string sanitizeIdentityValue(const std::string& value, size_t maxLength)
@@ -650,6 +661,66 @@ static uint32_t resolveLocalWeaponId(uint32_t weaponValue)
 	}
 
 	return NetworkClamp::WeaponDefault;
+}
+
+// Read one setting out of the config file, accepting any of the given key
+// spellings. Returns an empty string when the key is absent; the last occurrence
+// wins, matching how the profile loader treats duplicates.
+//
+// Used for the settings that are needed on their own, before or without the
+// skin/profile loaders: they still work when the file has neither skin nor
+// profile keys in it.
+static std::string readLocalConfigValue(std::initializer_list<const char*> keys)
+{
+	std::ifstream configFile(resolveLocalProfileConfigPath());
+	if (!configFile.is_open())
+		return {};
+
+	std::string result;
+	std::string line;
+	while (std::getline(configFile, line))
+	{
+		line = SkinSync::trim(line);
+		if (line.empty() || line[0] == '#' || line[0] == ';')
+			continue;
+
+		const size_t separator = line.find('=');
+		if (separator == std::string::npos)
+			continue;
+
+		std::string key = SkinSync::trim(line.substr(0, separator));
+		std::transform(key.begin(), key.end(), key.begin(),
+			[](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+		for (const char* wanted : keys)
+		{
+			if (key == wanted)
+				result = SkinSync::stripQuotes(SkinSync::trim(line.substr(separator + 1)));
+		}
+	}
+
+	return result;
+}
+
+/// Address of the server to join, or empty when the config does not set one.
+static std::string readConfiguredServerIp()
+{
+	return readLocalConfigValue({ "server_ip", "server", "ip" });
+}
+
+// Console logging is off by default so a normal session stays quiet; "debug=1"
+// turns the development output back on. Loaded before anything else, because
+// almost everything that logs runs before the profile is read.
+//
+// saveLocalPlayerProfile only rewrites the name/status/damage lines and copies
+// everything else through, so /name and /damage cannot clobber this setting.
+static void loadDebugLoggingFlag()
+{
+	std::string value = readLocalConfigValue({ "debug", "debug_log", "logging" });
+	std::transform(value.begin(), value.end(), value.begin(),
+		[](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+	g_debugLogging = (value == "1" || value == "true" || value == "yes" || value == "on");
 }
 
 static void parseLocalProfileConfigLine(const std::string& line, std::string& nickname, std::string& status, uint16_t& damage)
@@ -888,7 +959,7 @@ static void readGamePointers()
 
 	//Enemies 
 	clearEnemies();
-	printf("List Enemies\n");
+	dprintf("List Enemies\n");
 
 	//
 	hoistables.clear();
@@ -918,9 +989,9 @@ static void readGamePointers()
 	g_allTriggersAddrs = allTriggers;
 
 
-	std::cout << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
+	dcout() << "SIZE OF ALL RIGID: " << allRigidInstances.size() << '\n';
 
-	std::cout << "CHESTS AMOUNT: " << chestCount << "\n";
+	dcout() << "CHESTS AMOUNT: " << chestCount << "\n";
 
 	for (uint32_t e : allNpcAddrs)
 	{
@@ -941,12 +1012,12 @@ static void readGamePointers()
 
 		if (0xABCABCABCABCABC0 == eGuid)
 		{
-			printf("YOU ARE SETTING BILBO AS ENEMY NPC!!!");
+			dprintf("YOU ARE SETTING BILBO AS ENEMY NPC!!!");
 			continue;
 		}
 
 		//hex
-		std::cout << eGuid << " Address: " << e
+		dcout() << eGuid << " Address: " << e
 			<< " Team: " << processAnalyzer->readData<uint32_t>(e + OBJ_TEAM_OFFSET)
 			<< " Health: " << processAnalyzer->readData<float>(e + 0x290) << '\n';
 
@@ -959,7 +1030,7 @@ static void readGamePointers()
 		enemies.emplace(enemy->getGUID(), enemy);
 	}
 
-	printf("NPCs tracked: %d", enemies.size());
+	dprintf("NPCs tracked: %d", enemies.size());
 	applyFakeBilboDamage();
 }
 
@@ -1009,7 +1080,7 @@ static void __fastcall hkCreateStoneProjectile(
 	g_haveThrow = true;
 	LeaveCriticalSection(&throwCriticalSection);
 
-	printf("[stone] type 0x%02X from (%.1f, %.1f, %.1f)  ->  TO (%.1f, %.1f, %.1f)\n",
+	dprintf("[stone] type 0x%02X from (%.1f, %.1f, %.1f)  ->  TO (%.1f, %.1f, %.1f)\n",
 		type, from->x, from->y, from->z, to->x, to->y, to->z);
 	oCreateStoneProjectile(self, edx, from, to);
 }
@@ -1213,7 +1284,7 @@ static void __fastcall hkStartBreakAtPoint(void* self, void* edx, const vector3&
 			g_lastWebWallBreakPoint = { point.X, point.Y, point.Z };
 			g_haveWebWallBreak = true;
 
-			printf("Local web wall cut: GUID %llu at (%.1f, %.1f, %.1f)\n",
+			dprintf("Local web wall cut: GUID %llu at (%.1f, %.1f, %.1f)\n",
 				guid, point.X, point.Y, point.Z);
 		}
 		LeaveCriticalSection(&webWallBreak_CS);
@@ -1353,7 +1424,7 @@ static void detectPickupChanges()
 			if ((currentState & PICKUP_PICKED_UP_FLAG) && !(it->second & PICKUP_PICKED_UP_FLAG))
 			{
 				g_outgoingPickupCollects.push_back(guid);
-				printf("Pickup collected locally: GUID %llu\n", guid);
+				dprintf("Pickup collected locally: GUID %llu\n", guid);
 			}
 			pickupStatesCache[guid] = currentState;
 		}
@@ -1422,7 +1493,7 @@ static void applyQueuedPickupCollects()
 
 		// Directly grant the pickup to inventory (no chase)
 		game_BilboPickupsGetPickup(reinterpret_cast<void*>(bilboPtr), reinterpret_cast<void*>(addr));
-		printf("Applied remote pickup collect: GUID %llu\n", pickupGuid);
+		dprintf("Applied remote pickup collect: GUID %llu\n", pickupGuid);
 	}
 }
 
@@ -1504,7 +1575,7 @@ static void readAndPushTriggerItems(uint32_t addr, uint64_t guid, int32_t itemCo
 		pending.itemIds[i] = processAnalyzer->readData<int32_t>(listAddr + i * 4);
 
 	g_outgoingTriggerOnUse.push_back(pending);
-	printf("Trigger OnUse detected: GUID %llu, %d items\n", guid, itemCount);
+	dprintf("Trigger OnUse detected: GUID %llu, %d items\n", guid, itemCount);
 }
 
 // Scan all triggers for state changes (newly fired or items placed).
@@ -1556,7 +1627,7 @@ static void detectTriggerChanges()
 		if (justFired && currentItemCount == 0)
 		{
 			g_outgoingTriggerPressB.push_back(guid);
-			printf("Trigger fired locally (OnPressB): GUID %llu\n", guid);
+			dprintf("Trigger fired locally (OnPressB): GUID %llu\n", guid);
 			triggerStatesCache[guid] = currentFlags;
 			continue;
 		}
@@ -1674,7 +1745,7 @@ static void applyQueuedTriggerPressB()
 		triggerStatesCache[triggerGuid] = getTriggerFlags(addr);
 		LeaveCriticalSection(&triggerCriticalSection);
 
-		printf("Applied remote trigger OnPressB: GUID %llu\n", triggerGuid);
+		dprintf("Applied remote trigger OnPressB: GUID %llu\n", triggerGuid);
 	}
 }
 
@@ -1767,7 +1838,7 @@ static void applyQueuedTriggerOnUse()
 		triggerSuppliedItemCountCache[use.triggerGuid] = newCount;
 		LeaveCriticalSection(&triggerCriticalSection);
 
-		printf("Applied remote trigger OnUse: GUID %llu, %d items (total %d)\n", use.triggerGuid, use.itemCount, newCount);
+		dprintf("Applied remote trigger OnUse: GUID %llu, %d items (total %d)\n", use.triggerGuid, use.itemCount, newCount);
 	}
 }
 
@@ -1836,7 +1907,7 @@ static void detectSwitchChanges()
 			// Switch state changed — record the new on/off state
 			bool nowOn = (currentFlags & SWITCH_ON_FLAG) != 0;
 			g_outgoingSwitchToggles.push_back({ guid, nowOn });
-			printf("Switch toggled locally: GUID %llu -> %s\n", guid, nowOn ? "ON" : "OFF");
+			dprintf("Switch toggled locally: GUID %llu -> %s\n", guid, nowOn ? "ON" : "OFF");
 			switchStatesCache[guid] = currentFlags;
 		}
 	}
@@ -1901,7 +1972,7 @@ static void applyQueuedSwitchToggles()
 			continue; // already in the desired state
 
 		game_SwitchSetOn(reinterpret_cast<void*>(addr), entry.second ? 1 : 0);
-		printf("Applied remote switch toggle: GUID %llu -> %s\n", entry.first, entry.second ? "ON" : "OFF");
+		dprintf("Applied remote switch toggle: GUID %llu -> %s\n", entry.first, entry.second ? "ON" : "OFF");
 	}
 }
 
@@ -1990,7 +2061,7 @@ static uint32_t snapshotAnimatedRigids(AnimObjEntry* out, uint32_t maxOut)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
 	{
-		printf("anim scan raised an exception - suppressed (%u collected)\n", n);
+		dprintf("anim scan raised an exception - suppressed (%u collected)\n", n);
 	}
 	return n;
 }
@@ -2019,7 +2090,7 @@ static void sendAnimSync(Client& client)
 	}
 	if (found > MaxAnimSyncPerMessage)
 	{
-		printf("anim sync: %u animated objects found, capped at %zu\n",
+		dprintf("anim sync: %u animated objects found, capped at %zu\n",
 			found, MaxAnimSyncPerMessage);
 	}
 
@@ -2039,7 +2110,7 @@ static void sendAnimSync(Client& client)
 
 	g_ChatOverlay.AddSystemMessage("[System] Synced animation frame of " +
 		std::to_string(sent) + " object(s) to all players.");
-	printf("Broadcast anim sync for %zu rigid_instances\n", sent);
+	dprintf("Broadcast anim sync for %zu rigid_instances\n", sent);
 }
 
 // Queue an incoming anim-sync snapshot (network thread).
@@ -2083,7 +2154,7 @@ static void applyQueuedAnimSync()
 		++applied;
 	}
 
-	printf("anim sync applied to %u/%zu object(s)\n", applied, pending.size());
+	dprintf("anim sync applied to %u/%zu object(s)\n", applied, pending.size());
 }
 
 // ===========================================================================
@@ -2150,7 +2221,7 @@ static void sendRingSync(Client& client)
 	msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 	client.SendMessage(channels::Gameplay, msg);
 
-	printf("Broadcast ring state: %s\n", msg->ringEquipped ? "ON" : "OFF");
+	dprintf("Broadcast ring state: %s\n", msg->ringEquipped ? "ON" : "OFF");
 }
 
 // Store an incoming ring state (network thread). Persistent per player, so not
@@ -2872,11 +2943,11 @@ static size_t loadSyncedCinemaGuids(std::string* loadedPath = nullptr)
 		if (loadedPath)
 			*loadedPath = candidate;
 
-		printf("Synced cinemas: %zu GUID(s) loaded from %s\n", count, candidate.c_str());
+		dprintf("Synced cinemas: %zu GUID(s) loaded from %s\n", count, candidate.c_str());
 		return count;
 	}
 
-	printf("Synced cinemas: no %s found, cutscene sync disabled\n", SYNCED_CINEMA_FILE);
+	dprintf("Synced cinemas: no %s found, cutscene sync disabled\n", SYNCED_CINEMA_FILE);
 	return 0;
 }
 
@@ -2910,7 +2981,7 @@ static void __fastcall hkCinemaStart(void* self, void* edx)
 	// Printed high-dword-first so it can be pasted into the file verbatim, which
 	// is the form guidFromString() parses.
 	const bool synced = isSyncedCinema(cinemaGuid);
-	printf("[cinema] start %08X_%08X %s\n",
+	dprintf("[cinema] start %08X_%08X %s\n",
 		static_cast<uint32_t>(cinemaGuid >> 32),
 		static_cast<uint32_t>(cinemaGuid),
 		synced ? "(SYNCED)" : "(local only)");
@@ -3000,7 +3071,7 @@ static void applyQueuedCinemaStarts()
 		// Trampoline, not the hook - otherwise this would re-broadcast.
 		oCinemaStart(reinterpret_cast<void*>(cinemaAddress), nullptr);
 
-		printf("[cinema] applied remote %08X_%08X\n",
+		dprintf("[cinema] applied remote %08X_%08X\n",
 			static_cast<uint32_t>(cinemaGuid >> 32),
 			static_cast<uint32_t>(cinemaGuid));
 	}
@@ -3052,7 +3123,7 @@ static void __fastcall hkLoadTriggerExecute(void* self, void* edx)
 			reinterpret_cast<uint32_t>(self) + CINEMA_GUID_OFF);   // object+0x8, same for every object
 	}
 
-	printf("[layer] load trigger %08X_%08X fired - broadcasting anim frames\n",
+	dprintf("[layer] load trigger %08X_%08X fired - broadcasting anim frames\n",
 		static_cast<uint32_t>(triggerGuid >> 32),
 		static_cast<uint32_t>(triggerGuid));
 }
@@ -3182,7 +3253,7 @@ static void processLocalSpawnRequest()
 	LeaveCriticalSection(&spawnCriticalSection);
 
 	g_ChatOverlay.AddSystemMessage("[System] Spawned rigid instance (synced to all players).");
-	printf("Spawned RigidInstance GUID %llu, broadcasting\n", created.Guid);
+	dprintf("Spawned RigidInstance GUID %llu, broadcasting\n", created.Guid);
 }
 
 // Send any queued local spawns to peers (network thread, from the client loop).
@@ -3390,7 +3461,7 @@ static uint64_t __cdecl hkFxFireAndForget(const char* name, const vector3* pos,
 		BroadcastFxOnly(name, pos->X, pos->Y + fxBroadcastYOffset(name), pos->Z,
 			rot ? rot->X : 0.0f, rot ? rot->Y : 0.0f, rot ? rot->Z : 0.0f,
 			scale ? scale->X : 1.0f, scale ? scale->Y : 1.0f, scale ? scale->Z : 1.0f);
-		printf("Broadcasting FX '%s'\n", name);
+		dprintf("Broadcasting FX '%s'\n", name);
 	}
 
 	return result;
@@ -3467,26 +3538,24 @@ static void applyQueuedFx()
 //  Server IP Config
 // ===========================================================================
 
-[[maybe_unused]] static std::string readServerIP()
-{
-	std::string ip = NetDefaults::DEFAULT_IP;
-	std::ifstream configFile(NetDefaults::CONFIG_FILE);
-	if (configFile.is_open())
-	{
-		std::getline(configFile, ip);
-		printf("Server IP from config.txt: %s\n", ip.c_str());
-	}
-	else
-	{
-		printf("config.txt not found — using default: %s\n", ip.c_str());
-	}
-	return ip;
-}
-
+// The client takes its server address from "server_ip=" in the settings file.
+// config.txt is still read as a fallback: server.exe uses it for bind_ip /
+// public_ip, so a machine that hosts and plays keeps working with one file.
 static std::string readSecureServerIP()
 {
-	const std::string ip = SecureConnect::getClientServerIp();
-	printf("Server IP for secure token request: %s\n", ip.c_str());
+	// Our own search runs first because it also looks next to the DLL, which can
+	// sit somewhere the exe-relative search below would not find.
+	std::string ip = readConfiguredServerIp();
+	if (!ip.empty())
+	{
+		printf("Server IP: %s (from %s)\n", ip.c_str(), resolveLocalProfileConfigPath().c_str());
+		return ip;
+	}
+
+	std::string sourceFile;
+	ip = SecureConnect::getClientServerIp(&sourceFile);
+	printf("Server IP: %s (from %s)\n", ip.c_str(),
+		sourceFile.empty() ? "built-in default" : sourceFile.c_str());
 	return ip;
 }
 
@@ -3649,7 +3718,7 @@ static void processSkinAnnouncement(SkinAnnouncementMessage* msg)
 	if (Player* player = findPlayerByGuid(msg->playerGuid))
 		applySkinMetadataToPlayer(*player);
 
-	printf("Skin mapped: GUID %llu -> texture '%s'\n", msg->playerGuid, textureName.c_str());
+	dprintf("Skin mapped: GUID %llu -> texture '%s'\n", msg->playerGuid, textureName.c_str());
 }
 
 static void processSkinFileTransfer(SkinFileTransferMessage* msg)
@@ -3676,16 +3745,24 @@ static void processSkinFileTransfer(SkinFileTransferMessage* msg)
 		if (Player* player = findPlayerByGuid(msg->playerGuid))
 			applySkinMetadataToPlayer(*player);
 
-		printf("Saved skin file for GUID %llu to %s\n", msg->playerGuid, savedPath.c_str());
+		dprintf("Saved skin file for GUID %llu to %s\n", msg->playerGuid, savedPath.c_str());
 	}
 }
 
+// A player left, so their GUID no longer has an announced skin. This only drops
+// the mapping - the installed file in common\props is deliberately left alone.
+//
+// Deleting it used to be the behaviour, and it was the wrong trade: the file name
+// is what the level data binds slot N's geometry to, so removing it leaves the
+// engine pointing at a resource that no longer exists until someone with a skin
+// takes that slot. A stale texture on disk costs nothing (the next occupant with
+// a skin overwrites it), and it also means a config that points file_path
+// straight at common\props\bilb<N>[d].xbmp can no longer lose its source file.
+//
+// Consequence to be aware of: a player who takes over a slot without uploading a
+// skin of their own inherits whatever the previous occupant left behind.
 static void processSkinClear(SkinClearMessage* msg)
 {
-	const auto pathIt = playerSkinFilePaths.find(msg->playerGuid);
-	if (pathIt != playerSkinFilePaths.end())
-		SkinSync::removeInstalledSkinFileByPath(pathIt->second);
-
 	playerTextureNames.erase(msg->playerGuid);
 	playerSkinFilePaths.erase(msg->playerGuid);
 
@@ -3695,7 +3772,7 @@ static void processSkinClear(SkinClearMessage* msg)
 		player->textureFilePath.clear();
 	}
 
-	printf("Cleared skin mapping for GUID %llu\n", msg->playerGuid);
+	dprintf("Cleared skin mapping for GUID %llu\n", msg->playerGuid);
 }
 
 static void sendLocalSkinData(Client& client)
@@ -3747,7 +3824,7 @@ static void sendLocalSkinData(Client& client)
 	client.AttachBlockToMessage(fileMsg, block, static_cast<int>(localSkinDefinition.fileBytes.size()));
 	client.SendMessage(channels::Skin, fileMsg);
 
-	printf("Uploaded local skin '%s' (%zu bytes) for GUID %llu\n",
+	dprintf("Uploaded local skin '%s' (%zu bytes) for GUID %llu\n",
 		canonicalFileName.c_str(),
 		localSkinDefinition.fileBytes.size(),
 		myGuid);
@@ -3772,7 +3849,7 @@ static void processPositionUpdate(PositionMessage* msg, double currentTime)
 
 	LeaveCriticalSection(&playersCriticalSection);
 	/*
-	std::cout << "Player " << std::hex << msg->playerGuid << std::dec
+	dcout() << "Player " << std::hex << msg->playerGuid << std::dec
 		<< ": pos(" << msg->x << ", "
 		<< msg->y << ", "
 		<< msg->z << ") rot("
@@ -4011,18 +4088,18 @@ static void processEnemiesUpdate(EnemiesStateMessage* msg, double /*currentTime*
 static void processNicknameUpdate(NicknameUpdateMessage* msg)
 {
 	std::string newName = sanitizeIdentityValue(msg->new_name, sizeof(NicknameUpdateMessage::new_name));
-	std::cout << "processNicknameUpdate\r\n";
-	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "new name = " << newName << "\r\n";
+	dcout() << "processNicknameUpdate\r\n";
+	dcout() << "player GUID = " << msg->player_guid << "\r\n";
+	dcout() << "new name = " << newName << "\r\n";
 
 	pendingNicknames[msg->player_guid] = newName;
 
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
-		std::cout << "playerFound\r\n";
+		dcout() << "playerFound\r\n";
 		pl->nickname = newName;
 		if (pl->nickname_marker) {
-			std::cout << "markerFound\r\n";
+			dcout() << "markerFound\r\n";
 			pl->nickname_marker->setText(newName.c_str());
 		}
 	}
@@ -4031,18 +4108,18 @@ static void processNicknameUpdate(NicknameUpdateMessage* msg)
 static void processStatusUpdate(StatusUpdateMessage* msg)
 {
 	std::string newStatus = sanitizeIdentityValue(msg->new_status, sizeof(StatusUpdateMessage::new_status));
-	std::cout << "processStatusUpdate\r\n";
-	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "new status = " << newStatus << "\r\n";
+	dcout() << "processStatusUpdate\r\n";
+	dcout() << "player GUID = " << msg->player_guid << "\r\n";
+	dcout() << "new status = " << newStatus << "\r\n";
 
 	pendingStatuses[msg->player_guid] = newStatus;
 
 	Player* pl = findPlayerByGuid(msg->player_guid);
 	if (pl) {
-		std::cout << "playerFound\r\n";
+		dcout() << "playerFound\r\n";
 		pl->status = newStatus;
 		if (pl->status_marker) {
-			std::cout << "markerFound\r\n";
+			dcout() << "markerFound\r\n";
 			pl->status_marker->setText(newStatus.c_str());
 		}
 	}
@@ -4051,9 +4128,9 @@ static void processStatusUpdate(StatusUpdateMessage* msg)
 static void processChatMessage(ChatMsgMessage* msg)
 {
 	std::string chatText = sanitizeIdentityValue(msg->msg, sizeof(ChatMsgMessage::msg));
-	std::cout << "processChatMessage\r\n";
-	std::cout << "player GUID = " << msg->player_guid << "\r\n";
-	std::cout << "msg = " << chatText << "\r\n";
+	dcout() << "processChatMessage\r\n";
+	dcout() << "player GUID = " << msg->player_guid << "\r\n";
+	dcout() << "msg = " << chatText << "\r\n";
 
 	std::string sender_name;
 
@@ -4179,7 +4256,7 @@ static void processMessage(Client& client, Message* message, double time)
 	case GUID_ASSIGN:
 		myGuid = static_cast<GuidAssignMessage*>(message)->guid;
 		localSkinUploadAttempted = false;
-		printf("Assigned my GUID: %llu\n", myGuid);
+		dprintf("Assigned my GUID: %llu\n", myGuid);
 
 		myNicknameGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91100000000ull;
 		myStatusGuid = (myGuid & 0xFFFFFFFF) | 0x0D8AD91200000000ull;
@@ -4263,9 +4340,9 @@ static void ChatMessage(const std::string& message)
 	strlcpy(xmsg->msg, cleanMessage.c_str());
 	g_Client->SendMessage(channels::Gameplay, xmsg);
 
-	//	std::cout << "sent chat message\r\n";
-	//	std::cout << "player GUID = " << myGuid << "\r\n";
-	//	std::cout << "message = " << xmsg->msg << "\r\n";
+	//	dcout() << "sent chat message\r\n";
+	//	dcout() << "player GUID = " << myGuid << "\r\n";
+	//	dcout() << "message = " << xmsg->msg << "\r\n";
 }
 
 static void ChatCommandNickname(const std::string& name)
@@ -4286,9 +4363,9 @@ static void ChatCommandNickname(const std::string& name)
 		g_ChatOverlay.AddSystemMessage("[System] Failed to save name/status config.");
 	g_ChatOverlay.AddSystemMessage("[System] Name changed to " + myNickname + ".");
 
-	//	std::cout << "sent nickname update\r\n";
-	//	std::cout << "player GUID = " << myGuid << "\r\n";
-	//	std::cout << "new name = " << myNickname << "\r\n";
+	//	dcout() << "sent nickname update\r\n";
+	//	dcout() << "player GUID = " << myGuid << "\r\n";
+	//	dcout() << "new name = " << myNickname << "\r\n";
 }
 
 static void ChatCommandStatus(const std::string& status)
@@ -4483,16 +4560,25 @@ static int clientMain()
 	// add chat commands
 	g_Client = &client;
 	g_ChatOverlay.SetMsgCallback(ChatMessage);
+	// The player-facing set /help lists in a normal session. Everything marked
+	// DebugOnly below still works if typed - it is just kept out of the list
+	// unless debug=1, so /help stays short enough to read on screen.
 	g_ChatOverlay.AddCommand("/name", "<nickname> - Change your nickname", ChatCommandNickname);
 	g_ChatOverlay.AddCommand("/status", "<status> - Change your status", ChatCommandStatus);
-	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode);
-	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage);
 	g_ChatOverlay.AddCommand("/reconnect", "- Try to reconnect to the server", ChatCommandReconnect);
 	g_ChatOverlay.AddCommand("/setTeam", "<0,1,2> - Set fake Bilbo's team", ChatCommandSetTeam);
-	g_ChatOverlay.AddCommand("/syncanim", "- Sync animation frame of all animated objects on the level", ChatCommandSyncAnim);
-	g_ChatOverlay.AddCommand("/reloadcinemas", "- Re-read SYNCED_CINEMAS.txt (synced cutscene list)", ChatCommandReloadCinemas);
 	g_ChatOverlay.AddCommand("/spawn", "[template] - Spawn a rigid instance (synced to all players)", ChatCommandSpawn);
-	g_ChatOverlay.AddCommand("/spawnfx", "[fxName] - Play an FX effect (synced to all players)", ChatCommandSpawnFx);
+
+	g_ChatOverlay.AddCommand("/ai", "<mode> - Change AI mode", ChatCommandChangeAIMode,
+		ChatCommandListing::DebugOnly);
+	g_ChatOverlay.AddCommand("/damage", "<value> - Set damage of fake Bilbo", ChatCommandDamage,
+		ChatCommandListing::DebugOnly);
+	g_ChatOverlay.AddCommand("/syncanim", "- Sync animation frame of all animated objects on the level", ChatCommandSyncAnim,
+		ChatCommandListing::DebugOnly);
+	g_ChatOverlay.AddCommand("/reloadcinemas", "- Re-read SYNCED_CINEMAS.txt (synced cutscene list)", ChatCommandReloadCinemas,
+		ChatCommandListing::DebugOnly);
+	g_ChatOverlay.AddCommand("/spawnfx", "[fxName] - Play an FX effect (synced to all players)", ChatCommandSpawnFx,
+		ChatCommandListing::DebugOnly);
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);
@@ -4533,12 +4619,12 @@ static int clientMain()
 			}
 			else
 			{
-				printf("Client ID from server token: %.16" PRIx64 "\n", clientId);
+				dprintf("Client ID from server token: %.16" PRIx64 "\n", clientId);
 				client.Connect(clientId, connectToken);
 
 				char addrStr[256];
 				client.GetAddress().ToString(addrStr, sizeof(addrStr));
-				printf("Client address: %s\n", addrStr);
+				dprintf("Client address: %s\n", addrStr);
 			}
 		}
 
@@ -4559,7 +4645,7 @@ static int clientMain()
 			}
 			else
 			{
-				printf("Reconnecting client with Client ID: %.16" PRIx64 "\n", clientId);
+				dprintf("Reconnecting client with Client ID: %.16" PRIx64 "\n", clientId);
 				client.Connect(clientId, connectToken);
 				g_ChatOverlay.AddSystemMessage("[System] Reconnecting to server...");
 			}
@@ -4768,7 +4854,7 @@ static int clientMain()
 						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 						client.SendMessage(channels::Gameplay, msg);
-						std::cout << "hoistable acquire\r\n";
+						dcout() << "hoistable acquire\r\n";
 					}
 
 					if (g_currentHoistable && (hoist_guid.Guid == 0 || pBilbo->_get_state() != BS_HOISTING)) {
@@ -4781,7 +4867,7 @@ static int clientMain()
 
 						delete g_currentHoistable;
 						g_currentHoistable = nullptr;
-						std::cout << "hoistable release\r\n";
+						dcout() << "hoistable release\r\n";
 					}
 
 					if (g_currentHoistable) {
@@ -4816,7 +4902,7 @@ static int clientMain()
 						msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
 						client.SendMessage(channels::Gameplay, msg);
-						std::cout << "pushblock acquire\r\n";
+						dcout() << "pushblock acquire\r\n";
 					}
 
 					if (g_currentPushBlock && pBilbo->_get_state() != BS_PUSH_BLOCK) {
@@ -4829,7 +4915,7 @@ static int clientMain()
 
 						delete g_currentPushBlock;
 						g_currentPushBlock = nullptr;
-						std::cout << "pushblock release\r\n";
+						dcout() << "pushblock release\r\n";
 					}
 
 					if (g_currentPushBlock) {
@@ -4842,7 +4928,7 @@ static int clientMain()
 						msgUpdate->hoistableGuid = g_currentPushBlock->getGUID();
 						msgUpdate->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
 
-						printf("SENT UPDATE PUSHBOX %.2f %.2f %.2f\n", msgUpdate->x, msgUpdate->y, msgUpdate->z);
+						dprintf("SENT UPDATE PUSHBOX %.2f %.2f %.2f\n", msgUpdate->x, msgUpdate->y, msgUpdate->z);
 
 						client.SendMessage(channels::Gameplay, msgUpdate);
 					}
@@ -4893,7 +4979,13 @@ DWORD WINAPI mainThread(LPVOID)
 	freopen("CONOUT$", "w", stdout);
 	freopen("CONIN$", "r", stdin);
 
+	// Before anything else logs: decide whether the development output is wanted.
+	loadDebugLoggingFlag();
+
 	std::cout << "Injected.\n";
+	if (g_debugLogging)
+		std::cout << "Debug logging enabled (debug=1 in "
+		          << SkinSync::LocalConfigFile << ").\n";
 
 	//-----------------------------------------------------
 	// START GAME MANAGER
@@ -4923,27 +5015,47 @@ DWORD WINAPI mainThread(LPVOID)
 		<< "\n";
 
 	//-----------------------------------------------------
-	// LOAD SKIN CONFIG
+	// LOAD SETTINGS
 	//-----------------------------------------------------
 
 	localSkinLoaded =
 		loadLocalSkinDefinitionFromKnownPaths(
 			localSkinDefinition,
-			localSkinConfigPath,
-			localSkinConfigError);
+			localConfigPath,
+			localSkinError);
 
-	if (localSkinLoaded)
+	// Report the settings file itself first - it carries server_ip, debug, the
+	// player profile and the skin, so "no skin configured" must not read like
+	// "no settings found".
+	const std::string settingsPath = resolveLocalProfileConfigPath();
+	std::error_code settingsPathError;
+	if (SkinSync::fs::exists(SkinSync::fs::path(settingsPath), settingsPathError))
 	{
 		std::cout
-			<< "Loaded skin config from: "
-			<< localSkinConfigPath
+			<< "Settings from: "
+			<< settingsPath
 			<< "\n";
 	}
 	else
 	{
 		std::cout
-			<< "Skin sync disabled: "
-			<< localSkinConfigError
+			<< "No "
+			<< SkinSync::LocalConfigFile
+			<< " found (current folder, game folder, DLL folder) - using defaults.\n";
+	}
+
+	if (localSkinLoaded)
+	{
+		std::cout
+			<< "Skin upload: "
+			<< localSkinDefinition.fileName
+			<< "\n";
+	}
+	else
+	{
+		std::cout
+			<< "Skin upload disabled: "
+			<< localSkinError
 			<< "\n";
 	}
 
@@ -4990,8 +5102,10 @@ DWORD WINAPI mainThread(LPVOID)
 		return 1;
 	}
 
+	// yojimbo does its own per-packet logging; keep it to errors unless we are
+	// debugging, otherwise it prints over everything else on its own.
 	yojimbo_log_level(
-		YOJIMBO_LOG_LEVEL_INFO);
+		g_debugLogging ? YOJIMBO_LOG_LEVEL_INFO : YOJIMBO_LOG_LEVEL_ERROR);
 
 	srand(
 		static_cast<unsigned int>(

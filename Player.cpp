@@ -5,6 +5,7 @@
 
 #include "Player.h"
 #include <cmath>
+#include "DebugLog.h"
 
 void Player::setPosition(float px, float py, float pz)
 {
@@ -172,7 +173,7 @@ void Player::tickLerp(float t)
 				// Remember it — every later playback parks cleanly. Seed this
 				// value into g_learnedAnimPeak above to avoid the one restart.
 				g_learnedAnimPeak[animation] = animHoldPeakFrame;
-				printf("learned anim %u ends at frame %.3f\n",
+				dprintf("learned anim %u ends at frame %.3f\n",
 					animation, animHoldPeakFrame);
 
 				animHoldActive = true;

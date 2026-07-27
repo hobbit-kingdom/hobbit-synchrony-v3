@@ -14,12 +14,13 @@
 #include <cstdint> 
 #include <cstdio>
 #include "ProcessAnalyzer.h"
+#include "DebugLog.h"
 
 class ProcessAnalyzerTypeWrapped : protected ProcessAnalyzer {
 public:
 	ProcessAnalyzerTypeWrapped() 
 	{
-		printf("Moved log option 'PROC ANALYZ' to 'PROC ANALYZ WRAP'\n");
+		dprintf("Moved log option 'PROC ANALYZ' to 'PROC ANALYZ WRAP'\n");
 	}
 	using ProcessAnalyzer::readData;
 	using ProcessAnalyzer::writeData;

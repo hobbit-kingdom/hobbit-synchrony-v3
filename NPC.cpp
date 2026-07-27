@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include "meridian.hpp"
+#include "DebugLog.h"
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -24,13 +25,13 @@ NPC::NPC(HobbitProcessAnalyzer* analyzer)
 void NPC::initializeByGuid(uint64_t guid)
 {
 	guid_ = guid;
-	printf("Creating NPC with GUID %llu\n", guid);
+	dprintf("Creating NPC with GUID %llu\n", guid);
 
 	resolveObjectPtr(guid);
 
 	if (objectAddress_ == 0)
 	{
-		printf("Warning: NPC object not found for GUID %llu\n", guid);
+		dprintf("Warning: NPC object not found for GUID %llu\n", guid);
 		return;
 	}
 
@@ -40,7 +41,7 @@ void NPC::initializeByGuid(uint64_t guid)
 
 	// Read initial health as a sanity check
 	float hp = getHealth();
-	printf("NPC initialized — health: %.1f\n", hp);
+	dprintf("NPC initialized — health: %.1f\n", hp);
 }
 
 void NPC::initializeByAddress(uint32_t address)
@@ -52,7 +53,7 @@ void NPC::initializeByAddress(uint32_t address)
 
 	if (objectAddress_ == 0)
 	{
-		printf("Warning: NPC object not found for address %u\n", address);
+		dprintf("Warning: NPC object not found for address %u\n", address);
 		return;
 	}
 
@@ -64,7 +65,7 @@ void NPC::initializeByAddress(uint32_t address)
 
 	// Read initial health as a sanity check
 	float hp = getHealth();
-	printf("NPC initialized — health: %.1f\n", hp);
+	dprintf("NPC initialized — health: %.1f\n", hp);
 
 	initialAIState = analyzer_->readData<uint8_t>(objectAddress_ + 0x268);
 
@@ -78,12 +79,12 @@ bool NPC::isAnalyzerReady() const
 {
 	if (!analyzer_)
 	{
-		printf("Error: HobbitProcessAnalyzer is null\n");
+		dprintf("Error: HobbitProcessAnalyzer is null\n");
 		return false;
 	}
 	if (!analyzer_->isProcessSet())
 	{
-		printf("Error: game process not attached\n");
+		dprintf("Error: game process not attached\n");
 		return false;
 	}
 	return true;
@@ -199,7 +200,7 @@ void NPC::setNPCAnim(int anim)
 	uint32_t animAdd2 = analyzer_->readData<uint32_t>(0x50 + animAdd1);
 	uint32_t animAdd4 = analyzer_->readData<uint32_t>(0x10C + animAdd2);
 
-	//    std::cout << analyzer_->readData<uint32_t>(animAdd4) << "\n";
+	//    dcout() << analyzer_->readData<uint32_t>(animAdd4) << "\n";
 
 	if (animAdd4 == 0)
 	{
@@ -224,7 +225,7 @@ void NPC::setNPCAnim(int anim)
 
 		//strcpy(anim_result, "ANIM OK");
 	}
-	else std::cout << "bad anim" << "\n";
+	else dcout() << "bad anim" << "\n";
 }
 
 
@@ -397,10 +398,10 @@ void NPC::resolveObjectPtr(uint64_t guid)
 	{
 		objectAddress_ = 0;
 		objectPointer_ = 0;
-		printf("Exception resolving NPC GUID %llu\n", guid);
+		dprintf("Exception resolving NPC GUID %llu\n", guid);
 	}
 
-	printf("Object address: 0x%08X\n", objectAddress_);
+	dprintf("Object address: 0x%08X\n", objectAddress_);
 }
 
 void NPC::resolvePositionPtrs()
@@ -431,7 +432,7 @@ void NPC::resolveRotationPtr()
 void NPC::resolveAnimationPtr()
 {
 	animationAddr_ = followAnimationPtrChain();
-	printf("Animation address: 0x%08X\n", animationAddr_);
+	dprintf("Animation address: 0x%08X\n", animationAddr_);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 #include "Hoistable.h"
 #include "meridian.hpp"
+#include "DebugLog.h"
 
 Hoistable::Hoistable(HobbitProcessAnalyzer* analyzer)
 	: analyzer_(analyzer)
@@ -10,15 +11,15 @@ Hoistable::Hoistable(HobbitProcessAnalyzer* analyzer)
 void Hoistable::initializeByGuid(uint64_t guid)
 {
 	guid_ = guid;
-	printf("Creating Hoistable with GUID %llu\n", guid);
+	dprintf("Creating Hoistable with GUID %llu\n", guid);
 
 	resolveObjectPtr(guid);
 
-	std::cout << "HOISTABLE ADDRESS: " << objectAddress_ << "\n";
+	dcout() << "HOISTABLE ADDRESS: " << objectAddress_ << "\n";
 
 	if (objectAddress_ == 0)
 	{
-		printf("Warning: Hoistable object not found for GUID %llu\n", guid);
+		dprintf("Warning: Hoistable object not found for GUID %llu\n", guid);
 		return;
 	}
 
@@ -26,7 +27,7 @@ void Hoistable::initializeByGuid(uint64_t guid)
 	resolveRotationPtr();
 
 
-	printf("Hoistable initialized\n");
+	dprintf("Hoistable initialized\n");
 }
 
 void Hoistable::initializeByAddress(uint32_t address)
@@ -35,11 +36,11 @@ void Hoistable::initializeByAddress(uint32_t address)
 	objectAddress_ = address;
 	objectPointer_ = address;
 
-	std::cout << "HOISTABLE ADDRESS: " << objectAddress_ << "\n";
+	dcout() << "HOISTABLE ADDRESS: " << objectAddress_ << "\n";
 
 	if (objectAddress_ == 0)
 	{
-		printf("Warning: Hoistable object not found for address %u\n", address);
+		dprintf("Warning: Hoistable object not found for address %u\n", address);
 		return;
 	}
 
@@ -54,12 +55,12 @@ bool Hoistable::isAnalyzerReady() const
 {
 	if (!analyzer_)
 	{
-		printf("Error: HobbitProcessAnalyzer is null\n");
+		dprintf("Error: HobbitProcessAnalyzer is null\n");
 		return false;
 	}
 	if (!analyzer_->isProcessSet())
 	{
-		printf("Error: game process not attached\n");
+		dprintf("Error: game process not attached\n");
 		return false;
 	}
 	return true;
@@ -191,10 +192,10 @@ void Hoistable::resolveObjectPtr(uint64_t guid)
 	{
 		objectAddress_ = 0;
 		objectPointer_ = 0;
-		printf("Exception resolving NPC GUID %llu\n", guid);
+		dprintf("Exception resolving NPC GUID %llu\n", guid);
 	}
 
-	printf("Object address: 0x%08X\n", objectAddress_);
+	dprintf("Object address: 0x%08X\n", objectAddress_);
 }
 
 void Hoistable::resolvePositionPtrs()

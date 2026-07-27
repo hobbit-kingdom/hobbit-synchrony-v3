@@ -6,6 +6,7 @@
 #include "Marker.h"
 #include "meridian.hpp"
 #include <iostream>
+#include "DebugLog.h"
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -23,13 +24,13 @@ Marker::Marker(HobbitProcessAnalyzer* analyzer)
 void Marker::initializeByGuid(uint64_t guid)
 {
 	guid_ = guid;
-	//printf("Creating Marker with GUID %llu\n", guid);
+	//dprintf("Creating Marker with GUID %llu\n", guid);
 
 	resolveObjectPtr(guid);
 
 	if (objectAddress_ == 0)
 	{
-		//printf("Warning: Marker object not found for GUID %llu\n", guid);
+		//dprintf("Warning: Marker object not found for GUID %llu\n", guid);
 		return;
 	}
 
@@ -45,7 +46,7 @@ void Marker::initializeByAddress(uint32_t address)
 
 	if (objectAddress_ == 0)
 	{
-		//printf("Warning: Marker object not found for address %u\n", address);
+		//dprintf("Warning: Marker object not found for address %u\n", address);
 		return;
 	}
 
@@ -107,10 +108,10 @@ void Marker::resolveObjectPtr(uint64_t guid)
 	{
 		objectAddress_ = 0;
 		objectPointer_ = 0;
-		printf("Exception resolving Marker GUID %llu\n", guid);
+		dprintf("Exception resolving Marker GUID %llu\n", guid);
 	}
 
-	//printf("Object address: 0x%08X\n", objectAddress_);
+	//dprintf("Object address: 0x%08X\n", objectAddress_);
 }
 
 void Marker::resolvePositionPtrs()
@@ -146,12 +147,12 @@ bool Marker::isAnalyzerReady() const
 {
 	if (!analyzer_)
 	{
-		printf("Error: HobbitProcessAnalyzer is null\n");
+		dprintf("Error: HobbitProcessAnalyzer is null\n");
 		return false;
 	}
 	if (!analyzer_->isProcessSet())
 	{
-		printf("Error: game process not attached\n");
+		dprintf("Error: game process not attached\n");
 		return false;
 	}
 	return true;

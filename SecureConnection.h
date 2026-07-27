@@ -27,6 +27,10 @@ namespace SecureConnect
 	{
 		std::string bindIp = NetDefaults::DEFAULT_IP;
 		std::string publicIp = NetDefaults::DEFAULT_IP;
+
+		/// Which file the address came from; empty when nothing was configured
+		/// and the built-in default is being used.
+		std::string sourceFile;
 	};
 
 	inline std::string trim(const std::string& value)
@@ -46,13 +50,21 @@ namespace SecureConnect
 		return value;
 	}
 
-	inline NetworkSettings loadNetworkSettings()
+	/// Everything one settings file has to say about addresses. Empty strings mean
+	/// "not configured here", so a later file can supply the value instead.
+	struct FileNetworkSettings
 	{
-		NetworkSettings settings;
+		std::string bindIp;
+		std::string publicIp;
+	};
 
-		std::ifstream configFile(NetDefaults::CONFIG_FILE);
+	inline FileNetworkSettings parseNetworkSettingsFile(const std::string& path)
+	{
+		FileNetworkSettings parsed;
+
+		std::ifstream configFile(path);
 		if (!configFile.is_open())
-			return settings;
+			return parsed;
 
 		bool sawKeyValue = false;
 		std::string legacyIp;
@@ -66,6 +78,7 @@ namespace SecureConnect
 			const size_t equals = trimmed.find('=');
 			if (equals == std::string::npos)
 			{
+				// config.txt's original format: just the address, on its own line.
 				if (!sawKeyValue && legacyIp.empty())
 					legacyIp = trimmed;
 				continue;
@@ -79,27 +92,100 @@ namespace SecureConnect
 				continue;
 
 			if (key == "bind_ip")
-				settings.bindIp = value;
-			else if (key == "public_ip" || key == "server_ip")
-				settings.publicIp = value;
+				parsed.bindIp = value;
+			else if (key == "public_ip" || key == "server_ip" || key == "server" || key == "ip")
+				parsed.publicIp = value;
 		}
 
 		if (!sawKeyValue && !legacyIp.empty())
 		{
-			settings.bindIp = legacyIp;
-			settings.publicIp = legacyIp;
+			parsed.bindIp = legacyIp;
+			parsed.publicIp = legacyIp;
 		}
-		else if (settings.publicIp.empty())
+
+		return parsed;
+	}
+
+	/// Where an address may be configured, in priority order: the settings file in
+	/// the current folder and next to this exe/dll, the same under its pre-rename
+	/// name, and finally the old transport-only config.txt. Server and client walk
+	/// the same list so a host does not have to keep two files in step.
+	inline std::vector<std::string> settingsFileCandidates()
+	{
+		std::vector<std::string> paths;
+
+		std::string moduleDirectory;
+		char moduleBuffer[MAX_PATH] = {};
+		const DWORD moduleLength = GetModuleFileNameA(nullptr, moduleBuffer, MAX_PATH);
+		if (moduleLength > 0 && moduleLength < MAX_PATH)
+			moduleDirectory = SkinSync::fs::path(moduleBuffer).parent_path().string();
+
+		for (const char* fileName : { SkinSync::LocalConfigFile, SkinSync::LegacyLocalConfigFile })
 		{
-			settings.publicIp = settings.bindIp;
+			paths.push_back(fileName);
+			if (!moduleDirectory.empty())
+				paths.push_back((SkinSync::fs::path(moduleDirectory) / fileName).string());
 		}
+
+		paths.push_back(NetDefaults::CONFIG_FILE);
+		return paths;
+	}
+
+	inline NetworkSettings loadNetworkSettings()
+	{
+		NetworkSettings settings;
+
+		std::string bindIp;
+		std::string publicIp;
+		std::string bindSource;
+		std::string publicSource;
+
+		// First file that provides a given key wins; the two keys are resolved
+		// independently, so bind_ip can come from one file and server_ip another.
+		for (const std::string& path : settingsFileCandidates())
+		{
+			const FileNetworkSettings parsed = parseNetworkSettingsFile(path);
+
+			if (bindIp.empty() && !parsed.bindIp.empty())
+			{
+				bindIp = parsed.bindIp;
+				bindSource = path;
+			}
+
+			if (publicIp.empty() && !parsed.publicIp.empty())
+			{
+				publicIp = parsed.publicIp;
+				publicSource = path;
+			}
+
+			if (!bindIp.empty() && !publicIp.empty())
+				break;
+		}
+
+		// One address configured on its own means both, which is what the old
+		// single-line config.txt did. Getting this wrong the other way round is
+		// how a dedicated host ends up bound to 127.0.0.1 and unreachable.
+		if (!bindIp.empty())
+			settings.bindIp = bindIp;
+		else if (!publicIp.empty())
+			settings.bindIp = publicIp;
+
+		if (!publicIp.empty())
+			settings.publicIp = publicIp;
+		else if (!bindIp.empty())
+			settings.publicIp = bindIp;
+
+		settings.sourceFile = publicSource.empty() ? bindSource : publicSource;
 
 		return settings;
 	}
 
-	inline std::string getClientServerIp()
+	inline std::string getClientServerIp(std::string* sourceFile = nullptr)
 	{
 		NetworkSettings settings = loadNetworkSettings();
+		if (sourceFile)
+			*sourceFile = settings.sourceFile;
+
 		if (!settings.publicIp.empty())
 			return settings.publicIp;
 		return settings.bindIp.empty() ? std::string(NetDefaults::DEFAULT_IP) : settings.bindIp;

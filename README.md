@@ -26,7 +26,48 @@ The multiplayer layer now supports a GUID-bound skin registry:
 - synced skins are installed into `common\props`
 - the client can upload one skin file, and the server relays it using the canonical slot filename for that GUID 256kb size MAX
 
-To enable it for a client, copy `skin_config.example.txt` to `skin_config.txt` and point `file_path` at your texture file.
+To enable it for a client, copy `synchrony_config.example.txt` to `synchrony_config.txt` and point
+`file_path` at your texture file.
+
+## Client settings — `synchrony_config.txt`
+
+One key/value file holds everything the client needs: server address, logging, skin and player
+profile. It is searched for in the current folder, the game exe folder and the DLL folder, in that
+order. The old name `skin_config.txt` is still accepted in the same places, so an existing install
+keeps working, but a `synchrony_config.txt` anywhere wins over it.
+
+```txt
+server_ip=203.0.113.25
+debug=0
+enabled=true
+file_path=common\props\my_custom_skin.xbmp
+```
+
+`server_ip` replaces `config.txt`. **Both the client and `server.exe` read it** — the server takes
+`bind_ip` and `server_ip` (or `public_ip`) from the same file, so a host keeps one file instead of two.
+Setting only `server_ip` also sets the bind address, matching what a single-line `config.txt` used to do.
+
+Resolution order for the address: `synchrony_config.txt` (current folder, then next to the exe/dll),
+then `skin_config.txt` in the same places, then `config.txt`. The first file that provides a key wins,
+and the two keys resolve independently. Both programs print which file they ended up using.
+
+`name`, `status` and `damage` also live here; the `/name`, `/status` and `/damage` chat commands write
+them back, preserving every other key in the file.
+
+## Console logging
+
+By default the console stays quiet - it prints the startup lines, the host prompt and any connection
+error, and nothing else.
+
+```txt
+debug=1
+```
+
+turns the development output back on: every NPC that gets resolved, every stone thrown, every chest,
+trigger, pickup and switch replicated, the nickname/status/chat packet traces, and yojimbo's own
+per-packet logging (which is otherwise limited to errors).
+
+The file is searched for in the current folder, the game exe folder and the DLL folder, in that order.
 
 ## yojimbo
 
