@@ -28,6 +28,11 @@ struct Enemy
 	float rot;            // rotationY
 	uint32_t anim;        // animation
 	float health;
+
+	// Whether the NPC still carries its shield. Only the machine running an NPC's
+	// AI ever shatters it (see NPC::hasShield), so this travels with the rest of
+	// the host-authoritative enemy state and costs one bit per enemy per tick.
+	bool shieldIntact = true;
 };
 
 // ---------------------------------------------------------------------------

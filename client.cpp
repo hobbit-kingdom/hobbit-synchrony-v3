@@ -326,6 +326,13 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 			if (badBoy->getAnimation() != enemyUpdate.second.anim)
 				badBoy->setNPCAnim(enemyUpdate.second.anim);
 
+			// Shield break. Only the machine running this NPC's AI shatters it, so
+			// the host's answer is the authority. The hasShield() guard makes this
+			// fire exactly once per break (ShatterShield clears the GUID) and lets
+			// the state repair itself for anyone who joined or reloaded after it.
+			if (!enemyUpdate.second.shieldIntact && badBoy->hasShield())
+				badBoy->shatterShield();
+
 		}
 		enemies_updated = false;
 	}
@@ -1144,8 +1151,10 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		float eRot = enemy.second->getRotationY();
 		uint32_t eAnim = enemy.second->getAnimation();
 		float eHealth = enemy.second->getHealth();
+		bool eShield = enemy.second->hasShield();
 
-		temp[enemy.first] = NetworkClamp::sanitizeEnemy({ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth });
+		temp[enemy.first] = NetworkClamp::sanitizeEnemy(
+			{ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth, eShield });
 	}
 
 	return temp;

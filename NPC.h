@@ -93,6 +93,16 @@ public:
 
 	void setWeapon(uint32_t weaponId);
 
+	// --- Shield ---
+
+	/// Whether this NPC is still carrying its shield.
+	bool hasShield() const;
+
+	/// Run the engine's own shield break (hide the shield object, drop it from the
+	/// prop set, refresh the AI capability flags). Gate on hasShield(): calling it
+	/// on a shieldless NPC is harmless but pointless work.
+	void shatterShield();
+
 	void setGUID(uint32_t newGUID);
 	void setAIMode(int mode);
 	/// Put the AI flag byte back to whatever it was when this NPC was discovered.

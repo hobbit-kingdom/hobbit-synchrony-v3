@@ -311,6 +311,7 @@ struct EnemiesStateMessage : public Message
 				serialize_float(stream, e.rot);
 				serialize_bits(stream, e.anim, 32);
 				serialize_float(stream, e.health);
+				serialize_bool(stream, e.shieldIntact);
 
 				++count;
 			}
@@ -340,6 +341,7 @@ struct EnemiesStateMessage : public Message
 				serialize_float(stream, e.rot);
 				serialize_bits(stream, e.anim, 32);
 				serialize_float(stream, e.health);
+				serialize_bool(stream, e.shieldIntact);
 
 				if (guid != 0)
 					enemies[guid] = NetworkClamp::sanitizeEnemy(e);

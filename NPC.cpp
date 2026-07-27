@@ -312,6 +312,62 @@ void NPC::setWeapon(uint32_t weaponId)
 }
 
 // ---------------------------------------------------------------------------
+// Shield
+// ---------------------------------------------------------------------------
+//
+// A shield is a normal level object (so its GUID is the same on every machine)
+// that the NPC points at through its prop set:
+//
+//   NPCObject + 0x260          -> prop set          (the same field setWeapon writes)
+//   propSet   + 0x10 (uint64)  -> ShieldGuid        (0 once the shield is gone)
+//
+// NPCObject::ShatterShield @0x004A40D0 is the engine's own break: it hides the
+// shield object via special_surfaces::SetHidden, zeroes that GUID, then calls
+// vtable slot 0x11C (0x004A0BA0) to recompute which moves the NPC can still
+// perform now that it cannot block.
+//
+// Only a charged sting/stick hit (PainData::ePainType 4 or 5) reaches the AI
+// block reaction @0x005BEA00 that calls it, and only on the machine actually
+// running that NPC's AI. Clients suppress AI on synced-team NPCs, so a break has
+// to be replicated - see the shieldIntact field on Enemy.
+//
+// Both accessors dereference game memory directly: we are injected into the game
+// process, so there is no reason to go through the analyzer for two loads.
+
+static constexpr uint32_t NPC_PROPS_OFF = 0x260;             // NPCObject+0x260: prop set
+static constexpr uint32_t NPC_PROPS_SHIELD_GUID_OFF = 0x10;  // propSet+0x10: shield object GUID
+static constexpr uint32_t NPC_SHATTERSHIELD_ADDR = 0x004A40D0;
+
+// public: void __thiscall NPCObject::ShatterShield(void)
+typedef void(__fastcall* ShatterShield_t)(void* self, void* edx);
+
+bool NPC::hasShield() const
+{
+	if (objectAddress_ == 0)
+		return false;
+
+	const uint32_t props = *reinterpret_cast<const uint32_t*>(objectAddress_ + NPC_PROPS_OFF);
+	if (props == 0)
+		return false;
+
+	return *reinterpret_cast<const uint64_t*>(props + NPC_PROPS_SHIELD_GUID_OFF) != 0;
+}
+
+void NPC::shatterShield()
+{
+	if (objectAddress_ == 0)
+		return;
+
+	// Object slots get recycled when something is destroyed mid-level, so re-check
+	// the type tag before handing a cached address to an NPCObject member.
+	if (*reinterpret_cast<const uint8_t*>(objectAddress_ + OBJ_TYPE_OFFSET) != OBJ_TYPE_NPC)
+		return;
+
+	reinterpret_cast<ShatterShield_t>(NPC_SHATTERSHIELD_ADDR)(
+		reinterpret_cast<void*>(objectAddress_), nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Internal: Pointer resolution
 // ---------------------------------------------------------------------------
 
