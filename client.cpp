@@ -448,6 +448,7 @@ void InstallSenseHooks();  // forward decl (defined further below)
 void InstallPainHooks();   // forward decl (defined further below)
 void InstallCinemaHook();  // forward decl (defined further below)
 void InstallLayerHooks();  // forward decl (defined further below)
+void InstallGoalHook();    // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -476,6 +477,8 @@ void SetupBilboHook(void)
 	InstallCinemaHook();  // detour cinema::Start to share whitelisted cutscenes
 	InstallLayerHooks();  // detour load_trigger::Execute so the host re-broadcasts
 	                      // anim frames when a layer streams in
+	InstallGoalHook();    // detour StateController::GetCurrentGoal so host-driven
+	                      // NPCs' goal/patrol AI never executes on non-host clients
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -3008,6 +3011,114 @@ void InstallCinemaHook()
 	void* target = reinterpret_cast<void*>(CINEMA_START_ADDR);
 	MH_CreateHook(target, &hkCinemaStart,
 		reinterpret_cast<void**>(&oCinemaStart));
+	MH_EnableHook(target);
+}
+
+// ===========================================================================
+//  Goal starving — keep host-driven NPCs' goal/patrol AI from ever running
+// ===========================================================================
+//
+// What actually runs an NPC's behaviour is NOT the goal-list catalogue
+// (StateController +0xE0/+0xE4, searched by GetGoalListFromName @0x005AF160) but the
+// StateController's ACTION QUEUE:
+//
+//   +0x118 count   +0x11C ptr array   +0x120 capacity   +0x130 flags (bit0 = empty)
+//
+// with a full engine API around it: push @0x005AF9F0, pop-front @0x005AF980, clear
+// @0x005AF2E0. A goal list is consumed one goal at a time (progress index lives on
+// the goal-list object at +0x64) and the AI states — IdleState, AttackState,
+// AlertState, their ChangePhase/HandleEvent/HandleMessage — refill the queue
+// continuously, mostly from goal-list pointers they cached at state entry that never
+// go through the name catalogue. That is why writing zeros into the counts could not
+// stick: the running state re-pushes on the very next tick, and Deactivate/Activate
+// rebuilds neither the states nor the queue.
+//
+// The single choke point everything reads through instead:
+//
+//   StateController::GetCurrentGoal @0x005AF960
+//       if (this[+0x118] < 1) return 0;
+//       return *(void**)this[+0x11C];
+//
+// PhysController::UpdateGoals @0x00595310 caches its result at PhysController+0x190
+// every tick, and ProcessGoal @0x00595730 begins with "if null, return" — an NPC with
+// no current goal is a fully supported engine state, not a corrupted one. There are
+// exactly four call sites in the whole exe (0x59534E, 0x60BA03, 0x61D502, 0x631D50)
+// and all of them treat 0 as "no goal running".
+//
+// So: detour GetCurrentGoal and answer "no goal" whenever the controller belongs to
+// a host-driven (team 1/2) NPC and we are not the host. The states can refill the
+// queue all they want; nothing ever executes, including patrol (patrol is reached
+// via PatrolIdleStateGoalListName — the same queue).
+//
+// The decision is made INSIDE the hook from the controller's own fields, not from a
+// set built off the level-start NPC scan. The scan runs the moment isOnLevel() flips
+// true, which races the engine's object import — an NPC it missed would have been
+// unstarved for the whole level (the "works one load, not the next" symptom). The
+// controller knows its owner without us:
+//
+//   StateController +0x170 : owner GUID
+//   StateController +0x178 : cached owner OBJECT pointer, filled by the resolver
+//       @0x005AF120 on first use each level. (obj_mgr::GetSlotFromGuid @0x004021C0
+//       returns the object POINTER despite the name, masked to 0 until the object's
+//       imported bit — obj+0x7F & 0x10 — is set.)
+//
+// From the owner object, type tag +0x7C and team +0x1A4 answer everything. Team is
+// read fresh per call, so NPCs that scripts move onto a fighting side mid-level are
+// picked up the moment it happens.
+//
+// StateController lives at NPCObject+0x300 (siblings: +0x304 PhysController,
+// +0x308 SenseController).
+static constexpr uint32_t NPC_STATECONTROLLER_OFF = 0x300;   // verified: NPCObject::OnImport
+static constexpr uint32_t GOAL_GETCURRENT_ADDR = 0x005AF960; // StateController::GetCurrentGoal
+static constexpr uint32_t SC_OWNER_GUID_OFF = 0x170;         // owner GUID on the controller
+static constexpr uint32_t SC_OWNER_OBJ_OFF = 0x178;          // cached owner object ptr (0 until resolved)
+
+// obj_mgr::GetSlotFromGuid @0x004021C0 - returns the object pointer for a GUID (0 if
+// not found / not imported yet). __thiscall on the global obj_mgr @0x0076CD88, GUID
+// passed by value as two dwords.
+typedef uint32_t(__fastcall* ObjFromGuid_t)(void* objMgr, void* edx, uint64_t guid);
+static const ObjFromGuid_t game_ObjFromGuid = reinterpret_cast<ObjFromGuid_t>(0x004021C0);
+static void* const GAME_OBJ_MGR = reinterpret_cast<void*>(0x0076CD88);
+
+typedef void* (__fastcall* StateGetCurrentGoal_t)(void* self, void* edx);
+static StateGetCurrentGoal_t oStateGetCurrentGoal = nullptr;
+
+static void* __fastcall hkStateGetCurrentGoal(void* self, void* edx)
+{
+	// The host is the one client whose goal AI is REAL - it drives everyone else.
+	if (isHost != 1)
+	{
+		const uint8_t* sc = static_cast<const uint8_t*>(self);
+
+		uint32_t owner = *reinterpret_cast<const uint32_t*>(sc + SC_OWNER_OBJ_OFF);
+		if (owner == 0)
+		{
+			// Engine hasn't resolved the owner yet (first ticks after import - exactly
+			// when the level scripts queue the initial goals). Resolve it the same way
+			// the engine does, but do NOT write the cache back; that stays its job.
+			const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
+			if (guid != 0)
+				owner = game_ObjFromGuid(GAME_OBJ_MGR, nullptr, guid);
+		}
+
+		if (owner >= 0x00010000 &&
+			*reinterpret_cast<const uint8_t*>(owner + OBJ_TYPE_OFFSET) == OBJ_TYPE_NPC &&
+			isSyncedTeam(*reinterpret_cast<const int*>(owner + OBJ_TEAM_OFFSET)))
+		{
+			return nullptr;   // "no goal running" — the normal empty-idle answer
+		}
+	}
+
+	return oStateGetCurrentGoal(self, edx);
+}
+
+void InstallGoalHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* target = reinterpret_cast<void*>(GOAL_GETCURRENT_ADDR);
+	MH_CreateHook(target, &hkStateGetCurrentGoal,
+		reinterpret_cast<void**>(&oStateGetCurrentGoal));
 	MH_EnableHook(target);
 }
 
