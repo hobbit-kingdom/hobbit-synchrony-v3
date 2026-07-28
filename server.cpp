@@ -819,6 +819,24 @@ static void broadcastCinemaSync(Server& server, int senderIndex, CinemaSyncMessa
 	}
 }
 
+// A client asks for the host's looping-anim frames (it just loaded a layer or
+// entered the level). Relayed to everyone; only the host acts on it.
+static void broadcastAnimSyncRequest(Server& server, int senderIndex, AnimSyncRequestMessage* msg)
+{
+	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
+	{
+		if (i == senderIndex || !server.IsClientConnected(i))
+			continue;
+
+		auto* broadcast = static_cast<AnimSyncRequestMessage*>(
+			server.CreateMessage(i, ANIM_SYNC_REQUEST));
+
+		broadcast->nowLevel = msg->nowLevel;
+
+		server.SendMessage(i, channels::Gameplay, broadcast);
+	}
+}
+
 static void broadcastSpawnObject(Server& server, int senderIndex, SpawnObjectMessage* msg)
 {
 	for (int i = 0; i < NetDefaults::MAX_CLIENTS; i++)
@@ -979,6 +997,9 @@ static void processMessage(Server& server, int clientIndex, Message* message)
 		break;
 	case CINEMA_SYNC:
 		broadcastCinemaSync(server, clientIndex, static_cast<CinemaSyncMessage*>(message));
+		break;
+	case ANIM_SYNC_REQUEST:
+		broadcastAnimSyncRequest(server, clientIndex, static_cast<AnimSyncRequestMessage*>(message));
 		break;
 
 	case RING_SYNC:

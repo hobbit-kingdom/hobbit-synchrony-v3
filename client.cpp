@@ -2017,6 +2017,11 @@ static constexpr uint8_t  RIGID_INSTANCE_CLASS_TAG = 0x05;
 static constexpr uint32_t RI_ANIMPLAYER_OFF = 0x140;
 static constexpr uint32_t AP_FRAME_OFF = 0x10;
 static constexpr uint32_t AP_VALID_OFF = 0x88;
+// The engine's own clamp-vs-wrap switch, read by the frame advance @0x0053B780:
+// 0 -> the anim clamps at its last frame (one-shot: doors, levers - owned by the
+// trigger sync, never by us), nonzero -> it wraps and counts loops at +0x14.
+// Only looping objects are worth frame-syncing: one alignment holds forever.
+static constexpr uint32_t AP_LOOPING_OFF = 0x60;
 static constexpr uint32_t RI_SETANIMFRAME_ADDR = 0x004C7580;
 
 // public: void __thiscall rigid_instance::SetAnimFrame(float)
@@ -2027,6 +2032,10 @@ static const SetAnimFrame_t game_SetAnimFrame = reinterpret_cast<SetAnimFrame_t>
 
 CRITICAL_SECTION animSyncCriticalSection;
 static std::atomic<bool> g_animSyncRequested{ false };
+// Non-host side of the pull protocol: set when THIS client's world just changed
+// (level entry, or one of its own load triggers fired) and it wants the host's
+// looping-anim frames. Sent as ANIM_SYNC_REQUEST by the network thread.
+static std::atomic<bool> g_animSyncPullRequested{ false };
 static std::unordered_map<uint64_t, float> g_incomingAnimFrames;
 
 // Engine object list (same globals HobbitProcessAnalyzer uses).
@@ -2075,6 +2084,8 @@ static uint32_t snapshotAnimatedRigids(AnimObjEntry* out, uint32_t maxOut)
 				continue;                                              // no anim player
 			if (*reinterpret_cast<uint32_t*>(player + AP_VALID_OFF) == 0)
 				continue;                                              // AnimDataAvailable == false
+			if (*reinterpret_cast<uint32_t*>(player + AP_LOOPING_OFF) == 0)
+				continue;                                              // one-shot anim - not ours to sync
 
 			out[n].addr  = objAddr;
 			out[n].guid  = *reinterpret_cast<uint64_t*>(objAddr + 0x8);
@@ -2136,6 +2147,42 @@ static void sendAnimSync(Client& client)
 	client.SendMessage(channels::Gameplay, msg);
 
 	dprintf("Broadcast anim sync for %zu rigid_instances\n", sent);
+}
+
+// Send our own pull request (network thread, from the client loop). Host never
+// pulls - it IS the source of truth.
+static void sendAnimSyncRequest(Client& client)
+{
+	if (!g_animSyncPullRequested.exchange(false))
+		return;
+	if (isHost == 1)
+		return;
+	if (nowLevel == 7)
+		return;   // level 7: anim sync disabled entirely
+	if (!client.IsConnected() || !gameManager.isOnLevel())
+		return;
+
+	auto* msg = static_cast<AnimSyncRequestMessage*>(client.CreateMessage(ANIM_SYNC_REQUEST));
+	if (!msg)
+		return;
+	msg->nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+	client.SendMessage(channels::Gameplay, msg);
+
+	dprintf("anim sync: requested frames from the host\n");
+}
+
+// A peer asked for frames (network thread). Only the host answers, and only if
+// the requester is on the same level - the snapshot would be meaningless
+// otherwise. Multiple requests in one tick collapse into the same flag, so the
+// host broadcasts once no matter how many clients loaded at the same time.
+static void processAnimSyncRequest(AnimSyncRequestMessage* msg)
+{
+	if (isHost != 1)
+		return;
+	if (msg->nowLevel != nowLevel)
+		return;
+
+	g_animSyncRequested.store(true);
 }
 
 // Queue an incoming anim-sync snapshot (network thread).
@@ -3299,7 +3346,7 @@ static void applyQueuedCinemaStarts()
 }
 
 // ===========================================================================
-//  Layer load -> automatic animation resync (host only)
+//  Layer load -> automatic animation resync (both directions)
 // ===========================================================================
 //
 // Level geometry is streamed in "layers". A LoadTrigger brings a set of them in,
@@ -3307,9 +3354,14 @@ static void applyQueuedCinemaStarts()
 // them, so they drift apart - the same problem /syncanim exists to fix, just
 // triggered by streaming instead of by a late join.
 //
-// So: when the host fires a load trigger, request the same one-shot anim
-// broadcast /syncanim does. Host only, because every client runs the same level
-// scripts and would otherwise all broadcast the same snapshot at once.
+// Each side reacts to ITS OWN load triggers, because layer state is per-client
+// and unobservable from the outside:
+//   host   -> fires the one-shot anim broadcast /syncanim does (world changed,
+//             tell everyone where the loops are)
+//   client -> sends ANIM_SYNC_REQUEST (world changed HERE, ask the host); the
+//             host answers with that same broadcast. Since looping anims advance
+//             at the same rate everywhere, one alignment per activation holds
+//             until the next layer change - no periodic traffic.
 //
 // No waiting is needed before snapshotting. Objects are instantiated ONCE per
 // level: layer_mgr::LoadObjects @0x0055A400 is called from exactly one place,
@@ -3329,13 +3381,21 @@ static void __fastcall hkLoadTriggerExecute(void* self, void* edx)
 {
 	oLoadTriggerExecute(self, edx);
 
-	if (isHost != 1)
-		return;
-
-	// Same one-shot request /syncanim raises; the capture + broadcast happens on
-	// the network thread in sendAnimSync(), which is also a natural short delay
-	// after the layer flush that this trigger queued.
-	g_animSyncRequested.store(true);
+	if (isHost == 1)
+	{
+		// Same one-shot request /syncanim raises; the capture + broadcast happens on
+		// the network thread in sendAnimSync(), which is also a natural short delay
+		// after the layer flush that this trigger queued.
+		g_animSyncRequested.store(true);
+	}
+	else
+	{
+		// OUR world just changed - the layers this trigger activates start their
+		// looping anims at whatever frame they were parked on, not the host's.
+		// Ask the host for one fresh snapshot (sent by sendAnimSyncRequest on the
+		// network thread, answered with the normal AnimSyncMessage broadcast).
+		g_animSyncPullRequested.store(true);
+	}
 
 	uint64_t triggerGuid = 0;
 	if (self && processAnalyzer)
@@ -3344,9 +3404,10 @@ static void __fastcall hkLoadTriggerExecute(void* self, void* edx)
 			reinterpret_cast<uint32_t>(self) + CINEMA_GUID_OFF);   // object+0x8, same for every object
 	}
 
-	dprintf("[layer] load trigger %08X_%08X fired - broadcasting anim frames\n",
+	dprintf("[layer] load trigger %08X_%08X fired - %s\n",
 		static_cast<uint32_t>(triggerGuid >> 32),
-		static_cast<uint32_t>(triggerGuid));
+		static_cast<uint32_t>(triggerGuid),
+		isHost == 1 ? "broadcasting anim frames" : "requesting anim frames");
 }
 
 void InstallLayerHooks()
@@ -4525,6 +4586,9 @@ static void processMessage(Client& client, Message* message, double time)
 	case ANIM_SYNC:
 		if (gameManager.isOnLevel()) processAnimSync(static_cast<AnimSyncMessage*>(message));
 		break;
+	case ANIM_SYNC_REQUEST:
+		if (gameManager.isOnLevel()) processAnimSyncRequest(static_cast<AnimSyncRequestMessage*>(message));
+		break;
 	case RING_SYNC:
 		processRingSync(static_cast<RingSyncMessage*>(message));
 		break;
@@ -4881,6 +4945,12 @@ static int clientMain()
 			{
 				readGamePointers();
 				processedDataForThisLevel = true;
+
+				// Our whole world just (re)activated - align every looping anim
+				// to the host. Covers the base layer set and late joins; per-layer
+				// streaming is handled by the load-trigger hook.
+				if (isHost != 1)
+					g_animSyncPullRequested.store(true);
 			}
 			if (!gameManager.isOnLevel())
 			{
@@ -5003,6 +5073,9 @@ static int clientMain()
 
 					// Send a one-shot animation-frame sync if /syncanim was used
 					sendAnimSync(client);
+
+					// Ask the host for looping-anim frames if our world just changed
+					sendAnimSyncRequest(client);
 
 					// Broadcast our ring state when it changes
 					sendRingSync(client);

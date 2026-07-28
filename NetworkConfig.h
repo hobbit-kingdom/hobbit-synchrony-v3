@@ -21,7 +21,7 @@ using namespace yojimbo;
 
 // Bumped when the message factory changes, so an old client/server pair is
 // rejected cleanly at connect instead of desyncing the reliable stream later.
-const uint64_t ProtocolId = 0x11223344556678ULL;
+const uint64_t ProtocolId = 0x11223344556679ULL;
 
 const int ClientPort = 30000;
 const int ServerPort = 40000;
@@ -62,6 +62,7 @@ YOJIMBO_DECLARE_MESSAGE_TYPE(RING_SYNC, RingSyncMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(SPAWN_OBJECT, SpawnObjectMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(SPAWN_FX, SpawnFxMessage);
 YOJIMBO_DECLARE_MESSAGE_TYPE(CINEMA_SYNC, CinemaSyncMessage);
+YOJIMBO_DECLARE_MESSAGE_TYPE(ANIM_SYNC_REQUEST, AnimSyncRequestMessage);
 YOJIMBO_MESSAGE_FACTORY_FINISH();
 
 // ---------------------------------------------------------------------------

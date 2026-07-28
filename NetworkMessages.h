@@ -52,6 +52,7 @@ enum GameMessageType
 	SPAWN_OBJECT,
 	SPAWN_FX,
 	CINEMA_SYNC,
+	ANIM_SYNC_REQUEST,
 	NUM_GAME_MESSAGE_TYPES
 };
 
@@ -573,8 +574,34 @@ struct SwitchToggleMessage : public Message
 };
 
 // ---------------------------------------------------------------------------
+// AnimSyncRequestMessage — a non-host client just (re)activated part of its
+// world (level entry, or one of ITS OWN load triggers fired) and wants the
+// host's looping-animation frames. Carries only the requester's level so the
+// host can ignore requests from a different level. The host answers with the
+// normal AnimSyncMessage broadcast; clients that didn't ask re-apply frames
+// their loops are already at, which is visually a no-op.
+// ---------------------------------------------------------------------------
+
+struct AnimSyncRequestMessage : public Message
+{
+	uint32_t nowLevel = 0;
+
+	template <typename Stream>
+	bool Serialize(Stream& stream)
+	{
+		serialize_bits(stream, nowLevel, 32);
+		if (stream.IsReading)
+			nowLevel = NetworkClamp::sanitizeLevel(nowLevel);
+		return true;
+	}
+
+	YOJIMBO_VIRTUAL_SERIALIZE_FUNCTIONS();
+};
+
+// ---------------------------------------------------------------------------
 // AnimSyncMessage — one-shot snapshot of the current animation frame of every
-// animated rigid_instance on the level, keyed by object GUID. Sent once by a
+// LOOPING animated rigid_instance on the level, keyed by object GUID (one-shot
+// anims - doors, levers - are excluded; they belong to the trigger sync). Sent by a
 // peer; each receiver snaps its matching objects to those frames. Because the
 // engine's rigid_instance animations loop at a fixed rate, a single alignment
 // keeps them in sync from that point on. (Same variable-length map shape as
