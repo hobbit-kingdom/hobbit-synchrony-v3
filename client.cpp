@@ -2073,6 +2073,8 @@ static void sendAnimSync(Client& client)
 {
 	if (!g_animSyncRequested.exchange(false))
 		return;
+	if (nowLevel == 7)
+		return;   // level 7: anim sync disabled entirely
 	if (!client.IsConnected() || !processAnalyzer || !gameManager.isOnLevel())
 		return;
 
@@ -2094,9 +2096,11 @@ static void sendAnimSync(Client& client)
 			found, MaxAnimSyncPerMessage);
 	}
 
+	// Console only, no chat: this also runs automatically on every layer load, and
+	// the manual /syncanim already acknowledges itself when you type it.
 	if (snapshot.empty())
 	{
-		g_ChatOverlay.AddSystemMessage("[System] No animated objects found to sync.");
+		dprintf("anim sync: no animated objects found to sync\n");
 		return;
 	}
 
@@ -2108,8 +2112,6 @@ static void sendAnimSync(Client& client)
 	size_t sent = msg->frames.size();
 	client.SendMessage(channels::Gameplay, msg);
 
-	g_ChatOverlay.AddSystemMessage("[System] Synced animation frame of " +
-		std::to_string(sent) + " object(s) to all players.");
 	dprintf("Broadcast anim sync for %zu rigid_instances\n", sent);
 }
 
@@ -2137,6 +2139,9 @@ static void applyQueuedAnimSync()
 	EnterCriticalSection(&animSyncCriticalSection);
 	pending.swap(g_incomingAnimFrames);
 	LeaveCriticalSection(&animSyncCriticalSection);
+
+	if (nowLevel == 7)
+		return;   // level 7: anim sync disabled entirely (queue is drained, not applied)
 
 	if (pending.empty())
 		return;
