@@ -76,6 +76,23 @@ static uint32_t bilboWeapon;
 static uint32_t nowLevel;
 static bool levelIsRunning;
 
+// NPCs that are host-driven REGARDLESS of their current team, per level.
+//
+// The normal rule is "team 1/2 = host-driven" and it is re-checked every frame, so a
+// script flipping an NPC to neutral hands him back to local AI on every client. On
+// some levels that is exactly wrong: the Trollshaw troll 0D8AD98D_A6188400 (level
+// index 3) gets parked on team 0 during a cutscene and back to 2 afterwards - the
+// neutral window was enough for each client's local goal/patrol AI to march him off
+// on his own before the host took over again. Force-listing him keeps every gate
+// (send, AI suppression, goal starving, action filtering) treating him as synced
+// straight through the flip.
+static bool isForceSyncedNpc(uint64_t guid)
+{
+	if (nowLevel == 3 && guid == 0x0D8AD98DA6188400ULL)   // 0D8AD98D_A6188400
+		return true;
+	return false;
+}
+
 static uint64_t myNicknameGuid = 0;
 static uint64_t myStatusGuid = 0;
 
@@ -449,6 +466,7 @@ void InstallPainHooks();   // forward decl (defined further below)
 void InstallCinemaHook();  // forward decl (defined further below)
 void InstallLayerHooks();  // forward decl (defined further below)
 void InstallGoalHook();    // forward decl (defined further below)
+void InstallActionFilterHook(); // forward decl (defined further below)
 
 void SetupBilboHook(void)
 {
@@ -479,6 +497,8 @@ void SetupBilboHook(void)
 	                      // anim frames when a layer streams in
 	InstallGoalHook();    // detour StateController::GetCurrentGoal so host-driven
 	                      // NPCs' goal/patrol AI never executes on non-host clients
+	InstallActionFilterHook(); // detour AIAction::OnAdvanceLogic so level-script
+	                      // SetGoalList actions can't re-drive host-driven NPCs
 }
 
 static std::string getModuleDirectory(HMODULE module)
@@ -1218,7 +1238,7 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		// NPC that a script just turned hostile starts being sent immediately.
 		if (!enemy.second->isNpcType())
 			continue;
-		if (!isSyncedTeam(enemy.second->getTeam()))
+		if (!isSyncedTeam(enemy.second->getTeam()) && !isForceSyncedNpc(enemy.first))
 			continue;
 
 		Vector3 ePos = enemy.second->getPosition();
@@ -1249,7 +1269,7 @@ static void changeEnemiesAIMode(int mode)
 		if (npc == nullptr || !npc->isValid() || !npc->isNpcType())
 			continue;
 
-		if (isSyncedTeam(npc->getTeam()))
+		if (isSyncedTeam(npc->getTeam()) || isForceSyncedNpc(enemy.first))
 		{
 			npc->setAIMode(mode);
 			g_aiSuppressed.insert(enemy.first);
@@ -3086,19 +3106,23 @@ static StateGetCurrentGoal_t oStateGetCurrentGoal = nullptr;
 static void* __fastcall hkStateGetCurrentGoal(void* self, void* edx)
 {
 	// The host is the one client whose goal AI is REAL - it drives everyone else.
-	if (isHost != 1)
+	// Level 9 (Smaug) keeps its own AI everywhere, same as the AI-mode path.
+	if (isHost != 1 && nowLevel != 9)
 	{
 		const uint8_t* sc = static_cast<const uint8_t*>(self);
+		const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
+
+		// Force-listed NPCs stay starved even while a cutscene parks them on team 0.
+		if (isForceSyncedNpc(guid))
+			return nullptr;
 
 		uint32_t owner = *reinterpret_cast<const uint32_t*>(sc + SC_OWNER_OBJ_OFF);
-		if (owner == 0)
+		if (owner == 0 && guid != 0)
 		{
 			// Engine hasn't resolved the owner yet (first ticks after import - exactly
 			// when the level scripts queue the initial goals). Resolve it the same way
 			// the engine does, but do NOT write the cache back; that stays its job.
-			const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
-			if (guid != 0)
-				owner = game_ObjFromGuid(GAME_OBJ_MGR, nullptr, guid);
+			owner = game_ObjFromGuid(GAME_OBJ_MGR, nullptr, guid);
 		}
 
 		if (owner >= 0x00010000 &&
@@ -3119,6 +3143,87 @@ void InstallGoalHook()
 	void* target = reinterpret_cast<void*>(GOAL_GETCURRENT_ADDR);
 	MH_CreateHook(target, &hkStateGetCurrentGoal,
 		reinterpret_cast<void**>(&oStateGetCurrentGoal));
+	MH_EnableHook(target);
+}
+
+// ===========================================================================
+//  AIManager action filter — stop level-script actions from re-driving NPCs
+// ===========================================================================
+//
+// Levels carry an AIManager block (triggers / actions / links). Its runtime is
+// AIManager::OnAdvanceLogic @0x0055CD20: links test their triggers (trigger
+// vtbl+0x04 = Test), a link that passes calls AIAction::Fire @0x005CC300 on each
+// linked action, and every action then ticks through the shared base
+//
+//   AIAction::OnAdvanceLogic @0x005CC330   (action vtbl+0x14; ExecuteImmediately
+//       goes through it too - Fire calls vtbl+0x14 directly with dt=0.01)
+//     +0x08 pending fire count    +0x0C elapsed     +0x10 ExecuteDelay
+//     +0x14 flags: bit0 = ExecuteImmediately, bit1 = armed (delay running)
+//   When armed && elapsed >= delay: calls vtbl+0x04 (the real Execute) pending
+//   times, zeroes pending, clears the armed bit.
+//
+// ActionType 4 = ActionSetGoalList (factory @0x0055D520 case 4 -> ctor @0x005D0580,
+// vtable @0x006F4640). Its Execute @0x005D06F0 resolves CharacterGuid (+0x18),
+// requires the target to be an NPC (type tag 0x1C), then sets the AI STATE
+// (AIStateName xstring @+0x20) and starts the goal list (GoalListName @+0x4C).
+// The goal-list half is already neutralised by the GetCurrentGoal hook above, but
+// the STATE half changes what the local state machine plays - a client that lets
+// it run diverges from the host.
+//
+// So: detour the base tick and, on non-host clients, swallow the fire of every
+// ActionSetGoalList whose target is a host-driven (team 1/2) NPC - zero the
+// pending count and clear the armed bit right before the original runs, so the
+// bookkeeping stays exactly like an already-consumed action. Identified by
+// vtable, so other action types (and other targets: neutral NPCs, cinema
+// characters) are untouched. Extend AIACTION_BLOCKED_VTBLS to filter more types.
+static constexpr uint32_t AIACTION_ONADVANCE_ADDR = 0x005CC330;   // AIAction::OnAdvanceLogic (base)
+static constexpr uint32_t AIACTION_VTBL_SETGOALLIST = 0x006F4640; // ActionType 4
+static constexpr uint32_t AIACTION_PENDING_OFF = 0x08;
+static constexpr uint32_t AIACTION_FLAGS_OFF = 0x14;              // bit1 = armed
+static constexpr uint32_t ASGL_CHARGUID_OFF = 0x18;               // ActionSetGoalList.CharacterGuid
+
+typedef void(__fastcall* AIActionOnAdvance_t)(void* self, void* edx, float dt);
+static AIActionOnAdvance_t oAIActionOnAdvance = nullptr;
+
+static void __fastcall hkAIActionOnAdvance(void* self, void* edx, float dt)
+{
+	// Level 9 (Smaug) keeps its own AI everywhere, same as the AI-mode path.
+	if (isHost != 1 && nowLevel != 9 && self &&
+		*reinterpret_cast<const uint32_t*>(self) == AIACTION_VTBL_SETGOALLIST)
+	{
+		uint8_t* act = static_cast<uint8_t*>(self);
+
+		// Only bother resolving the target while the action is armed - i.e. Fire
+		// ran and Execute is due now or after ExecuteDelay. Unarmed actions (the
+		// overwhelming majority of ticks) cost one flag test.
+		if ((*reinterpret_cast<const uint32_t*>(act + AIACTION_FLAGS_OFF) & 2) != 0)
+		{
+			const uint64_t guid = *reinterpret_cast<const uint64_t*>(act + ASGL_CHARGUID_OFF);
+			const uint32_t target = (guid != 0)
+				? game_ObjFromGuid(GAME_OBJ_MGR, nullptr, guid) : 0;
+
+			if (isForceSyncedNpc(guid) ||
+				(target >= 0x00010000 &&
+				 *reinterpret_cast<const uint8_t*>(target + OBJ_TYPE_OFFSET) == OBJ_TYPE_NPC &&
+				 isSyncedTeam(*reinterpret_cast<const int*>(target + OBJ_TEAM_OFFSET))))
+			{
+				dprintf("[aimgr] blocked SetGoalList action -> NPC %016llX\n", guid);
+				*reinterpret_cast<int*>(act + AIACTION_PENDING_OFF) = 0;
+				*reinterpret_cast<uint32_t*>(act + AIACTION_FLAGS_OFF) &= ~2u;
+			}
+		}
+	}
+
+	oAIActionOnAdvance(self, edx, dt);
+}
+
+void InstallActionFilterHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* target = reinterpret_cast<void*>(AIACTION_ONADVANCE_ADDR);
+	MH_CreateHook(target, &hkAIActionOnAdvance,
+		reinterpret_cast<void**>(&oAIActionOnAdvance));
 	MH_EnableHook(target);
 }
 
