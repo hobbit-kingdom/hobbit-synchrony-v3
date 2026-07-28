@@ -21,7 +21,7 @@ using namespace yojimbo;
 
 // Bumped when the message factory changes, so an old client/server pair is
 // rejected cleanly at connect instead of desyncing the reliable stream later.
-const uint64_t ProtocolId = 0x11223344556679ULL;
+const uint64_t ProtocolId = 0x1122334455667AULL;
 
 const int ClientPort = 30000;
 const int ServerPort = 40000;

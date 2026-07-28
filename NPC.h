@@ -103,6 +103,14 @@ public:
 	/// on a shieldless NPC is harmless but pointless work.
 	void shatterShield();
 
+	// --- Visibility (DoRender / DoShadow bits of the capability mask) ---
+
+	bool isRendered() const;
+	bool hasShadow() const;
+	/// Set both visibility bits in one write, leaving every other capability
+	/// bit (collision, phys, root, ...) untouched.
+	void setRenderFlags(bool rendered, bool shadow);
+
 	void setGUID(uint32_t newGUID);
 	void setAIMode(int mode);
 	/// Put the AI flag byte back to whatever it was when this NPC was discovered.

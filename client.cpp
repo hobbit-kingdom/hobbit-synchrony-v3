@@ -351,6 +351,11 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 			if (!enemyUpdate.second.shieldIntact && badBoy->hasShield())
 				badBoy->shatterShield();
 
+			// Visibility. Level scripts hide/reveal NPCs by flipping DoRender /
+			// DoShadow on the host; mirror both bits so "invisible there" means
+			// "invisible here". Only these two bits are written (setAIMode no
+			// longer whole-byte-writes the mask, so nothing fights this).
+			badBoy->setRenderFlags(enemyUpdate.second.rendered, enemyUpdate.second.shadowOn);
 		}
 		enemies_updated = false;
 	}
@@ -1246,9 +1251,11 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		uint32_t eAnim = enemy.second->getAnimation();
 		float eHealth = enemy.second->getHealth();
 		bool eShield = enemy.second->hasShield();
+		bool eRendered = enemy.second->isRendered();
+		bool eShadow = enemy.second->hasShadow();
 
 		temp[enemy.first] = NetworkClamp::sanitizeEnemy(
-			{ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth, eShield });
+			{ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth, eShield, eRendered, eShadow });
 	}
 
 	return temp;
