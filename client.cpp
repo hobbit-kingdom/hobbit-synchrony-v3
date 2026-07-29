@@ -38,6 +38,8 @@
 #include "meridian.hpp"        // bilbo class + existing hooks (still needed by the rest of this file)
 #include "minhook/MinHook.h"   // CreateStoneProjectile detour (MinHook is compiled into the project)
 #include "DebugLog.h"
+#include "custom_page.h"       // engine UI toolkit (hobbit_ui) - host/client selection page
+#include <conio.h>             // _kbhit/_getch: console fallback for the host choice
 
 using namespace yojimbo;
 
@@ -101,6 +103,44 @@ static bool isForceSyncedNpc(uint64_t guid)
 {
 	if (nowLevel == 3 && guid == 0x0D8AD98DA6188400ULL)   // 0D8AD98D_A6188400
 		return true;
+	return false;
+}
+
+// The opposite list: NPCs that are NEVER host-driven, whatever team they are on.
+// They keep their own local AI on every client - not sent in the enemy packet, not
+// AI-suppressed, not goal-starved, and their SetGoalList actions are left alone.
+// This wins over both the team rule and isForceSyncedNpc.
+static bool isLocalAiNpc(uint64_t guid)
+{
+	if (nowLevel != 4)
+		return false;
+
+	static const uint64_t localAiGuids[] =
+	{
+		0x0D8AD68CC88FF000ULL,   // 0D8AD68C_C88FF000
+		0x0D8AD68CC890A800ULL,   // 0D8AD68C_C890A800
+		0x0D8AD68CC891C000ULL,   // 0D8AD68C_C891C000
+		0x0D8AD1CCC3644400ULL,   // 0D8AD1CC_C3644400
+		0x0D8AD68CC8905C00ULL,   // 0D8AD68C_C8905C00
+		0x0D8AD68CC88E9800ULL,   // 0D8AD68C_C88E9800
+		0x0D8AD68CC8922000ULL,   // 0D8AD68C_C8922000
+		0x0D8AD68CC88F2400ULL,   // 0D8AD68C_C88F2400
+		0x0D8AD68CC88F8800ULL,   // 0D8AD68C_C88F8800
+		0x0D8AD68CC8918400ULL,   // 0D8AD68C_C8918400
+		0x0D8AD68CC890F400ULL,   // 0D8AD68C_C890F400
+		0x0D8AD68CC8A67C11ULL,   // 0D8AD68C_C8A67C11
+		0x0D8AD68CC8A67C13ULL,   // 0D8AD68C_C8A67C13
+		0x0D8AD44CC8160800ULL,   // 0D8AD44C_C8160800
+		0x0D8AD68CC8A75C01ULL,   // 0D8AD68C_C8A75C01
+		0x0D8AD68CC89BF400ULL,   // 0D8AD68C_C89BF400
+	};
+
+	for (uint64_t localGuid : localAiGuids)
+	{
+		if (guid == localGuid)
+			return true;
+	}
+
 	return false;
 }
 
@@ -1254,6 +1294,8 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		// NPC that a script just turned hostile starts being sent immediately.
 		if (!enemy.second->isNpcType())
 			continue;
+		if (isLocalAiNpc(enemy.first))
+			continue;   // runs its own AI everywhere; sending it would fight that
 		if (!isSyncedTeam(enemy.second->getTeam()) && !isForceSyncedNpc(enemy.first))
 			continue;
 
@@ -1286,7 +1328,8 @@ static void changeEnemiesAIMode(int mode)
 		if (npc == nullptr || !npc->isValid() || !npc->isNpcType())
 			continue;
 
-		if (isSyncedTeam(npc->getTeam()) || isForceSyncedNpc(enemy.first))
+		if (!isLocalAiNpc(enemy.first) &&
+			(isSyncedTeam(npc->getTeam()) || isForceSyncedNpc(enemy.first)))
 		{
 			npc->setAIMode(mode);
 			g_aiSuppressed.insert(enemy.first);
@@ -3176,6 +3219,10 @@ static void* __fastcall hkStateGetCurrentGoal(void* self, void* edx)
 		const uint8_t* sc = static_cast<const uint8_t*>(self);
 		const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
 
+		// Listed as local-AI: never starved, whatever team it is on.
+		if (isLocalAiNpc(guid))
+			return oStateGetCurrentGoal(self, edx);
+
 		// Force-listed NPCs stay starved even while a cutscene parks them on team 0.
 		if (isForceSyncedNpc(guid))
 			return nullptr;
@@ -3266,10 +3313,11 @@ static void __fastcall hkAIActionOnAdvance(void* self, void* edx, float dt)
 			const uint32_t target = (guid != 0)
 				? game_ObjFromGuid(GAME_OBJ_MGR, nullptr, guid) : 0;
 
-			if (isForceSyncedNpc(guid) ||
+			if (!isLocalAiNpc(guid) &&
+				(isForceSyncedNpc(guid) ||
 				(target >= 0x00010000 &&
 				 *reinterpret_cast<const uint8_t*>(target + OBJ_TYPE_OFFSET) == OBJ_TYPE_NPC &&
-				 isSyncedTeam(*reinterpret_cast<const int*>(target + OBJ_TEAM_OFFSET))))
+				 isSyncedTeam(*reinterpret_cast<const int*>(target + OBJ_TEAM_OFFSET)))))
 			{
 				dprintf("[aimgr] blocked SetGoalList action -> NPC %016llX\n", guid);
 				*reinterpret_cast<int*>(act + AIACTION_PENDING_OFF) = 0;
@@ -3288,6 +3336,145 @@ void InstallActionFilterHook()
 	void* target = reinterpret_cast<void*>(AIACTION_ONADVANCE_ADDR);
 	MH_CreateHook(target, &hkAIActionOnAdvance,
 		reinterpret_cast<void**>(&oAIActionOnAdvance));
+	MH_EnableHook(target);
+}
+
+// ===========================================================================
+//  Host/client selection page (in-game, replaces the console 1/0 prompt)
+// ===========================================================================
+//
+// Uses custom_page.h's page template, but opened the way the STOCK option pages
+// are opened — that is what fixes the "tiny page, only clickable to the left"
+// behaviour:
+//
+//   ShowCustomPage() hardcodes the dialog rect as (0,0,640,480) DESIGN coords,
+//   while the engine DRAWS the controls scaled to the real backbuffer. At any
+//   resolution above 640x480 the art is scaled/centred but the hit rects stay in
+//   the top-left region, so clicks only land near the upper-left. The stock menu
+//   pages are opened with the screen's own rect, which is why they line up.
+//   Our detour already receives the rect the "main menu" itself is being opened
+//   with, so we simply pass that same rect through.
+//
+// Interaction is button-driven, not tick-box-driven: a checkbox's hit area is
+// only the little box glyph at the far left (the other half of what you saw), so
+// the WIDE button toggles the choice and the checkbox just shows it. Close
+// confirms and dismisses.
+//
+// Trigger: MinHook detour on ui OpenDialog @0x006A1430 — every menu screen goes
+// through it by template name, and the main menu registers as "main menu"
+// (verified by walking all 32 RegisterDialogTemplate call sites). Shown on EVERY
+// "main menu" open until a choice exists, never again after. All UI work happens
+// on the game thread inside the detour; the startup thread waits on the flag,
+// with console keys 1/0 kept as a fallback.
+
+static std::atomic<bool> g_hostChoiceMade{ false };
+
+// Live choice while the page is open (committed on Close).
+static bool g_hostPageWantsHost = false;
+
+static void refreshHostPageLabels(void* dlg)
+{
+	using namespace hobbit_ui;
+	SetText(GetById(dlg, ID_BUTTON), g_hostPageWantsHost
+		? L"ROLE:  HOST        (click to change)"
+		: L"ROLE:  CLIENT      (click to change)");
+}
+
+// custom_page.h click callback: fires on every control press of the active page.
+static void onHostPageClick(int id, void* dlg)
+{
+	using namespace hobbit_ui;
+
+	if (id == ID_BUTTON)
+	{
+		// One wide button IS the choice - a checkbox's hit area would only be the
+		// little box glyph at its far left.
+		g_hostPageWantsHost = !g_hostPageWantsHost;
+		refreshHostPageLabels(dlg);
+		return;
+	}
+
+	if (id != ID_CLOSE)
+		return;
+
+	// The console fallback may have answered first; don't overwrite it.
+	if (!g_hostChoiceMade.load())
+	{
+		isHost = g_hostPageWantsHost ? 1 : 0;
+		g_hostChoiceMade.store(true);
+		printf(isHost == 1 ? "HOST selected (menu page)\n"
+		                   : "CLIENT selected (menu page)\n");
+	}
+}
+
+// Hide a control completely: invisible AND not hittable, so it neither draws nor
+// swallows clicks. (Nav-grid cells it claimed stay claimed - harmless.)
+static void hideHostPageControl(void* page, int id)
+{
+	void* c = hobbit_ui::GetById(page, id);
+	if (!c)
+		return;
+	uint32_t* flags = reinterpret_cast<uint32_t*>(
+		reinterpret_cast<char*>(c) + hobbit_ui::addr::CTRL_FLAGS);
+	*flags = (*flags & ~1u) | 2u;
+}
+
+// void* __thiscall ui_manager::OpenDialog(ctx, name, rL,rT,rR,rB, a, b, c)
+typedef void* (__fastcall* UiOpenDialog_t)(void* uimgr, void* edx, void* ctx,
+	const char* name, int rL, int rT, int rR, int rB, int a, int b, int c);
+static UiOpenDialog_t oUiOpenDialog = nullptr;
+
+static void* __fastcall hkUiOpenDialog(void* uimgr, void* edx, void* ctx,
+	const char* name, int rL, int rT, int rR, int rB, int a, int b, int c)
+{
+	void* dlg = oUiOpenDialog(uimgr, edx, ctx, name, rL, rT, rR, rB, a, b, c);
+
+	if (!g_hostChoiceMade.load() && name && strcmp(name, "main menu") == 0)
+	{
+		using namespace hobbit_ui;
+
+		OnClick() = &onHostPageClick;
+		BackdropMode() = BD_PANEL;
+		BackdropScale() = 1.0f;          // frame is already sized in the template
+		RegisterTemplate();
+
+		// Same rect the main menu itself was opened with - NOT the hardcoded
+		// 640x480 that ShowCustomPage() uses (see the note above).
+		void* page = oUiOpenDialog(uimgr, nullptr, ctx, "kitchen_sink",
+			rL, rT, rR, rB, a, b, c);
+		if (page)
+		{
+			Relabel(page);               // backdrop + click handler + CurrentPage()
+
+			// Fully opaque panel (Relabel's default fill is alpha 0xDC = see-through).
+			SetFrameFill(GetById(page, ID_FRAME), 0x14, 0x16, 0x20, 0xFF);
+
+			SetText(GetById(page, ID_TITLE), L"THE HOBBIT SYNCHRONY");
+			// One control per line - the text control does not break on '\n'.
+			SetText(GetById(page, ID_INFO),  L"Welcome to the Hobbit Synchrony - a multiplayer");
+			SetText(GetById(page, ID_INFO2), L"mod for The Hobbit. Your friends are waiting");
+			SetText(GetById(page, ID_INFO3), L"for you. Choose to host a game or join a friend,");
+			SetText(GetById(page, ID_INFO4), L"and let the journey begin.");
+			SetText(GetById(page, ID_CLOSE), L"Done");
+
+			g_hostPageWantsHost = false;            // default role: CLIENT
+			refreshHostPageLabels(page);
+
+			hideHostPageControl(page, ID_SLIDER);   // unused here
+			hideHostPageControl(page, ID_CHECK);    // the button carries the choice
+		}
+	}
+
+	return dlg;
+}
+
+void InstallHostSelectHook()
+{
+	MH_Initialize();                  // harmless if MinHook is already initialized
+
+	void* target = reinterpret_cast<void*>(hobbit_ui::addr::OpenDialog);
+	MH_CreateHook(target, &hkUiOpenDialog,
+		reinterpret_cast<void**>(&oUiOpenDialog));
 	MH_EnableHook(target);
 }
 
@@ -5394,14 +5581,33 @@ DWORD WINAPI mainThread(LPVOID)
 	}
 
 	//-----------------------------------------------------
-	// HOST INPUT
+	// HOST INPUT — in-game page on the main menu screen.
+	// The OpenDialog detour shows a checkbox+confirm page whenever "main menu"
+	// opens and no choice has been made yet; this thread just waits for the
+	// answer. Console keys 1/0 stay available as a fallback.
 	//-----------------------------------------------------
 
-	std::cout
-		<< "Are you the host? "
-		<< "(yes = 1 / no = 0)\n";
+	InstallHostSelectHook();
 
-	std::cin >> isHost;
+	std::cout
+		<< "Choose HOST or CLIENT on the page shown at the game's main menu\n"
+		<< "(fallback: press 1 = host / 0 = client here in the console)\n";
+
+	while (!g_hostChoiceMade.load())
+	{
+		if (_kbhit())
+		{
+			const int key = _getch();
+			if (key == '1' || key == '0')
+			{
+				isHost = (key == '1') ? 1 : 0;
+				g_hostChoiceMade.store(true);
+				std::cout << (isHost == 1 ? "HOST selected (console)\n"
+				                          : "CLIENT selected (console)\n");
+			}
+		}
+		Sleep(50);
+	}
 
 	//-----------------------------------------------------
 	// INIT YOJIMBO
