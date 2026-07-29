@@ -438,86 +438,56 @@ void NPC::resolveAnimationPtr()
 // ---------------------------------------------------------------------------
 // Dostate + Senses: AI
 // ---------------------------------------------------------------------------
-//
-// NPCObject+0x268 is the engine's per-NPC capability mask, decoded from
-// NPCObject::OnImport (property name -> bit):
-//   0x01 base enable   0x02 DoRender        0x04 DoCollision   0x08 DoStateControl
-//   0x10 DoPhysControl 0x20 DoSenses        0x40 DoShadow      0x80 RootToPosition
-//   0x2000 Sleeps      0x40000 Pushable
-//
-// setAIMode touches ONLY the two bits it manages (DoStateControl + DoSenses) via
-// read-modify-write. The old version wrote whole magic bytes (87/127/... and a
-// >127 twin set that was dead code behind a signed-char compare), which forced
-// render/shadow/collision back ON every tick and clobbered RootToPosition - it
-// would also have fought the host-driven render sync added below.
-
-static constexpr uint32_t NPC_AIFLAGS_OFF = 0x268;
-static constexpr uint8_t  AIFLAG_DORENDER = 0x02;
-static constexpr uint8_t  AIFLAG_DOSTATECONTROL = 0x08;
-static constexpr uint8_t  AIFLAG_DOSENSES = 0x20;
-static constexpr uint8_t  AIFLAG_DOSHADOW = 0x40;
 
 void NPC::setAIMode(int mode)
 {
 	if (!isAnalyzerReady() || !isValid())
 		return;
 
-	uint8_t* pointerAI = (uint8_t*)getObjectPtr() + NPC_AIFLAGS_OFF;
-	uint8_t value = *pointerAI;
+	uint32_t ObjectPtr = getObjectPtr();
 
-	switch (mode)
+
+	char* pointerAI = (char*)ObjectPtr + 0x268;
+
+
+	if (*pointerAI <= 127) // && *pointerAI >= 87
 	{
-	case 0: // dostate and senses off
-		value &= ~(AIFLAG_DOSTATECONTROL | AIFLAG_DOSENSES);
-		break;
-	case 1: // both on
-		value |= (AIFLAG_DOSTATECONTROL | AIFLAG_DOSENSES);
-		break;
-	case 2: // only senses off
-		value = (value | AIFLAG_DOSTATECONTROL) & ~AIFLAG_DOSENSES;
-		break;
-	case 3: // only state off
-		value = (value | AIFLAG_DOSENSES) & ~AIFLAG_DOSTATECONTROL;
-		break;
-	default:
-		return;
+		if (mode == 0) // dostate and senses off
+		{
+			*pointerAI = 87;
+		}
+		else if (mode == 1) // everything on
+		{
+			*pointerAI = 127;
+		}
+		else if (mode == 2) // only senses off
+		{
+			*pointerAI = 95;
+		}
+		else if (mode == 3) // only state off
+		{
+			*pointerAI = 119;
+		}
 	}
-
-	if (value != *pointerAI)
-		*pointerAI = value;
-}
-
-// ---------------------------------------------------------------------------
-// Render / shadow visibility (same mask; host-authoritative for synced NPCs)
-// ---------------------------------------------------------------------------
-
-bool NPC::isRendered() const
-{
-	if (objectAddress_ == 0)
-		return true;
-	return (*reinterpret_cast<const uint8_t*>(objectAddress_ + NPC_AIFLAGS_OFF) & AIFLAG_DORENDER) != 0;
-}
-
-bool NPC::hasShadow() const
-{
-	if (objectAddress_ == 0)
-		return true;
-	return (*reinterpret_cast<const uint8_t*>(objectAddress_ + NPC_AIFLAGS_OFF) & AIFLAG_DOSHADOW) != 0;
-}
-
-void NPC::setRenderFlags(bool rendered, bool shadow)
-{
-	if (!isAnalyzerReady() || !isValid())
-		return;
-
-	uint8_t* pointerAI = (uint8_t*)getObjectPtr() + NPC_AIFLAGS_OFF;
-	uint8_t value = *pointerAI;
-
-	value = rendered ? (value | AIFLAG_DORENDER) : (value & ~AIFLAG_DORENDER);
-	value = shadow ? (value | AIFLAG_DOSHADOW) : (value & ~AIFLAG_DOSHADOW);
-
-	if (value != *pointerAI)
-		*pointerAI = value;
+	else if (*pointerAI <= 255) // *pointerAI >= 215 && 
+	{
+		if (mode == 0) // dostate and senses off
+		{
+			*pointerAI = 215;
+		}
+		else if (mode == 1) // everything on
+		{
+			*pointerAI = 255;
+		}
+		else if (mode == 2) // only senses off
+		{
+			*pointerAI = 223;
+		}
+		else if (mode == 3) // only state off
+		{
+			*pointerAI = 247;
+		}
+	}
 }
 
 void NPC::restoreAIState()

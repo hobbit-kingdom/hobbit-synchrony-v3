@@ -33,12 +33,6 @@ struct Enemy
 	// AI ever shatters it (see NPC::hasShield), so this travels with the rest of
 	// the host-authoritative enemy state and costs one bit per enemy per tick.
 	bool shieldIntact = true;
-
-	// Host-side DoRender / DoShadow bits of the NPC capability mask (+0x268).
-	// Level scripts hide and reveal NPCs with these; clients mirror the host so
-	// an NPC that is invisible there is invisible everywhere. Two bits per tick.
-	bool rendered = true;
-	bool shadowOn = true;
 };
 
 // ---------------------------------------------------------------------------

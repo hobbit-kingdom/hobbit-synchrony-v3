@@ -89,6 +89,17 @@ static bool levelKeepsLocalAI()
 	return nowLevel == 1 || nowLevel == 9;
 }
 
+// Levels where the GOAL machinery specifically is left alone - the goal-starving
+// hook and the SetGoalList action filter - while the rest of the host-driven
+// handling (AI mode, position/anim sync) still applies as normal. Level 6 is here
+// because its scripted sequences drive NPCs through goal lists that must run
+// locally. This is deliberately a superset of levelKeepsLocalAI(): a level that
+// keeps its own AI entirely must also keep its goals.
+static bool levelKeepsGoalLists()
+{
+	return levelKeepsLocalAI() || nowLevel == 6;
+}
+
 // NPCs that are host-driven REGARDLESS of their current team, per level.
 //
 // The normal rule is "team 1/2 = host-driven" and it is re-checked every frame, so a
@@ -402,11 +413,6 @@ void hook_bilbo::OnAdvanceLogic(float fDeltaTime)
 			if (!enemyUpdate.second.shieldIntact && badBoy->hasShield())
 				badBoy->shatterShield();
 
-			// Visibility. Level scripts hide/reveal NPCs by flipping DoRender /
-			// DoShadow on the host; mirror both bits so "invisible there" means
-			// "invisible here". Only these two bits are written (setAIMode no
-			// longer whole-byte-writes the mask, so nothing fights this).
-			badBoy->setRenderFlags(enemyUpdate.second.rendered, enemyUpdate.second.shadowOn);
 		}
 		enemies_updated = false;
 	}
@@ -1304,11 +1310,9 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 		uint32_t eAnim = enemy.second->getAnimation();
 		float eHealth = enemy.second->getHealth();
 		bool eShield = enemy.second->hasShield();
-		bool eRendered = enemy.second->isRendered();
-		bool eShadow = enemy.second->hasShadow();
 
 		temp[enemy.first] = NetworkClamp::sanitizeEnemy(
-			{ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth, eShield, eRendered, eShadow });
+			{ ePos.x, ePos.y, ePos.z, eRot, eAnim, eHealth, eShield });
 	}
 
 	return temp;
@@ -3213,8 +3217,8 @@ static StateGetCurrentGoal_t oStateGetCurrentGoal = nullptr;
 static void* __fastcall hkStateGetCurrentGoal(void* self, void* edx)
 {
 	// The host is the one client whose goal AI is REAL - it drives everyone else.
-	// Levels 1 and 9 keep their own AI everywhere, same as the AI-mode path.
-	if (isHost != 1 && !levelKeepsLocalAI())
+	// Levels 1, 6 and 9 run their goal lists locally (see levelKeepsGoalLists).
+	if (isHost != 1 && !levelKeepsGoalLists())
 	{
 		const uint8_t* sc = static_cast<const uint8_t*>(self);
 		const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
@@ -3298,8 +3302,8 @@ static AIActionOnAdvance_t oAIActionOnAdvance = nullptr;
 
 static void __fastcall hkAIActionOnAdvance(void* self, void* edx, float dt)
 {
-	// Levels 1 and 9 keep their own AI everywhere, same as the AI-mode path.
-	if (isHost != 1 && !levelKeepsLocalAI() && self &&
+	// Levels 1, 6 and 9 run their goal lists locally (see levelKeepsGoalLists).
+	if (isHost != 1 && !levelKeepsGoalLists() && self &&
 		*reinterpret_cast<const uint32_t*>(self) == AIACTION_VTBL_SETGOALLIST)
 	{
 		uint8_t* act = static_cast<uint8_t*>(self);
