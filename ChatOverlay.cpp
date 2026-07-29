@@ -342,7 +342,7 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 			if (slashPressed && !slashWasPressed)
 			{
 				g_ChatOverlay.m_ChatOpen = true;
-				g_ChatOverlay.m_ChatBuffer = "/";
+				g_ChatOverlay.SetInputBuffer("/");
 				g_ChatOverlay.ResetHistoryBrowsing();
 			}
 			g_ChatOverlay.m_KeyState[VK_OEM_2] = slashPressed;
@@ -351,30 +351,31 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 		// Typing mode
 		if (g_ChatOverlay.m_ChatOpen)
 		{
-			// Up / Down = walk the input history, like a terminal.
+			// Editing keys: history (Up/Down), caret (Left/Right/Home/End) and
+			// forward delete.
 			//
-			// These have to be read BEFORE the character sweep below: that loop
-			// runs VK_SPACE..VK_OEM_7, which covers VK_UP (0x26) and VK_DOWN
-			// (0x28), and it stamps m_KeyState for every key it touches. Reading
-			// the edge afterwards would always see "already held" and never fire.
-			// (MapVkToChar returns 0 for them, so the sweep itself is harmless.)
+			// These have to be read BEFORE the character sweep below. That loop
+			// runs VK_SPACE..VK_OEM_7, a range which swallows every key here -
+			// VK_END 0x23, VK_HOME 0x24, VK_LEFT 0x25, VK_UP 0x26, VK_RIGHT 0x27,
+			// VK_DOWN 0x28, VK_DELETE 0x2E - and it stamps m_KeyState for every
+			// key it touches. Reading the edge afterwards would always see
+			// "already held" and nothing would ever fire. (MapVkToChar returns 0
+			// for all of them, so the sweep itself does no harm.)
+			auto editKeyPressed = [](int vk) -> bool
 			{
-				SHORT state = oGetAsyncKeyState(VK_UP);
-				bool pressed = (state & 0x8000) != 0;
-				bool wasPressed = g_ChatOverlay.m_KeyState[VK_UP];
-				if (pressed && !wasPressed)
-					g_ChatOverlay.RecallPreviousInput();
-				g_ChatOverlay.m_KeyState[VK_UP] = pressed;
-			}
+				const bool pressed = (oGetAsyncKeyState(vk) & 0x8000) != 0;
+				const bool wasPressed = g_ChatOverlay.m_KeyState[vk];
+				g_ChatOverlay.m_KeyState[vk] = pressed;
+				return pressed && !wasPressed;
+			};
 
-			{
-				SHORT state = oGetAsyncKeyState(VK_DOWN);
-				bool pressed = (state & 0x8000) != 0;
-				bool wasPressed = g_ChatOverlay.m_KeyState[VK_DOWN];
-				if (pressed && !wasPressed)
-					g_ChatOverlay.RecallNextInput();
-				g_ChatOverlay.m_KeyState[VK_DOWN] = pressed;
-			}
+			if (editKeyPressed(VK_UP))     g_ChatOverlay.RecallPreviousInput();
+			if (editKeyPressed(VK_DOWN))   g_ChatOverlay.RecallNextInput();
+			if (editKeyPressed(VK_LEFT))   g_ChatOverlay.MoveCaret(-1);
+			if (editKeyPressed(VK_RIGHT))  g_ChatOverlay.MoveCaret(1);
+			if (editKeyPressed(VK_HOME))   g_ChatOverlay.MoveCaretToStart();
+			if (editKeyPressed(VK_END))    g_ChatOverlay.MoveCaretToEnd();
+			if (editKeyPressed(VK_DELETE)) g_ChatOverlay.DeleteAtCaret();
 
 			for (int vk = VK_SPACE; vk <= VK_OEM_7; vk++)
 			{
@@ -408,8 +409,8 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				SHORT state = oGetAsyncKeyState(VK_BACK);
 				bool pressed = (state & 0x8000) != 0;
 				bool wasPressed = g_ChatOverlay.m_KeyState[VK_BACK];
-				if (pressed && !wasPressed && !g_ChatOverlay.m_ChatBuffer.empty())
-					g_ChatOverlay.m_ChatBuffer.pop_back();
+				if (pressed && !wasPressed)
+					g_ChatOverlay.DeleteBeforeCaret();
 				g_ChatOverlay.m_KeyState[VK_BACK] = pressed;
 			}
 
@@ -442,7 +443,7 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				bool wasPressed = g_ChatOverlay.m_KeyState[VK_ESCAPE];
 				if (pressed && !wasPressed)
 				{
-					g_ChatOverlay.m_ChatBuffer.clear();
+					g_ChatOverlay.ClearInputBuffer();
 					g_ChatOverlay.ResetHistoryBrowsing();
 					g_ChatOverlay.m_ChatOpen = false;
 				}
@@ -473,7 +474,7 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 		if (msg == WM_KEYDOWN && wParam == VK_OEM_2)
 		{
 			g_ChatOverlay.m_ChatOpen = true;
-			g_ChatOverlay.m_ChatBuffer = "/";
+			g_ChatOverlay.SetInputBuffer("/");
 			g_ChatOverlay.ResetHistoryBrowsing();
 			return 0;
 		}
@@ -499,8 +500,7 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 			switch (wParam)
 			{
 			case VK_BACK:
-				if (!g_ChatOverlay.m_ChatBuffer.empty())
-					g_ChatOverlay.m_ChatBuffer.pop_back();
+				g_ChatOverlay.DeleteBeforeCaret();
 				return 0;
 
 			case VK_TAB:
@@ -515,12 +515,32 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 				g_ChatOverlay.RecallNextInput();
 				return 0;
 
+			case VK_LEFT:
+				g_ChatOverlay.MoveCaret(-1);
+				return 0;
+
+			case VK_RIGHT:
+				g_ChatOverlay.MoveCaret(1);
+				return 0;
+
+			case VK_HOME:
+				g_ChatOverlay.MoveCaretToStart();
+				return 0;
+
+			case VK_END:
+				g_ChatOverlay.MoveCaretToEnd();
+				return 0;
+
+			case VK_DELETE:
+				g_ChatOverlay.DeleteAtCaret();
+				return 0;
+
 			case VK_RETURN:
 				g_ChatOverlay.ProcessChatSend();
 				return 0;
 
 			case VK_ESCAPE:
-				g_ChatOverlay.m_ChatBuffer.clear();
+				g_ChatOverlay.ClearInputBuffer();
 				g_ChatOverlay.ResetHistoryBrowsing();
 				g_ChatOverlay.m_ChatOpen = false;
 				return 0;
@@ -706,7 +726,7 @@ void ChatOverlay::RecallPreviousInput()
 		return;   // already on the oldest line
 	}
 
-	m_ChatBuffer = m_InputHistory[m_HistoryCursor];
+	SetInputBuffer(m_InputHistory[m_HistoryCursor]);
 }
 
 void ChatOverlay::RecallNextInput()
@@ -717,13 +737,73 @@ void ChatOverlay::RecallNextInput()
 	if (m_HistoryCursor + 1 < static_cast<int>(m_InputHistory.size()))
 	{
 		++m_HistoryCursor;
-		m_ChatBuffer = m_InputHistory[m_HistoryCursor];
+		SetInputBuffer(m_InputHistory[m_HistoryCursor]);
 		return;
 	}
 
 	// Past the newest entry: back to the line that was being typed.
-	m_ChatBuffer = m_DraftBuffer;
+	SetInputBuffer(m_DraftBuffer);
 	ResetHistoryBrowsing();
+}
+
+// ===========================================================================
+//  Input line editing (caret)
+// ===========================================================================
+
+void ChatOverlay::SetInputBuffer(const std::string& text)
+{
+	m_ChatBuffer = text;
+	m_CaretPos = m_ChatBuffer.size();
+}
+
+void ChatOverlay::ClearInputBuffer()
+{
+	m_ChatBuffer.clear();
+	m_CaretPos = 0;
+}
+
+void ChatOverlay::MoveCaret(int delta)
+{
+	if (delta < 0)
+	{
+		const size_t step = static_cast<size_t>(-delta);
+		m_CaretPos = (m_CaretPos > step) ? (m_CaretPos - step) : 0;
+		return;
+	}
+
+	m_CaretPos += static_cast<size_t>(delta);
+	if (m_CaretPos > m_ChatBuffer.size())
+		m_CaretPos = m_ChatBuffer.size();
+}
+
+void ChatOverlay::MoveCaretToStart()
+{
+	m_CaretPos = 0;
+}
+
+void ChatOverlay::MoveCaretToEnd()
+{
+	m_CaretPos = m_ChatBuffer.size();
+}
+
+void ChatOverlay::DeleteBeforeCaret()
+{
+	if (m_CaretPos == 0 || m_ChatBuffer.empty())
+		return;
+
+	if (m_CaretPos > m_ChatBuffer.size())
+		m_CaretPos = m_ChatBuffer.size();
+
+	m_ChatBuffer.erase(m_CaretPos - 1, 1);
+	--m_CaretPos;
+}
+
+void ChatOverlay::DeleteAtCaret()
+{
+	if (m_CaretPos >= m_ChatBuffer.size())
+		return;
+
+	m_ChatBuffer.erase(m_CaretPos, 1);
 }
 
 void ChatOverlay::AppendInputChar(char ch)
@@ -734,7 +814,13 @@ void ChatOverlay::AppendInputChar(char ch)
 	if (!IsSafeChatChar(static_cast<unsigned char>(ch)) || m_ChatBuffer.size() >= MaxChatInputLength)
 		return;
 
-	m_ChatBuffer.push_back(ch);
+	// Typed text lands at the caret, not the end, so a line can be fixed in the
+	// middle instead of being retyped.
+	if (m_CaretPos > m_ChatBuffer.size())
+		m_CaretPos = m_ChatBuffer.size();
+
+	m_ChatBuffer.insert(m_CaretPos, 1, ch);
+	++m_CaretPos;
 }
 
 std::string ChatOverlay::GetAutocompleteSuggestion() const
@@ -755,7 +841,7 @@ void ChatOverlay::AutocompleteCommand()
 {
 	std::string suggestion = GetAutocompleteSuggestion();
 	if (!suggestion.empty())
-		m_ChatBuffer += suggestion;
+		SetInputBuffer(m_ChatBuffer + suggestion);
 }
 
 void ChatOverlay::ProcessChatSend()
@@ -807,7 +893,7 @@ void ChatOverlay::ProcessChatSend()
 	}
 
 	found:
-	m_ChatBuffer.clear();
+	ClearInputBuffer();
 	m_ChatOpen = m_KeepChatOpen;
 	m_KeepChatOpen = false;
 }
@@ -876,9 +962,21 @@ void ChatOverlay::Render(LPDIRECT3DDEVICE9 pDevice)
 				D3DCOLOR_ARGB(120, 255, 255, 255));
 		}
 
+		// Caret sits at the insertion point rather than always at the end, so
+		// Left/Right/Home/End are visible. Measured over the same string that
+		// was drawn ("> " + the sanitized line), clamped in case sanitising
+		// dropped a character the caret index still counted.
 		if ((GetTickCount64() / 500) % 2)
-			DrawTextSimple(m_Font, "_", 25 + typedWidth, 655,
+		{
+			const size_t typedChars = (text.size() >= 2) ? (text.size() - 2) : 0;
+			const size_t caretChars = (m_CaretPos < typedChars) ? m_CaretPos : typedChars;
+			const int caretX = (caretChars == typedChars)
+				? typedWidth   // already measured for the suggestion
+				: MeasureTextWidth(m_Font, text.substr(0, 2 + caretChars));
+
+			DrawTextSimple(m_Font, "_", 25 + caretX, 655,
 				D3DCOLOR_XRGB(255, 255, 255));
+		}
 	}
 
 	if (stateBlock)

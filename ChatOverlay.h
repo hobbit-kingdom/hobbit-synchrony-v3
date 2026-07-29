@@ -55,6 +55,11 @@ class ChatOverlay
 	/// it fade out a few seconds later.
 	bool m_KeepChatOpen = false;
 
+	/// Insertion point in m_ChatBuffer, 0..size(). Every path that replaces the
+	/// buffer wholesale must move this with it - use SetInputBuffer, which does
+	/// both, rather than assigning m_ChatBuffer directly.
+	size_t m_CaretPos = 0;
+
 	// --- Input history (Up / Down, like a terminal) ---
 
 	/// Lines that were actually sent, oldest first.
@@ -92,6 +97,17 @@ class ChatOverlay
 	void ProcessChatSend();
 	void AppendInputChar(char ch);
 	void AutocompleteCommand();
+
+	/// Replace the whole input line and park the caret at its end.
+	void SetInputBuffer(const std::string& text);
+	void ClearInputBuffer();
+
+	// --- Caret movement / editing (Left, Right, Home, End, Backspace, Delete) ---
+	void MoveCaret(int delta);
+	void MoveCaretToStart();
+	void MoveCaretToEnd();
+	void DeleteBeforeCaret();
+	void DeleteAtCaret();
 
 	/// Terminal-style recall: Up walks towards older lines, Down back towards the
 	/// line that was being typed. RememberInput records a sent line; ResetHistory
