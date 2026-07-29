@@ -76,6 +76,17 @@ static uint32_t bilboWeapon;
 static uint32_t nowLevel;
 static bool levelIsRunning;
 
+// Levels whose AI we leave completely alone on every client: 1 (Hobbiton) and
+// 9 (Smaug). Their NPCs keep running their own local AI, so none of the
+// host-driven machinery may touch them - AI suppression, goal starving and the
+// SetGoalList action filter all have to agree on this, or a client ends up with
+// its goals starved on a level whose NPCs were never host-driven in the first
+// place and they just stand there.
+static bool levelKeepsLocalAI()
+{
+	return nowLevel == 1 || nowLevel == 9;
+}
+
 // NPCs that are host-driven REGARDLESS of their current team, per level.
 //
 // The normal rule is "team 1/2 = host-driven" and it is re-checked every frame, so a
@@ -1266,8 +1277,7 @@ std::unordered_map<uint64_t, Enemy> readEnemiesState()
 // its own AI back the moment a script returns it to neutral.
 static void changeEnemiesAIMode(int mode)
 {
-	// Levels that must keep their own AI untouched: 1, and 9 (Smaug).
-	if (nowLevel == 1 || nowLevel == 9)
+	if (levelKeepsLocalAI())
 		return;
 
 	for (auto enemy : enemies)
@@ -3160,8 +3170,8 @@ static StateGetCurrentGoal_t oStateGetCurrentGoal = nullptr;
 static void* __fastcall hkStateGetCurrentGoal(void* self, void* edx)
 {
 	// The host is the one client whose goal AI is REAL - it drives everyone else.
-	// Level 9 (Smaug) keeps its own AI everywhere, same as the AI-mode path.
-	if (isHost != 1 && nowLevel != 9)
+	// Levels 1 and 9 keep their own AI everywhere, same as the AI-mode path.
+	if (isHost != 1 && !levelKeepsLocalAI())
 	{
 		const uint8_t* sc = static_cast<const uint8_t*>(self);
 		const uint64_t guid = *reinterpret_cast<const uint64_t*>(sc + SC_OWNER_GUID_OFF);
@@ -3241,8 +3251,8 @@ static AIActionOnAdvance_t oAIActionOnAdvance = nullptr;
 
 static void __fastcall hkAIActionOnAdvance(void* self, void* edx, float dt)
 {
-	// Level 9 (Smaug) keeps its own AI everywhere, same as the AI-mode path.
-	if (isHost != 1 && nowLevel != 9 && self &&
+	// Levels 1 and 9 keep their own AI everywhere, same as the AI-mode path.
+	if (isHost != 1 && !levelKeepsLocalAI() && self &&
 		*reinterpret_cast<const uint32_t*>(self) == AIACTION_VTBL_SETGOALLIST)
 	{
 		uint8_t* act = static_cast<uint8_t*>(self);
