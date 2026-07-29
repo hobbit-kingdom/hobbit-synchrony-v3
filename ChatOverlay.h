@@ -39,6 +39,9 @@ struct ChatCommand
 constexpr size_t MaxChatHistory = 16;
 constexpr int    MaxVisibleChatLines = 12;
 
+/// How many sent lines Up/Down can walk back through.
+constexpr size_t MaxInputHistory = 32;
+
 class ChatOverlay
 {
 	public:
@@ -51,6 +54,15 @@ class ChatOverlay
 	/// open after it runs, which keeps the text at full alpha instead of letting
 	/// it fade out a few seconds later.
 	bool m_KeepChatOpen = false;
+
+	// --- Input history (Up / Down, like a terminal) ---
+
+	/// Lines that were actually sent, oldest first.
+	std::vector<std::string> m_InputHistory;
+	/// Position in that list while browsing; -1 means "editing a fresh line".
+	int m_HistoryCursor = -1;
+	/// What was half-typed when browsing started, so Down can hand it back.
+	std::string m_DraftBuffer;
 
 	public:
 	std::vector<ChatCommand> m_Commands;
@@ -80,6 +92,14 @@ class ChatOverlay
 	void ProcessChatSend();
 	void AppendInputChar(char ch);
 	void AutocompleteCommand();
+
+	/// Terminal-style recall: Up walks towards older lines, Down back towards the
+	/// line that was being typed. RememberInput records a sent line; ResetHistory
+	/// Browsing puts the cursor back on a fresh line without touching the list.
+	void RecallPreviousInput();
+	void RecallNextInput();
+	void RememberInput(const std::string& line);
+	void ResetHistoryBrowsing();
 	std::string GetAutocompleteSuggestion() const;
 
 	void Render(LPDIRECT3DDEVICE9 pDevice);

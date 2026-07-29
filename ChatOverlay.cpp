@@ -343,7 +343,7 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 			{
 				g_ChatOverlay.m_ChatOpen = true;
 				g_ChatOverlay.m_ChatBuffer = "/";
-				
+				g_ChatOverlay.ResetHistoryBrowsing();
 			}
 			g_ChatOverlay.m_KeyState[VK_OEM_2] = slashPressed;
 		}
@@ -351,6 +351,31 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 		// Typing mode
 		if (g_ChatOverlay.m_ChatOpen)
 		{
+			// Up / Down = walk the input history, like a terminal.
+			//
+			// These have to be read BEFORE the character sweep below: that loop
+			// runs VK_SPACE..VK_OEM_7, which covers VK_UP (0x26) and VK_DOWN
+			// (0x28), and it stamps m_KeyState for every key it touches. Reading
+			// the edge afterwards would always see "already held" and never fire.
+			// (MapVkToChar returns 0 for them, so the sweep itself is harmless.)
+			{
+				SHORT state = oGetAsyncKeyState(VK_UP);
+				bool pressed = (state & 0x8000) != 0;
+				bool wasPressed = g_ChatOverlay.m_KeyState[VK_UP];
+				if (pressed && !wasPressed)
+					g_ChatOverlay.RecallPreviousInput();
+				g_ChatOverlay.m_KeyState[VK_UP] = pressed;
+			}
+
+			{
+				SHORT state = oGetAsyncKeyState(VK_DOWN);
+				bool pressed = (state & 0x8000) != 0;
+				bool wasPressed = g_ChatOverlay.m_KeyState[VK_DOWN];
+				if (pressed && !wasPressed)
+					g_ChatOverlay.RecallNextInput();
+				g_ChatOverlay.m_KeyState[VK_DOWN] = pressed;
+			}
+
 			for (int vk = VK_SPACE; vk <= VK_OEM_7; vk++)
 			{
 				SHORT state = oGetAsyncKeyState(vk);
@@ -418,6 +443,7 @@ static DWORD WINAPI ChatInputThread(LPVOID)
 				if (pressed && !wasPressed)
 				{
 					g_ChatOverlay.m_ChatBuffer.clear();
+					g_ChatOverlay.ResetHistoryBrowsing();
 					g_ChatOverlay.m_ChatOpen = false;
 				}
 				g_ChatOverlay.m_KeyState[VK_ESCAPE] = pressed;
@@ -448,7 +474,7 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 		{
 			g_ChatOverlay.m_ChatOpen = true;
 			g_ChatOverlay.m_ChatBuffer = "/";
-			
+			g_ChatOverlay.ResetHistoryBrowsing();
 			return 0;
 		}
 	}
@@ -481,12 +507,21 @@ static LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 				g_ChatOverlay.AutocompleteCommand();
 				return 0;
 
+			case VK_UP:
+				g_ChatOverlay.RecallPreviousInput();
+				return 0;
+
+			case VK_DOWN:
+				g_ChatOverlay.RecallNextInput();
+				return 0;
+
 			case VK_RETURN:
 				g_ChatOverlay.ProcessChatSend();
 				return 0;
 
 			case VK_ESCAPE:
 				g_ChatOverlay.m_ChatBuffer.clear();
+				g_ChatOverlay.ResetHistoryBrowsing();
 				g_ChatOverlay.m_ChatOpen = false;
 				return 0;
 			}
@@ -627,6 +662,70 @@ void ChatOverlay::AddSystemMessage(const std::string& text)
 		m_ChatHistory.erase(m_ChatHistory.begin());
 }
 
+// ===========================================================================
+//  Input history (Up / Down)
+// ===========================================================================
+
+void ChatOverlay::ResetHistoryBrowsing()
+{
+	m_HistoryCursor = -1;
+	m_DraftBuffer.clear();
+}
+
+void ChatOverlay::RememberInput(const std::string& line)
+{
+	// Consecutive repeats are not worth a slot - same as a shell with
+	// ignoredups, and it keeps a spammed command from filling the list.
+	if (!line.empty() && (m_InputHistory.empty() || m_InputHistory.back() != line))
+	{
+		m_InputHistory.push_back(line);
+		if (m_InputHistory.size() > MaxInputHistory)
+			m_InputHistory.erase(m_InputHistory.begin());
+	}
+
+	ResetHistoryBrowsing();
+}
+
+void ChatOverlay::RecallPreviousInput()
+{
+	if (m_InputHistory.empty())
+		return;
+
+	if (m_HistoryCursor < 0)
+	{
+		// Starting to browse: keep whatever was already typed so Down restores it.
+		m_DraftBuffer = m_ChatBuffer;
+		m_HistoryCursor = static_cast<int>(m_InputHistory.size()) - 1;
+	}
+	else if (m_HistoryCursor > 0)
+	{
+		--m_HistoryCursor;
+	}
+	else
+	{
+		return;   // already on the oldest line
+	}
+
+	m_ChatBuffer = m_InputHistory[m_HistoryCursor];
+}
+
+void ChatOverlay::RecallNextInput()
+{
+	if (m_HistoryCursor < 0)
+		return;   // not browsing, nothing newer to go to
+
+	if (m_HistoryCursor + 1 < static_cast<int>(m_InputHistory.size()))
+	{
+		++m_HistoryCursor;
+		m_ChatBuffer = m_InputHistory[m_HistoryCursor];
+		return;
+	}
+
+	// Past the newest entry: back to the line that was being typed.
+	m_ChatBuffer = m_DraftBuffer;
+	ResetHistoryBrowsing();
+}
+
 void ChatOverlay::AppendInputChar(char ch)
 {
 	if (m_ChatBuffer == "/" && ch == '/')
@@ -664,6 +763,10 @@ void ChatOverlay::ProcessChatSend()
 	std::string input = SanitizeChatText(m_ChatBuffer, MaxChatInputLength);
 	if (input.empty())
 	{
+		// Enter on an empty line just closes the box - but it can be reached
+		// while browsing (recall a line, clear it, press Enter), so the cursor
+		// has to be dropped here too or the next Up would resume mid-list.
+		ResetHistoryBrowsing();
 		m_ChatOpen = false;
 		return;
 	}
@@ -671,6 +774,10 @@ void ChatOverlay::ProcessChatSend()
 	// A command may ask to keep the box open (see HelpCommand); default is the
 	// old behaviour of closing as soon as the line is handled.
 	m_KeepChatOpen = false;
+
+	// Recorded before dispatch so a command that fails or closes the box still
+	// leaves its line available on Up.
+	RememberInput(input);
 
 	if (input[0] == '/')
 	{

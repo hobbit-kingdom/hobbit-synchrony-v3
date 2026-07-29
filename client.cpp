@@ -4826,8 +4826,10 @@ static void ChatCommandSpawnFx(const std::string& fxArg)
 	if (name.empty())
 		name = "fx_fire";
 
+	// Directly above the player (world up is +Y), so the effect is visible from
+	// wherever the camera happens to be instead of off to one side.
 	Vector3 bp = getBilboPos();
-	SpawnFxSynced(name.c_str(), bp.x + 100.0f, bp.y, bp.z);
+	SpawnFxSynced(name.c_str(), bp.x, bp.y + 100.0f, bp.z);
 	g_ChatOverlay.AddSystemMessage("[System] Spawned FX '" + name + "' (synced).");
 }
 
