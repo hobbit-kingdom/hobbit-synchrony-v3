@@ -6,15 +6,20 @@
 	data (Common\Strings\Rus). No config key, no console switch: if the player
 	installed the Russian data, they get a Russian page.
 
+	THE RUSSIAN TEXT IS TRANSLITERATED INTO LATIN LETTERS, ON PURPOSE.
+	The engine renders UI text from a bitmap font page
+	(Common\UI\FontExtended.xbmp) whose glyphs are REDRAWN per localization, so
+	the same character codes mean different letters in different builds: real
+	Cyrillic literals rendered as garbage on a Russian install. Latin letters
+	draw correctly everywhere, so Russian players get Russian wording spelled in
+	Latin. Do not "fix" these strings back to Cyrillic without a font page that
+	is known to carry it.
+
 	SCOPE: this covers the welcome page only. The chat deliberately stays
 	English - its overlay renders through ID3DXFont::DrawTextA, so putting
 	non-ASCII through it risks breaking text that currently works.
 
-	!! THIS FILE IS UTF-8 *WITH BOM* !!
-	MSVC needs the BOM to decode the Cyrillic literals below; saved as UTF-8
-	without one it assumes the system codepage and the wide strings come out as
-	mojibake. Keep the BOM if you edit this file. Everything Cyrillic lives here
-	so no other translation unit has to care about its encoding.
+	This file is pure ASCII, so its encoding no longer matters to MSVC.
 */
 
 #pragma once
@@ -59,19 +64,27 @@ namespace Loc
 
 	inline const HostPageText& russian()
 	{
-		// Lines are kept about as long as the English ones so they still fit the
-		// panel, and avoid characters a game font may not carry (no em dash, no
-		// letter "ё").
+		// TRANSLITERATED, not Cyrillic - deliberately.
+		//
+		// The engine draws UI text from a 256x512 BITMAP font page
+		// (Common\UI\FontExtended.xbmp), and a localized build ships a REDRAWN
+		// page: the same character codes carry different glyphs. Cyrillic
+		// literals came out as garbage on a real Russian install, while plain
+		// Latin renders correctly there - so Russian players get Russian
+		// WORDING written in Latin letters, which every font page can draw.
+		//
+		// Lines are kept about as long as the English ones so they still fit
+		// the panel.
 		static const HostPageText text =
 		{
-			L"ХОББИТ СИНХРОНИЯ",
-			L"Добро пожаловать в Хоббит Синхронию",
-			L"мультиплеерный мод для Хоббита.",
-			L"Друзья уже ждут вас. Создайте игру или",
-			L"присоединитесь к другу.",
-			L"РОЛЬ:  ХОСТ        (нажмите для смены)",
-			L"РОЛЬ:  КЛИЕНТ      (нажмите для смены)",
-			L"Готово",
+			L"HOBBIT SINHRONIYA",
+			L"Dobro pozhalovat v Hobbit Sinhroniyu -",
+			L"multipleernyy mod dlya Hobbita. Druzya",
+			L"uzhe zhdut vas. Sozdayte igru ili",
+			L"prisoedinites k drugu.",
+			L"ROL:  HOST          (nazhmite dlya smeny)",
+			L"ROL:  KLIENT        (nazhmite dlya smeny)",
+			L"Gotovo",
 		};
 		return text;
 	}
