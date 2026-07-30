@@ -5051,6 +5051,48 @@ static void ChatCommandSpawn(const std::string& templateArg)
 
 // Test trigger for the FX packet: play an FX (default "fx_fire") near the player
 // and broadcast it to everyone. The "real" trigger will call SpawnFxSynced directly.
+// Collect every effect name the game ships: <game exe dir>\Common\EFFECTS\*.fxo,
+// basenames without extension, lowercased and sorted. Feeds the /spawnfx argument
+// autocomplete. One directory scan at startup; an empty result (folder missing,
+// packed build) just leaves /spawnfx without suggestions.
+static std::vector<std::string> scanFxNames()
+{
+	std::vector<std::string> names;
+
+	char exePath[MAX_PATH] = {};
+	if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0)
+		return names;
+
+	const std::string pattern =
+		(SkinSync::fs::path(exePath).parent_path() / "Common" / "EFFECTS" / "*.fxo").string();
+
+	WIN32_FIND_DATAA found = {};
+	HANDLE search = FindFirstFileA(pattern.c_str(), &found);
+	if (search == INVALID_HANDLE_VALUE)
+		return names;
+
+	do
+	{
+		if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+
+		std::string name = found.cFileName;
+		const size_t dot = name.rfind('.');
+		if (dot != std::string::npos)
+			name.erase(dot);
+
+		std::transform(name.begin(), name.end(), name.begin(),
+			[](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+		if (!name.empty())
+			names.push_back(name);
+	} while (FindNextFileA(search, &found));
+	FindClose(search);
+
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
 static void ChatCommandSpawnFx(const std::string& fxArg)
 {
 	if (!g_Client || myGuid == 0 || !gameManager.isOnLevel())
@@ -5110,6 +5152,8 @@ static int clientMain()
 		ChatCommandListing::DebugOnly);
 	g_ChatOverlay.AddCommand("/spawnfx", "[fxName] - Play an FX effect (synced to all players)", ChatCommandSpawnFx,
 		ChatCommandListing::DebugOnly);
+	// Ghost-text + Tab completion of the fx name from Common\EFFECTS\*.fxo.
+	g_ChatOverlay.SetArgumentSuggestions("/spawnfx", scanFxNames());
 
 	// try to hook bilbo's OnAdvanceLogic
 	InitializeCriticalSection(&playersCriticalSection);

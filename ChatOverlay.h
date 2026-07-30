@@ -32,6 +32,14 @@ struct ChatCommand
 	ChatCommandListing listing = ChatCommandListing::Always;
 };
 
+/// Argument completion for one command: "/spawnfx" -> every known fx name.
+/// Options must be single words (the arg is everything after the first space).
+struct ChatArgSuggestions
+{
+	std::string cmd;                   // command these options belong to
+	std::vector<std::string> options;  // sorted, lowercase
+};
+
 /// How many messages are remembered, and how many are drawn when the chat box is
 /// closed. The history used to hold six, which silently ate the first half of any
 /// longer burst - /help among them. Twelve drawn lines is what fits between the
@@ -71,6 +79,7 @@ class ChatOverlay
 
 	public:
 	std::vector<ChatCommand> m_Commands;
+	std::vector<ChatArgSuggestions> m_ArgSuggestions;
 	ChatMessageCallback_t m_MsgCallback;
 
 	public:
@@ -123,6 +132,11 @@ class ChatOverlay
 	void SetMsgCallback(ChatMessageCallback_t callback);
 	void AddCommand(const std::string &name, const std::string &desc, ChatCommandCallback_t callback,
 		ChatCommandListing listing = ChatCommandListing::Always);
+
+	/// Install (or replace) the argument-completion list for a command. Shown as
+	/// ghost text while typing the argument; Tab completes, and Tab on an already
+	/// complete option cycles to the next one.
+	void SetArgumentSuggestions(const std::string& cmd, std::vector<std::string> options);
 };
 
 extern ChatOverlay g_ChatOverlay;

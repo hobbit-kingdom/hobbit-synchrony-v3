@@ -823,17 +823,49 @@ void ChatOverlay::AppendInputChar(char ch)
 	++m_CaretPos;
 }
 
+// The option list for the command in front of the first space, or nullptr.
+static const ChatArgSuggestions* FindArgSuggestions(
+	const std::vector<ChatArgSuggestions>& lists, const std::string& cmd)
+{
+	for (const ChatArgSuggestions& entry : lists)
+	{
+		if (StartsWithCaseInsensitive(entry.cmd, cmd) && entry.cmd.size() == cmd.size())
+			return &entry;
+	}
+	return nullptr;
+}
+
 std::string ChatOverlay::GetAutocompleteSuggestion() const
 {
-	if (m_ChatBuffer.empty() || m_ChatBuffer[0] != '/' || m_ChatBuffer.find(' ') != std::string::npos)
+	if (m_ChatBuffer.empty() || m_ChatBuffer[0] != '/')
 		return std::string();
 
-	for (const ChatCommand& command : m_Commands)
+	const size_t space = m_ChatBuffer.find(' ');
+	if (space == std::string::npos)
 	{
-		if (StartsWithCaseInsensitive(command.cmd, m_ChatBuffer) && command.cmd.size() > m_ChatBuffer.size())
-			return command.cmd.substr(m_ChatBuffer.size());
+		// Completing the command itself.
+		for (const ChatCommand& command : m_Commands)
+		{
+			if (StartsWithCaseInsensitive(command.cmd, m_ChatBuffer) && command.cmd.size() > m_ChatBuffer.size())
+				return command.cmd.substr(m_ChatBuffer.size());
+		}
+		return std::string();
 	}
 
+	// Completing the argument, for commands that registered options
+	// (e.g. "/spawnfx aci" -> "dattack"). An empty argument suggests the first
+	// option outright, so plain "/spawnfx " already shows something usable.
+	const ChatArgSuggestions* args =
+		FindArgSuggestions(m_ArgSuggestions, m_ChatBuffer.substr(0, space));
+	if (!args)
+		return std::string();
+
+	const std::string partial = m_ChatBuffer.substr(space + 1);
+	for (const std::string& option : args->options)
+	{
+		if (StartsWithCaseInsensitive(option, partial) && option.size() > partial.size())
+			return option.substr(partial.size());
+	}
 	return std::string();
 }
 
@@ -841,7 +873,34 @@ void ChatOverlay::AutocompleteCommand()
 {
 	std::string suggestion = GetAutocompleteSuggestion();
 	if (!suggestion.empty())
+	{
 		SetInputBuffer(m_ChatBuffer + suggestion);
+		return;
+	}
+
+	// Nothing left to complete. If the argument already IS a full option, Tab
+	// cycles to the next one in the list (wrapping), so the whole catalogue can
+	// be browsed with Tab alone.
+	const size_t space = m_ChatBuffer.find(' ');
+	if (space == std::string::npos)
+		return;
+
+	const std::string cmd = m_ChatBuffer.substr(0, space);
+	const ChatArgSuggestions* args = FindArgSuggestions(m_ArgSuggestions, cmd);
+	if (!args || args->options.empty())
+		return;
+
+	const std::string partial = m_ChatBuffer.substr(space + 1);
+	for (size_t i = 0; i < args->options.size(); ++i)
+	{
+		const std::string& option = args->options[i];
+		if (StartsWithCaseInsensitive(option, partial) && option.size() == partial.size())
+		{
+			const std::string& next = args->options[(i + 1) % args->options.size()];
+			SetInputBuffer(cmd + " " + next);
+			return;
+		}
+	}
 }
 
 void ChatOverlay::ProcessChatSend()
@@ -997,4 +1056,17 @@ void ChatOverlay::AddCommand(const std::string &name, const std::string &desc, C
 	ChatCommandListing listing)
 {
 	m_Commands.push_back({name,desc,callback,listing});
+}
+
+void ChatOverlay::SetArgumentSuggestions(const std::string& cmd, std::vector<std::string> options)
+{
+	for (ChatArgSuggestions& entry : m_ArgSuggestions)
+	{
+		if (entry.cmd == cmd)
+		{
+			entry.options = std::move(options);
+			return;
+		}
+	}
+	m_ArgSuggestions.push_back({ cmd, std::move(options) });
 }
