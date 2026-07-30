@@ -39,6 +39,7 @@
 #include "minhook/MinHook.h"   // CreateStoneProjectile detour (MinHook is compiled into the project)
 #include "DebugLog.h"
 #include "custom_page.h"       // engine UI toolkit (hobbit_ui) - host/client selection page
+#include "Localization.h"      // welcome-page text, EN or RU (chat stays English)
 #include <conio.h>             // _kbhit/_getch: console fallback for the host choice
 
 using namespace yojimbo;
@@ -926,6 +927,11 @@ static void clearActivePlayers()
 			delete p.npc;
 			p.npc = nullptr;
 		}
+		if (p.ghostNpc)
+		{
+			delete p.ghostNpc;
+			p.ghostNpc = nullptr;
+		}
 		if (p.nickname_marker)
 		{
 			delete p.nickname_marker;
@@ -1094,6 +1100,11 @@ static void readGamePointers()
 
 
 		if (skip) continue;
+
+		// Ring ghosts (the half-transparent fake-bilbo clones, first GUID half
+		// 0D8AD913) are NPC objects too and are driven per-client by the ring
+		// visuals - never as AI, never host-synced.
+		if ((eGuid >> 32) == 0x0D8AD913ull) continue;
 
 		if (0xABCABCABCABCABC0 == eGuid)
 		{
@@ -2390,16 +2401,28 @@ static void applyRingVisual(Player& p, bool ringOn)
 	if (npcAddr == 0)
 		return;
 
+	const uint8_t team = processAnalyzer->readData<uint8_t>(npcAddr + NPC_TEAM_OFF);
+
+	// Team 1 with the ring on shows the half-transparent GHOST clone instead of
+	// just vanishing: the real body is hidden as before, and tickLerp mirrors the
+	// visual state onto the ghost while ghostActive is set. Every other case
+	// (ring off, other teams, level without the clones) keeps the ghost hidden -
+	// re-applied every frame, so it self-corrects like the rest of this function.
+	const bool useGhost = ringOn && team == 1
+		&& p.ghostNpc && p.ghostNpc->isValid() && p.ghostNpc->isNpcType();
+
 	// Character mesh: hidden whenever the ring is on, for every team.
 	game_NPCMakeTransparent(reinterpret_cast<void*>(npcAddr), ringOn ? 1 : 0);
 
-	// Labels: only team 2 loses them, and only while the ring is on.
-	bool hideLabels = false;
-	if (ringOn)
+	if (p.ghostNpc && p.ghostNpc->isValid() && p.ghostNpc->isNpcType())
 	{
-		uint8_t team = processAnalyzer->readData<uint8_t>(npcAddr + NPC_TEAM_OFF);
-		hideLabels = (team == RING_TEAM_HIDE_LABELS);
+		game_NPCMakeTransparent(
+			reinterpret_cast<void*>(p.ghostNpc->getObjectPtr()), useGhost ? 0 : 1);
 	}
+	p.ghostActive = useGhost;
+
+	// Labels: only team 2 loses them, and only while the ring is on.
+	const bool hideLabels = ringOn && team == RING_TEAM_HIDE_LABELS;
 
 	if (p.nickname_marker)
 		p.nickname_marker->setText(hideLabels ? "" : p.nickname.c_str());
@@ -3379,9 +3402,10 @@ static bool g_hostPageWantsHost = false;
 static void refreshHostPageLabels(void* dlg)
 {
 	using namespace hobbit_ui;
+	const Loc::HostPageText& text = Loc::hostPage();
 	SetText(GetById(dlg, ID_BUTTON), g_hostPageWantsHost
-		? L"ROLE:  HOST        (click to change)"
-		: L"ROLE:  CLIENT      (click to change)");
+		? text.roleHost
+		: text.roleClient);
 }
 
 // custom_page.h click callback: fires on every control press of the active page.
@@ -3453,13 +3477,17 @@ static void* __fastcall hkUiOpenDialog(void* uimgr, void* edx, void* ctx,
 			// Fully opaque panel (Relabel's default fill is alpha 0xDC = see-through).
 			SetFrameFill(GetById(page, ID_FRAME), 0x14, 0x16, 0x20, 0xFF);
 
-			SetText(GetById(page, ID_TITLE), L"THE HOBBIT SYNCHRONY");
+			// Russian when the Russian string data is installed, English
+			// otherwise - see Localization.h.
+			const Loc::HostPageText& text = Loc::hostPage();
+
+			SetText(GetById(page, ID_TITLE), text.title);
 			// One control per line - the text control does not break on '\n'.
-			SetText(GetById(page, ID_INFO),  L"Welcome to the Hobbit Synchrony - a multiplayer");
-			SetText(GetById(page, ID_INFO2), L"mod for The Hobbit. Your friends are waiting");
-			SetText(GetById(page, ID_INFO3), L"for you. Choose to host a game or join a friend,");
-			SetText(GetById(page, ID_INFO4), L"and let the journey begin.");
-			SetText(GetById(page, ID_CLOSE), L"Done");
+			SetText(GetById(page, ID_INFO),  text.info1);
+			SetText(GetById(page, ID_INFO2), text.info2);
+			SetText(GetById(page, ID_INFO3), text.info3);
+			SetText(GetById(page, ID_INFO4), text.info4);
+			SetText(GetById(page, ID_CLOSE), text.done);
 
 			g_hostPageWantsHost = false;            // default role: CLIENT
 			refreshHostPageLabels(page);
@@ -4188,6 +4216,14 @@ static void addNewPlayer(PositionMessage* msg, double currentTime)
 
 		newPlayer.status_marker = new Marker(processAnalyzer);
 		newPlayer.status_marker->initializeByGuid(statusGuid);
+
+		// Ring ghost: the level-authored half-transparent clone (first half ..13,
+		// same scheme as the markers). Missing on levels without the clones - all
+		// uses are guarded by isValid(), so that just disables the effect there.
+		uint64_t ghostGuid = (newPlayer.npcGuid & 0xFFFFFFFF) | 0x0D8AD91300000000ull;
+
+		newPlayer.ghostNpc = new NPC(processAnalyzer);
+		newPlayer.ghostNpc->initializeByGuid(ghostGuid);
 	}
 
 	applyNameStatusMetadataToPlayer(newPlayer);
@@ -5475,21 +5511,41 @@ static int clientMain()
 DWORD WINAPI mainThread(LPVOID)
 {
 	//-----------------------------------------------------
-	// DEBUG CONSOLE
+	// DEBUG CONSOLE — only exists at all with debug=1.
+	//
+	// Two sources of a console window:
+	//   * ours (AllocConsole below), and
+	//   * the GAME's own - this unpacked Meridian.exe build starts life WITH a
+	//     console (title = exe path), and the DLL's CRT auto-attaches stdout to
+	//     it, which is why output appeared even when we never allocated one.
+	// So debug=0 must actively DETACH from any console that already exists, not
+	// merely skip creating our own. After that, every printf/cout goes nowhere
+	// and the host-choice console fallback (_kbhit 1/0) is unavailable - the
+	// menu page is the only input. Flag read FIRST, since it decides all this.
 	//-----------------------------------------------------
 
-	AllocConsole();
-
-	freopen("CONOUT$", "w", stdout);
-	freopen("CONIN$", "r", stdin);
-
-	// Before anything else logs: decide whether the development output is wanted.
 	loadDebugLoggingFlag();
 
-	std::cout << "Injected.\n";
 	if (g_debugLogging)
+	{
+		if (GetConsoleWindow() == nullptr)
+			AllocConsole();               // reuse the game's console if it has one
+
+		freopen("CONOUT$", "w", stdout);
+		freopen("CONIN$", "r", stdin);
+
+		std::cout << "Injected.\n";
 		std::cout << "Debug logging enabled (debug=1 in "
 		          << SkinSync::LocalConfigFile << ").\n";
+	}
+	else if (GetConsoleWindow() != nullptr)
+	{
+		// Quiet mode, but the process already owns a console (the game's own).
+		// Hide the window first - if another process (a launcher) shares the
+		// console, FreeConsole alone would detach us yet leave it on screen.
+		ShowWindow(GetConsoleWindow(), SW_HIDE);
+		FreeConsole();
+	}
 
 	//-----------------------------------------------------
 	// START GAME MANAGER

@@ -36,6 +36,15 @@ public:
 	Marker* nickname_marker = nullptr;
 	Marker* status_marker = nullptr;
 
+	// Half-transparent stand-in shown while this player wears the ring on team 1.
+	// A level-authored NPC clone with the see-through model, GUID derived like the
+	// marker GUIDs: first half replaced with 0D8AD913 (name = ..11, status = ..12).
+	// Purely cosmetic: tickLerp mirrors position/rotation/anim onto it while
+	// ghostActive; the ORIGINAL npc stays the real body (senses, pain, sync) and is
+	// simply unrendered. ghostActive is owned by applyRingVisual (game thread).
+	NPC* ghostNpc = nullptr;
+	bool ghostActive = false;
+
 	// set nickname
 	std::string nickname = "Username";
 	std::string status = "Status";

@@ -196,6 +196,20 @@ void Player::tickLerp(float t)
 		animHoldPeakFrame = 0.0f;
 	}
 
+	// --- Ring ghost (team 1): mirror the body onto the transparent stand-in ---
+	// The original npc above stays fully driven even while hidden - it is what
+	// enemies sense and what the sync targets. The ghost only copies the visual
+	// state, including the playback frame so both bodies stay in lockstep and
+	// the one-shot death hold carries over as-is.
+	if (ghostActive && ghostNpc && ghostNpc->isValid())
+	{
+		ghostNpc->setPosition(x, renderY, z);
+		ghostNpc->setRotationY(rotationY);
+		if (ghostNpc->getAnimation() != npc->getAnimation())
+			ghostNpc->setNPCAnim(static_cast<int>(npc->getAnimation()));
+		ghostNpc->setAnimFrame(npc->getAnimFrame());
+	}
+
 	// --- Marker(s) ---  (follow the lifted body so labels stay above the head)
 	if (nickname_marker)
 		nickname_marker->setPosition(x, renderY + 110.f, z);
