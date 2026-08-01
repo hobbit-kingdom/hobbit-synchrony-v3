@@ -2584,12 +2584,33 @@ static const RemotePlayerSense* findRemoteSense(uint64_t guid)
 	return nullptr;
 }
 
+// Observers that must never notice a remote player, per level. Their own AI is
+// left completely intact - they simply cannot sense fake bilbos, so a scripted
+// sequence that must not be interrupted stays on its rails in multiplayer.
+// Checked against the SENSING NPC (the sense controller's owner), not the target.
+static bool observerIgnoresRemotePlayers(void* sense)
+{
+	if (nowLevel != 7)
+		return false;
+
+	const uint8_t* observer = static_cast<const uint8_t*>(game_SenseGetOwner(sense, nullptr));
+	if (!observer)
+		return false;
+
+	const uint64_t guid = *reinterpret_cast<const uint64_t*>(observer + 0x8);   // object+0x8
+	return guid == 0x0D8ADCCE7481A400ULL;   // 0D8ADCCE_7481A400
+}
+
 // Can this observer legitimately SEE this remote player right now?
 // Applies the stealth grant the engine reserves for the local Bilbo, then runs the
 // engine's own FOV + LOS check via the signature swap described above.
 // Sight only - smell is deliberately not part of this, see remotePlayerSensedBy.
 static bool remotePlayerVisibleTo(void* sense, const RemotePlayerSense& player, int checkEnemy)
 {
+	// Blind to remote players entirely (level-specific, see above).
+	if (observerIgnoresRemotePlayers(sense))
+		return false;
+
 	// Stealth, mirroring what CanSee does for Bilbo: hidden, and this NPC is not
 	// one of the ones flagged to see through hiding.
 	if (player.hidden)
@@ -2642,6 +2663,11 @@ static bool remotePlayerVisibleTo(void* sense, const RemotePlayerSense& player, 
 // real Bilbo.
 static bool remotePlayerSensedBy(void* sense, const RemotePlayerSense& player, int checkEnemy)
 {
+	// Blind observers lose smell too - otherwise they would still catch a remote
+	// player who walked into them, which is exactly what this is meant to stop.
+	if (observerIgnoresRemotePlayers(sense))
+		return false;
+
 	if (remotePlayerVisibleTo(sense, player, checkEnemy))
 		return true;
 	return game_SenseCanSmell(sense, nullptr, player.guid, checkEnemy) != 0;
