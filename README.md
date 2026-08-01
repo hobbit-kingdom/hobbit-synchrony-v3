@@ -5,9 +5,7 @@ The Hobbit Synchrony is a mod that brings Multiplayer to The Hobbit 2003 Game. P
 Download here: https://github.com/hobbit-kingdom/hobbit-synchrony-v3/releases
 
 ## Trailer & Video Showcase
-[<img  width="50%" alt="Multiplayer Trailer" src="https://github.com/user-attachments/assets/5711c620-69f8-4c8d-97f8-c2781f9a3ec7" />](https://youtu.be/O65o7NI17v0)
-
-[<img width="50%" alt="Gameplay showcase" src="https://github.com/user-attachments/assets/d02c8aa2-772a-41de-bc9f-2c95044876f5" />](https://www.youtube.com/watch?v=4Yf1T2Yr1dc)
+[<img  width="49%" alt="Multiplayer Trailer" src="https://github.com/user-attachments/assets/5711c620-69f8-4c8d-97f8-c2781f9a3ec7" />](https://youtu.be/O65o7NI17v0)[<img width="49%" alt="Gameplay showcase" src="https://github.com/user-attachments/assets/d02c8aa2-772a-41de-bc9f-2c95044876f5" />](https://www.youtube.com/watch?v=4Yf1T2Yr1dc)
 
 
 ## Installation
